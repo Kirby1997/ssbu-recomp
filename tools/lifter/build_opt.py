@@ -1,6 +1,6 @@
 """Optimised, side-by-side build of the lifted code (phase P3, plan\\phases\\P3_performance.md).
 
-    python build_opt.py main [jobs]              gen_eh_o2\\*.c -> obj_eh_o2\\*.obj -> ssbu_game_eh_o2.dll (+ .lib)
+    python build_opt.py main [jobs]              gen_eh_o2\\*.c -> obj_eh_o2\\*.obj -> ssbu_game_eh_o2.dll (+ .lib)      [linux-arm64: .o, libssbu_game_*.so]
     python build_opt.py nro [jobs] [module ...]  lift (if needed) + compile + link the script modules into nro_bin_eh_o2\\
     python build_opt.py one <file.c> [limit]     compile one file of the main set, print time and the fallback used
     python build_opt.py sizes <dir>              the largest functions of a generated folder
@@ -32,16 +32,18 @@ import time
 
 os.environ.setdefault('RECOMP_GEN', 'gen_eh_o2')
 os.environ.setdefault('RECOMP_OBJ', 'obj_eh_o1')          # P3 (2026-10-09): the set that is the default of build.py
-os.environ.setdefault('RECOMP_DLL', 'ssbu_game_eh_o1.dll')
+import buildplat as plat      # noqa: E402
+
+os.environ.setdefault('RECOMP_DLL', plat.default_shared_name('ssbu_game_eh_o1'))
 os.environ.setdefault('RECOMP_NRO_SUFFIX', '_eh_o2')
 
 import build          # noqa: E402  (reads the environment at import)
 import build_nro      # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-9.0.0\bin\clang.exe')
+CLANG = os.environ.get('RECOMP_CLANG', 'clang' if plat.LINUX else r'C:\llvm-9.0.0\bin\clang.exe')
 OPT = os.environ.get('RECOMP_OPT', '-O1')
-EXTRA = ['-ffp-contract=off'] + os.environ.get('RECOMP_CFLAGS', '').split()
+EXTRA = ['-ffp-contract=off'] + plat.codegen_flags(shared=True) + os.environ.get('RECOMP_CFLAGS', '').split()
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
 DEF = re.compile(r'^(?:static )?void (\w+)\((Ctx \*c(?:, uint64_t rp)?)\) \{$')
@@ -70,7 +72,7 @@ def function_sizes(path):
 def optnone_header(src, obj, limit):
     """Write <obj>.optnone.h naming the functions of src longer than `limit` statements; returns (path, count, statements)."""
     big = [(n, name, params) for n, name, params in function_sizes(src) if n > limit]
-    path = obj[:-4] + '.optnone.h'
+    path = os.path.splitext(obj)[0] + '.optnone.h'
     if not big:
         if os.path.exists(path):
             os.remove(path)
@@ -84,12 +86,12 @@ def optnone_header(src, obj, limit):
 
 def run_limited(cmd, limit):
     t = time.time()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    p = plat.popen_group(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)      # linux: own session, so the whole tree can be killed
     try:
         out, _ = p.communicate(timeout=limit)
         return p.returncode, out.decode('latin-1')[-2000:], time.time() - t
     except subprocess.TimeoutExpired:
-        subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)      # this compiler and its -cc1 child only
+        plat.terminate_tree(p)      # this compiler and its -cc1 child only (windows: taskkill /T; linux: killpg)
         p.communicate()
         return None, '', time.time() - t
 
@@ -130,7 +132,7 @@ def report(objdir):
 # ---- main: build.compile_one replaced -------------------------------------------------------------------------
 def compile_one_main(name):
     src = os.path.join(build.GEN, name)
-    obj = os.path.join(build.OBJ, name[:-2] + '.obj')
+    obj = os.path.join(build.OBJ, name[:-2] + plat.OBJ_EXT)
     code, out, secs, note = compile_file(src, obj, ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', build.GEN])
     if note or secs > 60:
         line = '%-12s %6.0fs  %s' % (name, secs, note)
@@ -184,7 +186,7 @@ if __name__ == '__main__':
     if cmd == 'one':
         os.makedirs(build.OBJ, exist_ok=True)
         src = sys.argv[2] if os.path.isabs(sys.argv[2]) else os.path.join(build.GEN, sys.argv[2])
-        obj = os.path.join(os.environ.get('RECOMP_ONE_OUT', build.OBJ), os.path.basename(src)[:-2] + '.obj')
+        obj = os.path.join(os.environ.get('RECOMP_ONE_OUT', build.OBJ), os.path.basename(src)[:-2] + plat.OBJ_EXT)
         code, out, secs, note = compile_file(src, obj, ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', os.path.dirname(src)], float(sys.argv[3]) if len(sys.argv) > 3 else None)
         print('%s: exit %s  %.1fs  %s  %s' % (os.path.basename(src), code, secs, note or 'fully optimised', out.strip()[:500]))
     if cmd == 'sizes':

@@ -27,7 +27,7 @@ def main():
     ap.add_argument('--build', default=os.path.join(REPO, 'build'))
     ap.add_argument('--seconds', type=int, default=0, help='stop after this many seconds (0 = play until you quit)')
     ap.add_argument('--seq', help='input sequence file (tests/seq_*.txt): lines starting with # are comments')
-    ap.add_argument('--exe', default='ssbu_native.exe', help='exe name inside build/work; a copy of ssbu_native.exe is made if missing')
+    ap.add_argument('--exe', help='exe name inside build/work; a copy of ssbu_native is made if missing (default ssbu_native.exe; linux-arm64: ssbu_native)')
     ap.add_argument('--seed', help='SSBU_FIXED_SEED value (deterministic random numbers)')
     ap.add_argument('--log', help='write the game output to this file instead of the console')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE, may be repeated')
@@ -36,10 +36,17 @@ def main():
     with open(state_file) as f:
         state = json.load(f)
     work = os.path.join(a.build, 'work')
+    linux = state.get('target', 'windows') != 'windows'          # recorded by scripts/setup.py --target
+    base_exe = 'ssbu_native' if linux else 'ssbu_native.exe'
+    a.exe = a.exe or base_exe
     exe = os.path.join(work, a.exe)
     if not os.path.exists(exe):
-        shutil.copy2(os.path.join(work, 'ssbu_native.exe'), exe)
+        shutil.copy2(os.path.join(work, base_exe), exe)           # (the copy finds libSDL3.so / the game library through $ORIGIN, i.e. in the same folder)
+        if linux:
+            os.chmod(exe, 0o755)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('RECOMP_', 'SSBU_'))}
+    if linux:      # the Frame's desktop session variables are needed when started from ssh; SDL picks wayland/x11 itself
+        env.setdefault('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid())
     env['SSBU_ROMFS'] = state['dump']['romfs']
     env['SSBU_USERDATA'] = os.path.abspath(a.userdata)
     for sub, var in (('fonts', 'SSBU_FONTS'), ('zoneinfo', 'SSBU_TZDIR')):

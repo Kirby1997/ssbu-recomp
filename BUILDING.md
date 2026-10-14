@@ -137,3 +137,40 @@ Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
 - A compiler job that fails after a power loss or while the PC is under load: run the same command again; only what
   changed is rebuilt. Closing a running game first matters: a running exe holds its DLLs open and the link fails.
 - Output with non-ASCII characters from Windows tools is shown with `?`; the logs in `build/logs` are the originals.
+
+## Linux / Steam Frame (aarch64) — `--target linux-arm64`
+
+Builds the same game for the Steam Frame (aarch64 SteamOS, Mesa Turnip). Windows stays the default and is unchanged.
+The target has its own build folder, `build/linux-arm64` (git-ignored), so both builds can live side by side.
+
+```
+python3 scripts/setup.py --target linux-arm64 --dump <your dump folder> --suyu <folder>      # all steps
+python3 scripts/setup.py --target linux-arm64 --only deps                                   # toolchain probe, no dump needed
+```
+
+Two modes, chosen by the machine you run on:
+
+| | cross (x86-64 WSL/Linux) | native (on the Frame) |
+|---|---|---|
+| compiler | LLVM release tarball in `~/.local/llvm-<ver>` (tested 19.1.7; `--llvm`/`LLVM_ROOT`), clang + `ld.lld` | system `clang` 19 + `ld.lld` |
+| headers/libs | sysroot copied from the device: `toolchain/sync_sysroot.sh` -> `~/sysroots/steam-frame` (`--sysroot`/`SYSROOT`) | `/usr` |
+| SDL3 | in the sysroot (`opt/ssbu-deps/sdl3`) | `~/ssbu-port/deps/sdl3` (`--sdl3`) |
+| `check` | skipped (the aarch64 exe must run on the device) | runs |
+
+SDL3 is not part of SteamOS: build it once on the device with `toolchain/build_deps_on_device.sh` (SDL 3.4.18, shared). Other
+requirements (Vulkan, FreeType, Opus, glslang, FFmpeg, libvpx headers and libraries) are SteamOS packages. No sudo is needed anywhere.
+Details, flags and device notes: `toolchain/README.md`.
+
+`deps` compiles and links `toolchain/hello_sdl3_vulkan.c` (SDL3 video + Vulkan: prints the GPU), compiles the glslang shim, and runs the
+program: natively, or on the device from a cross build when `SSBU_DEVICE=steamos@frame` is set (it is copied to
+`~/ssbu-port/build/deps_probe/`). Without a desktop session the probe uses `SDL_VIDEO_DRIVER=offscreen`.
+
+Native build on the Frame: copy the repo (for example `tar c --exclude=./build --exclude=./.git . | ssh steamos@frame 'tar x -C ~/ssbu-port/build/repo'`),
+then `cd ~/ssbu-port/build/repo && python3 scripts/setup.py --target linux-arm64 --dump <dump> ...`. The device has no
+numpy/lz4/zstandard/Pillow/unicorn; install them with `pip install --user` (or build the lifted code in cross mode and copy `build/linux-arm64/work`).
+
+Output in `build/linux-arm64/work`: `ssbu_native`, `libssbu_game_eh_o1.so` (the lifted game), `libssbu_glslang.so`
+(`runtime/build_glslang.sh`, glslang linked statically), `libSDL3.so.0` (bundled) and `nro_bin_eh_o2/<module>.so`; the executable
+finds them through `RPATH=$ORIGIN`. All code is built with `-ffp-contract=off -fno-math-errno -fno-omit-frame-pointer -march=armv8.2-a+lse`;
+shared objects with `-fPIC -fvisibility=hidden -fno-semantic-interposition`, modules with `-Wl,-Bsymbolic`. Run:
+`python3 scripts/run.py --build build/linux-arm64 --userdata <folder>`; from ssh set `WAYLAND_DISPLAY=gamescope-0` (or `DISPLAY=:0`).

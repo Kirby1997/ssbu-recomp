@@ -17,9 +17,12 @@ import subprocess
 import sys
 import time
 
+import buildplat as plat
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RO = os.path.join(HERE, 'ro_study')
-CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-8.0.0\bin\clang.exe')
+CLANG = os.environ.get('RECOMP_CLANG', 'clang' if plat.LINUX else r'C:\llvm-8.0.0\bin\clang.exe')
+OE = plat.OBJ_EXT      # '.obj' | '.o' (linux-arm64: modules are <name>.so, built -fPIC -fvisibility=hidden, linked -Bsymbolic)
 GEN_HEADERS = ['runtime.h', 'neon.h', 'fpexact.h']
 LIFTER = os.path.join(RO, 'recomp_nro.py')
 
@@ -82,18 +85,18 @@ def build_module(e, jobs, relift, opt):
     t0 = time.time()
     newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in GEN_HEADERS)
     sources = sorted(n for n in os.listdir(gen) if n.endswith('.c'))
-    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen]
+    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + plat.codegen_flags(shared=True)
     todo = []
     for n in sources:
-        src, o = os.path.join(gen, n), os.path.join(obj, n[:-2] + '.obj')
+        src, o = os.path.join(gen, n), os.path.join(obj, n[:-2] + OE)
         if not os.path.exists(o) or os.path.getmtime(o) < max(os.path.getmtime(src), newest_header):
             todo.append((flags + [src, '-o', o], n))
-    shim, shim_obj = os.path.join(HERE, 'nro_shim.c'), os.path.join(obj, '_shim.obj')
+    shim, shim_obj = os.path.join(HERE, 'nro_shim.c'), os.path.join(obj, '_shim' + OE)
     if not os.path.exists(shim_obj) or os.path.getmtime(shim_obj) < max(os.path.getmtime(shim), newest_header):
         todo.append((flags + ['-DNRO_MODULE=' + name, shim, '-o', shim_obj], 'nro_shim.c'))
-    wanted = set(n[:-2] + '.obj' for n in sources) | {'_shim.obj'}
+    wanted = set(n[:-2] + OE for n in sources) | {'_shim' + OE}
     for n in os.listdir(obj):
-        if n.endswith('.obj') and n not in wanted:
+        if n.endswith(OE) and n not in wanted:
             os.remove(os.path.join(obj, n))
     failed = 0
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
@@ -107,20 +110,20 @@ def build_module(e, jobs, relift, opt):
 
     # 3. link the DLL
     t0 = time.time()
-    dll = os.path.join(bindir, name + '.dll')
-    objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith('.obj'))
+    dll = os.path.join(bindir, name + plat.SHARED_SUFFIX)
+    objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith(OE))
     linked = False
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(o) for o in objs):
         rsp = os.path.join(obj, 'link.rsp')
         with open(rsp, 'w') as f:
             f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
-        r = subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True)
+        r = subprocess.run([CLANG] + (plat.link_shared_flags(module=True) if plat.LINUX else ['-shared']) + ['@' + rsp, '-o', dll], capture_output=True, text=True)
         if r.returncode:
             print((r.stdout + r.stderr)[-4000:])
             print('could not link %s (is a game exe still running and holding it open?)' % dll)
             return 1
         linked = True
-        for ext in ('.lib', '.exp'):                        # nothing links against a module DLL
+        for ext in (() if plat.LINUX else ('.lib', '.exp')):      # nothing links against a module DLL
             p = dll[:-4] + ext
             if os.path.exists(p):
                 os.remove(p)

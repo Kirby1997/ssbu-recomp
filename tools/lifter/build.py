@@ -10,16 +10,27 @@ import subprocess
 import sys
 import time
 
+import buildplat as plat
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # P3 (2026-10-09): the OPTIMISED set is the default: gen_eh_o2 (lifter with the fcvt-half and FMAX/FMIN fixes) -> obj_eh_o1
 # (clang 9 -O1 through build_opt.py) -> ssbu_game_eh_o1.dll. The unoptimised set stays buildable under its own names:
 #     RECOMP_GEN=gen_eh RECOMP_OBJ=obj_eh RECOMP_DLL=ssbu_game_eh.dll python build.py compile --opt=-O0   (and: ... python build.py link)
 GEN = os.path.join(HERE, os.environ.get('RECOMP_GEN', 'gen_eh_o2'))      # side-by-side builds: RECOMP_GEN / RECOMP_OBJ / RECOMP_DLL / RECOMP_SHIM
 OBJ = os.path.join(HERE, os.environ.get('RECOMP_OBJ', 'obj_eh_o1'))
-CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-8.0.0\bin\clang.exe')      # scripts\setup.py sets RECOMP_CLANG (LLVM/clang 9.0.0)
-CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN]
+OE = plat.OBJ_EXT                                                  # '.obj' (windows) | '.o' (linux-arm64)
+CLANG = os.environ.get('RECOMP_CLANG', 'clang' if plat.LINUX else r'C:\llvm-8.0.0\bin\clang.exe')      # scripts\setup.py sets RECOMP_CLANG (LLVM/clang 9.0.0)
+CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + plat.codegen_flags(shared=True)      # linux-arm64: + target/sysroot, -ffp-contract=off ..., -fPIC -fvisibility=hidden (windows: unchanged)
 HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c','sdkdata.c', 'display.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnro.c', 'nro_registry.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c', 'nncxxlib.c', 'nnlibc2.c',
                 'sdklift_gen.c', 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c']
+if plat.LINUX:
+    # Host sources that exist only for Windows (Media Foundation movies) are left out; sources added for Linux are listed in
+    # LINUX_HOST_ADD. RECOMP_HOST_SKIP / RECOMP_HOST_ADD (comma lists) override both without editing this file.
+    LINUX_HOST_SKIP = ['nnmovie_mf.c']
+    LINUX_HOST_ADD = []
+    _skip = set(LINUX_HOST_SKIP + [x for x in os.environ.get('RECOMP_HOST_SKIP', '').split(',') if x])
+    HOST_SOURCES = [x for x in HOST_SOURCES if x not in _skip] + [x for x in LINUX_HOST_ADD + os.environ.get('RECOMP_HOST_ADD', '').split(',')
+                                                                  if x and x not in HOST_SOURCES]
 # A handful of files hold functions so large that clang -O1 needs more than an hour on them;
 # pass --opt=-O0 to compile whatever is still missing without optimization.
 OPT = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--opt=')), '-O1')
@@ -29,7 +40,7 @@ SLOW_FILES = {'c_019e.c', 'c_00a3.c', 'c_013a.c', 'c_0099.c', 'c_0367.c', 'c_03f
 
 def compile_one(name):
     src = os.path.join(GEN, name)
-    obj = os.path.join(OBJ, name[:-2] + '.obj')
+    obj = os.path.join(OBJ, name[:-2] + OE)
     t = time.time()
     # the dozen largest files hold functions clang 8 cannot optimise in reasonable time: keep them at -O0
     opt = '-O0' if name in SLOW_FILES else OPT
@@ -45,12 +56,12 @@ def cmd_compile(jobs, force):
     newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in GEN_HEADERS)
     todo = []
     for n in sources:
-        obj = os.path.join(OBJ, n[:-2] + '.obj')
+        obj = os.path.join(OBJ, n[:-2] + OE)
         if force or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(os.path.join(GEN, n)), newest_header):
             todo.append(n)
-    wanted = set(n[:-2] + '.obj' for n in sources)
+    wanted = set(n[:-2] + OE for n in sources)
     for n in os.listdir(OBJ):
-        if n.endswith('.obj') and n not in wanted:
+        if n.endswith(OE) and n not in wanted:
             os.remove(os.path.join(OBJ, n))
     print('sources: %d   to compile: %d   jobs: %d' % (len(sources), len(todo), jobs), flush=True)
     t0 = time.time()
@@ -70,20 +81,27 @@ def cmd_compile(jobs, force):
 
 # The lifted game code lives in ssbu_game.dll, linked only when obj\ changes; the exe holds just the
 # host runtime, so the edit-link-run loop costs a couple of seconds (see game_shim.c, gamedll.c).
-GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1.dll')
+GAME_DLL = os.environ.get('RECOMP_DLL', plat.default_shared_name('ssbu_game_eh_o1'))
+SDL_ROOT = plat.sdl_root()
 HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
-              '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
+              '-I', os.path.join(SDL_ROOT, 'include'),
               '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')]      # Khronos headers for nvn_vk.c (track V)
-SDL_DIR = os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'lib', 'x64')      # SDL3 for nnpad_sdl.c; SDL3.dll is copied beside the exe at link (SDL3_ROOT / VULKAN_HEADERS: scripts\setup.py)
-LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi']
+HOST_FLAGS += plat.codegen_flags(shared=False) + plat.extra_include_flags()      # linux-arm64: target/sysroot, -ffp-contract=off ...; windows: nothing added
+SDL_DIR = plat.sdl_libdir()      # SDL3 for nnpad_sdl.c; SDL3.dll (linux: libSDL3.so.0) is copied beside the exe at link (SDL3_ROOT / VULKAN_HEADERS: scripts/setup.py)
+LIBS = plat.exe_libs()
+
+
+def game_import_lib():
+    """What the exe links against to reach the game library: windows the import .lib, linux the .so itself."""
+    return os.path.join(HERE, GAME_DLL) if plat.LINUX else os.path.join(HERE, GAME_DLL[:-4] + '.lib')
 
 
 def build_game_dll():
     dll = os.path.join(HERE, GAME_DLL)
-    lib = dll[:-4] + '.lib'
+    lib = game_import_lib()
     shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
-    objs = sorted(os.path.join(OBJ, n) for n in os.listdir(OBJ) if n.endswith('.obj'))
+    objs = sorted(os.path.join(OBJ, n) for n in os.listdir(OBJ) if n.endswith(OE))
     newest = max([os.path.getmtime(o) for o in objs] + [os.path.getmtime(shim)])
     if os.path.exists(dll) and os.path.exists(lib) and os.path.getmtime(dll) >= newest:
         return 0
@@ -91,7 +109,12 @@ def build_game_dll():
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     t0 = time.time()
-    r = subprocess.run([CLANG, '-shared', '-O1', '-w', '-I', HERE, '-I', GEN, shim, '@' + rsp, '-o', dll], capture_output=True, text=True)
+    if plat.LINUX:      # the shim is compiled here with the library; soname = file name so the exe records a relative NEEDED entry
+        cmd = [CLANG, '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + plat.codegen_flags(shared=True) + plat.link_shared_flags() + \
+              ['-Wl,-soname,' + GAME_DLL, shim, '@' + rsp, '-o', dll]
+    else:
+        cmd = [CLANG, '-shared', '-O1', '-w', '-I', HERE, '-I', GEN, shim, '@' + rsp, '-o', dll]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     print((r.stdout + r.stderr)[-4000:])
     if r.returncode == 0:
         print('linked %s: %.0f MB in %.0fs' % (dll, os.path.getsize(dll) / 1048576.0, time.time() - t0))
@@ -109,7 +132,7 @@ def compile_host(job):
 def cmd_link():
     if build_game_dll():
         return 1
-    exe = os.environ.get('RECOMP_EXE', 'ssbu_native.exe')      # parallel work: one exe name per worker
+    exe = os.environ.get('RECOMP_EXE', 'ssbu_native' + plat.EXE_SUFFIX)      # parallel work: one exe name per worker
     out = os.path.join(HERE, exe)
     objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)
@@ -117,7 +140,7 @@ def cmd_link():
     newest_dep = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith('.h')] + [os.path.getmtime(os.path.join(HERE, 'build.py'))])
     objs, jobs = [], []
     for n in HOST_SOURCES + ['gamedll.c']:
-        src, obj = os.path.join(HERE, n), os.path.join(objdir, n[:-2] + '.obj')
+        src, obj = os.path.join(HERE, n), os.path.join(objdir, n[:-2] + OE)
         objs.append(obj)
         if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep):
             jobs.append((src, obj))
@@ -129,10 +152,21 @@ def cmd_link():
                 print('FAILED %s\n%s' % (os.path.basename(src), err))
     if failed:
         return 1
-    r = subprocess.run([CLANG] + objs + [os.path.join(HERE, GAME_DLL[:-4] + '.lib'), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + ['-o', out], capture_output=True, text=True)
-    if r.returncode == 0:
-        import shutil
-        shutil.copy2(os.path.join(SDL_DIR, 'SDL3.dll'), os.path.join(HERE, 'SDL3.dll'))
+    if plat.LINUX:
+        r = subprocess.run([CLANG] + plat.TARGET_FLAGS + ['-fno-omit-frame-pointer'] + objs + [game_import_lib()] + LIBS + ['-o', out], capture_output=True, text=True)
+        if r.returncode == 0:      # bundle: libSDL3 beside the exe (rpath $ORIGIN); SDL3.dll is the windows name
+            import shutil
+            src = next((os.path.join(SDL_DIR, f) for f in ('libSDL3.so.0', 'libSDL3.so') if os.path.exists(os.path.join(SDL_DIR, f))), None)
+            if src:
+                real = os.path.realpath(src)
+                shutil.copy2(real, os.path.join(HERE, 'libSDL3.so.0'))
+                if not os.path.lexists(os.path.join(HERE, 'libSDL3.so')):
+                    os.symlink('libSDL3.so.0', os.path.join(HERE, 'libSDL3.so'))
+    else:
+        r = subprocess.run([CLANG] + objs + [os.path.join(HERE, GAME_DLL[:-4] + '.lib'), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + ['-o', out], capture_output=True, text=True)
+        if r.returncode == 0:
+            import shutil
+            shutil.copy2(os.path.join(SDL_DIR, 'SDL3.dll'), os.path.join(HERE, 'SDL3.dll'))
     print((r.stdout + r.stderr)[-4000:])                 # link.exe reports its errors on stdout
     if r.returncode == 0:
         print('linked %s: %.1f MB in %.1fs (%d host files recompiled)' % (out, os.path.getsize(out) / 1048576.0, time.time() - t0, len(jobs)))
