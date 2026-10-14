@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "hostrt.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 #define NRO_BASE 0x7200000000ULL
 #define NRO_SLOT_SHIFT 21                      /* 2 MB */
@@ -297,6 +301,9 @@ static ImportFn function_at(uint64_t addr) {
     return m ? fn_in_table(m->fns, m->fn_count, addr) : NULL;
 }
 
+#ifndef _WIN32
+#include "fighter_sdk/win32_posix.h"           /* FindFirstFileA, CopyFileA, FlsAlloc ... for the three fighter_sdk files (paths: '\\' -> '/', .dll -> .so) */
+#endif
 #include "fighter_sdk/hook_host.c"             /* S3: the hook table: replace any lifted function by address or name (track M) */
 #include "fighter_sdk/fighter_host.c"          /* S1: fighter C++ source: loading, per-function switch, differential test */
 
@@ -393,6 +400,7 @@ static const NroHost g_host = {call_indirect, host_import, guest_trap, guest_uni
 /* Load nro_bin\<module>.dll (next to the exe) and take its tables. */
 static int attach_dll(NroModule *m) {
     if (m->dll) return 1;
+#ifdef _WIN32
     char path[MAX_PATH * 2];
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
@@ -412,6 +420,32 @@ static int attach_dll(NroModule *m) {
     if (!dll) return 0;
     NroBindFn bind = (NroBindFn)(void *)GetProcAddress(dll, "nro_bind");
     if (!bind) { FreeLibrary(dll); return 0; }
+#else   /* <exe dir>/<SSBU_NRO_BIN or nro_bin_eh_o2>/<module>.so: build_nro.py links name + buildplat.SHARED_SUFFIX (no "lib" prefix), -Bsymbolic, only nro_bind exported */
+    char path[PATH_MAX + 256];
+    char exe[PATH_MAX];
+    ssize_t d = readlink("/proc/self/exe", exe, sizeof exe - 1), n;
+    if (d < 0) d = 0;
+    while (d && exe[d - 1] != '/') d--;
+    const char *bin = getenv("SSBU_NRO_BIN");                /* a folder next to the exe, or an absolute path */
+    n = bin && bin[0] == '/' ? 0 : d;
+    memcpy(path, exe, (size_t)n);
+    snprintf(path + n, sizeof path - (size_t)n, "%s/%s.so", bin && bin[0] ? bin : "nro_bin_eh_o2", m->info->name);
+    void *dll = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    const char *python = getenv("SSBU_NRO_AUTOBUILD");       /* development aid: the python interpreter; lift a missing module on demand */
+    if (!dll && python && python[0]) {
+        char cmd[PATH_MAX * 2 + 512];
+        snprintf(cmd, sizeof cmd, "'%s' '%.*sbuild.py' nro '%s'", python, (int)d, exe, m->info->name);
+        printf("nn::ro::LoadModule: %s has no lifted code yet, building it: %s\n", m->info->name, cmd);
+        DWORD t0 = GetTickCount();
+        int rc = system(cmd);
+        printf("nn::ro::LoadModule: build of %s finished with code %d after %.1f s\n", m->info->name, rc, (GetTickCount() - t0) / 1000.0);
+        dll = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!dll) { const char *e = dlerror(); printf("nn::ro::LoadModule: dlopen %s: %s\n", path, e ? e : "?"); return 0; }
+    NroBindFn bind;
+    { void *s = dlsym(dll, "nro_bind"); memcpy(&bind, &s, sizeof bind); }
+    if (!bind) { const char *e = dlerror(); printf("nn::ro::LoadModule: %s has no nro_bind: %s\n", path, e ? e : "?"); dlclose(dll); return 0; }
+#endif
     NroTables t;
     memset(&t, 0, sizeof t);
     bind(&g_host, m, &t);
@@ -473,6 +507,7 @@ static void ro_Initialize(Ctx *c) { ro_init_tables(); c->x[0] = RO_OK; }
 static struct { uint64_t addr; uint32_t count; uint8_t *hashes; } g_nrr[RO_MAX_NRR];
 static SRWLOCK g_nrr_lock = SRWLOCK_INIT;
 
+#ifdef _WIN32
 static int sha256(const void *data, size_t size, uint8_t out[32]) {      /* Windows CNG (bcrypt.dll) */
     typedef LONG (WINAPI *open_fn)(void **, const WCHAR *, const WCHAR *, ULONG);
     typedef LONG (WINAPI *hash_fn)(void *, UCHAR *, ULONG, UCHAR *, ULONG, UCHAR *, ULONG);
@@ -488,6 +523,10 @@ static int sha256(const void *data, size_t size, uint8_t out[32]) {      /* Wind
     if (size > 0x7fffffffu) return 0;                                    /* BCryptHash takes 32-bit lengths; modules are far smaller */
     return hash(alg, NULL, 0, (UCHAR *)(uintptr_t)data, (ULONG)size, out, 32) == 0;
 }
+#else
+#include "sha256.h"                                                      /* built-in FIPS 180-4 (tests/port/modules/test_sha256.c) */
+static int sha256(const void *data, size_t size, uint8_t out[32]) { sha256_digest(data, size, out); return 1; }
+#endif
 
 static int nro_hash_registered(uint64_t nro, uint8_t hash[32]) {
     int found = 0;

@@ -38,12 +38,25 @@ static void diag_PutImplForC(Ctx *c) {   /* (const LogMetaData *, const char *te
 /* nn::fs::SetFileSize(FileHandle, s64) [sdk 0x1f5c50 -> FileAccessor::SetSize 0x1f31d0: the file system's answer].
  * musl calls it for O_TRUNC only (__nnmusl_FileOpen 0x517318, size 0). A file handle of nnfs.c is the Win32 handle.
  * The failure value is not modelled on anything (unverified): musl maps every unknown Result to errno 1. */
+#ifdef _WIN32
 static void fs_SetFileSize_c5b(Ctx *c) {
     LARGE_INTEGER size;
     size.QuadPart = (LONGLONG)A1;
     if (!SetFilePointerEx((HANDLE)A0, size, NULL, FILE_BEGIN) || !SetEndOfFile((HANDLE)A0)) { RET(0x2ee202); return; }
     RET(0);
 }
+#else
+/* POSIX: ftruncate + lseek (= SetEndOfFile at SetFilePointerEx(FILE_BEGIN)) on the descriptor behind the FileHandle. nnfs.c owns the
+ * handles (its Linux port, PORT_AUDIT Phase 6, chooses what a FileHandle is) and must define nnfs_handle_fd: the open descriptor of a
+ * handle, or -1. Until it does (weak reference, NULL) SetFileSize fails like an unknown handle: fopen("w") then fails, nothing is guessed. */
+int nnfs_handle_fd(uint64_t handle) __attribute__((weak));
+static void fs_SetFileSize_c5b(Ctx *c) {
+    int fd = nnfs_handle_fd ? nnfs_handle_fd(A0) : -1;
+    if (!nnfs_handle_fd) { static int said; if (!said) { said = 1; printf("nn::fs::SetFileSize (musl stdio): nnfs.c provides no nnfs_handle_fd on this platform: refused\n"); } }
+    if (fd < 0 || (int64_t)A1 < 0 || ftruncate(fd, (off_t)A1) != 0 || lseek(fd, (off_t)A1, SEEK_SET) < 0) { RET(0x2ee202); return; }
+    RET(0);
+}
+#endif
 
 static const char *const musl_stdio_names[] = {"printf", "fprintf", "fopen", "freopen", "fclose", "fread", "getc", "feof", "ferror", "fflush", "write"};
 #define MUSL_STDIO_COUNT ((int)(sizeof musl_stdio_names / sizeof musl_stdio_names[0]))
@@ -149,9 +162,15 @@ int libc2_stdio_selftest(Ctx *c) {
     char base[MAX_PATH], p[MAX_PATH];
     GetTempPathA(MAX_PATH - 64, base);
     snprintf(base + strlen(base), 64, "ssbu_stdio_selftest_%lu", (unsigned long)GetCurrentProcessId());
+#ifdef _WIN32
     CreateDirectoryA(base, NULL);
     STCHECK(fs_mount_plain("c5bstdio", base) == 0, "scratch mount");
     snprintf(p, sizeof p, "%s.work.%lu\\w.txt", base, (unsigned long)GetCurrentProcessId());   /* nnfs.c: changes of a mount live in its working folder until a commit */
+#else
+    mkdir(base, 0777);
+    STCHECK(fs_mount_plain("c5bstdio", base) == 0, "scratch mount");
+    snprintf(p, sizeof p, "%s.work.%lu/w.txt", base, (unsigned long)GetCurrentProcessId());      /* ASSUMES nnfs.c's Linux port keeps the "<root>.work.<pid>" folder */
+#endif
     uint64_t f = st_call(c, "fopen", SG("c5bstdio:/none.txt"), SG("r"), 0, 0);
     STCHECK(f == 0 && st_errno(c) == 2, "fopen(missing, \"r\") is not NULL / ENOENT");
     f = st_call(c, "fopen", SG("c5bstdio:/w.txt"), SG("w"), 0, 0);
@@ -194,8 +213,13 @@ int libc2_stdio_selftest(Ctx *c) {
     STCHECK(f != 0, "fopen(\"w\") on an existing file");
     if (f) STCHECK((int)st_call(c, "fclose", f, 0, 0, 0) == 0 && st_host_text(p, ""), "\"w\" does not truncate (nn::fs::SetFileSize)");
     st_call(c, "_ZN2nn2fs7UnmountEPKc", SG("c5bstdio"), 0, 0, 0);
+#ifdef _WIN32
     DeleteFileA(p);
     RemoveDirectoryA(base);
+#else
+    unlink(p);
+    rmdir(base);
+#endif
 
     /* swprintf: musl's vfwprintf formats every number with an internal fprintf on its FILE */
     uint32_t w[40];

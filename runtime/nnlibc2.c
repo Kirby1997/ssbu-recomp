@@ -14,6 +14,9 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include <sys/stat.h>                          /* mkdir in the stdio self-test (nnlibc2_c5b.inc) */
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
