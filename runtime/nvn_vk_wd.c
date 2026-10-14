@@ -12,16 +12,28 @@
  * The report is repeated after 4x the time (5 s, 20 s, 80 s, ...), at most 6 times a run; a line says when frames come back.
  * It only reads: nothing is unblocked or killed. Threads are suspended one at a time for the few microseconds of the unwind;
  * nothing is printed or allocated while one is suspended. */
+#ifdef _WIN32
 #include <tlhelp32.h>
+#define wd_iconic() IsIconic((HWND)nvn_front_hwnd())
+#else
+#include <time.h>
+#include <dirent.h>
+#include <sys/resource.h>
+/* TODO(Phase 5): the SDL window does not exist yet; "minimised" = SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED. Until then: never minimised
+ * (the watchdog then reports a stall exactly as on Windows with a visible window; it cannot misfire on a minimised window it cannot see). */
+static int wd_iconic(void) { return 0; }
+#endif
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */
 static volatile LONG g_wd_quit;
 static HANDLE g_wd_thread;
 static FILE *g_wd_fp;
 static DWORD g_wd_main_tid;
+#ifdef _WIN32
 typedef struct { uint32_t rva; char name[68]; } WdSym;
 static WdSym *g_wd_sym;
 static int g_wd_nsym, g_wd_map_tried;
+#endif
 static void wdp(const char *fmt, ...) {
     char b[1400];
     va_list ap;
@@ -29,6 +41,7 @@ static void wdp(const char *fmt, ...) {
     fputs(b, stdout);
     if (g_wd_fp) fputs(b, g_wd_fp);
 }
+#ifdef _WIN32
 static int wd_sym_cmp(const void *a, const void *b) { const WdSym *x = a, *y = b; return x->rva < y->rva ? -1 : x->rva > y->rva; }
 static void wd_map_load(void) {                    /* the linker's map of this exe, if it is there: "<exe without .exe>.map" */
     char path[MAX_PATH + 8], ln[1024], t1[64], t2[512], t3[64];
@@ -111,6 +124,7 @@ static int wd_walk(CONTEXT *ctx, uint64_t *pcs, int max) {
     } __except (1) { }
     return n;
 }
+#endif /* _WIN32 */
 static const char *wd_tname(DWORD tid, char *buf, size_t n) {
     const char *g = tid == g_render_tid ? "render (host)" : tid == g_wd_main_tid ? "the process's first thread (boot.c main: waits for the game)" : guest_thread_name_of(tid);
     if (g) return g;
@@ -126,16 +140,23 @@ static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
 }
 static void wd_dump(double stall_s, LONG64 tries_since) {
     static struct { DWORD tid; ULONGLONG cpu0, cpu1, born; int prio, nfr; uint64_t pc[28]; } th[400];
-    char path[MAX_PATH + 16], tb[48], ab[400];
+    char path[MAX_PATH + 16], tb[48];
+#ifdef _WIN32
+    char ab[400];
+#endif
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     SYSTEMTIME st; GetLocalTime(&st);
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId(), n = GetModuleFileNameA(NULL, path, MAX_PATH);
     int nt = 0;
+#ifdef _WIN32
     if (n > 4) { strcpy(path + n - 4, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }
+#else
+    if (n > 0 && n < MAX_PATH) { strcat(path, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }      /* <exe>_freeze.txt next to the exe (no ".exe" to strip) */
+#endif
     wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (unsigned long)pid, (long long)nvn_front_frame_next());
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld (%s); frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, tries_since ? "the game still presents but nothing reaches the window: see the failures" : "none: the game's present never came, or the render thread is held",
-        (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated, IsIconic((HWND)nvn_front_hwnd()) ? "MINIMISED" : "not minimised");
+        (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated, wd_iconic() ? "MINIMISED" : "not minimised");
     wdp("  render thread %lu, place in its present: %s; %s; fight near: %s\n", (unsigned long)g_render_tid, g_wd_where == 1 ? "the loading barrier (waits for the workers, at most 20 s)" : g_wd_where == 2 ? "vkAcquireNextImageKHR" : g_wd_where == 3 ? "blit and submit" : g_wd_where == 4 ? "vkQueuePresentKHR" : "not in a present",
         g_in_fight ? "the last frame was a FIGHT frame" : "the last frame was not a fight frame", fight_recent() ? "yes" : "no");
     wdp("  workers: %d threads; foreground jobs %lld queued / %lld done, background %lld / %lld, preparation %lld / %lld (%lld running); preparation state %d (0 not started, 1 running, 2 finished, 3 no containers, 5 store being built)%s, %d of %d containers read; loading-barrier holds %lld (time-outs %lld)\n",
@@ -152,6 +173,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         }
         if (!any) wdp("  waits of ours (stage / library / pipeline being made by another thread, queues): none entered\n");
     }
+#ifdef _WIN32
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, twice, 300 ms apart: who is running and who is blocked */
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te;
@@ -185,10 +207,35 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         CloseHandle(h);
     }
     { ULONGLONG first = ~0ull; for (int i = 0; i < nt; i++) if (th[i].born < first) { first = th[i].born; g_wd_main_tid = th[i].tid; } }      /* the process's first thread runs the guest's main thread (boot.c) */
+#else
+    /* Linux: every task of /proc/self/task, CPU time (per-thread clock, ns -> 100 ns units) twice 300 ms apart; name = comm. No call stacks yet. */
+    g_wd_main_tid = pid;                           /* the process's first thread runs the guest's main thread (boot.c); its tid is the pid */
+    for (int pass = 0; pass < 2; pass++) {
+        DIR *d = opendir("/proc/self/task");
+        struct dirent *de;
+        if (!d) break;
+        while ((de = readdir(d))) {
+            DWORD t = (DWORD)atoi(de->d_name);
+            struct timespec ts;
+            int i;
+            if (!t || t == me) continue;
+            for (i = 0; i < nt && th[i].tid != t; i++) {}
+            if (i == nt) { if (pass || nt == 400) continue; th[nt].tid = t; th[nt].cpu0 = th[nt].cpu1 = 0; th[nt].nfr = 0; th[nt].prio = 0; th[nt].born = t; nt++; }
+            if (clock_gettime((clockid_t)((~(unsigned)t << 3) | 4 | 2), &ts) == 0) { ULONGLONG cpu = ((ULONGLONG)ts.tv_sec * 1000000000ull + (ULONGLONG)ts.tv_nsec) / 100; if (pass) th[i].cpu1 = cpu; else th[i].cpu0 = th[i].cpu1 = cpu; }
+            th[i].prio = getpriority(PRIO_PROCESS, (id_t)t);        /* nice value, not a Win32 priority */
+        }
+        closedir(d);
+        if (!pass) Sleep(300);
+    }
+    /* TODO(Phase 8): call stacks of the other threads (tgkill + SIGRTMIN handler walking the frame pointer chain, dladdr for names). */
+    wdp("  (call stacks are not available on Linux yet; thread priorities below are nice values)\n");
+#endif
     wdp("  threads: %d (the watchdog's own not listed); \"cpu\" = CPU time used in 300 ms: 0.0 means blocked or idle\n", nt);
     for (int i = 0; i < nt; i++) {
         wdp("  thread %lu  %s  priority %d  cpu %.1f ms of 300\n", (unsigned long)th[i].tid, wd_tname(th[i].tid, tb, sizeof tb), th[i].prio, (double)(th[i].cpu1 - th[i].cpu0) / 10000.0);
+#ifdef _WIN32
         for (int f = 0; f < th[i].nfr; f++) { wd_addr(th[i].pc[f], ab, sizeof ab); wdp("      %2d  %s\n", f, ab); }
+#endif
     }
     wdp("nvn_vk_watchdog: ======== end of the report%s%s ========\n\n", g_wd_fp ? "; also appended to " : "", g_wd_fp ? path : "");
     fflush(stdout);
@@ -210,7 +257,7 @@ static DWORD WINAPI wd_main(void *arg) {
         }
         double s = (double)(tk() - b) / (double)fq.QuadPart;
         if (s < next || dumps >= 6) continue;
-        if (IsIconic((HWND)nvn_front_hwnd()) && g_wd_try != try0) { next = s + limit; continue; }      /* a minimised window: presents are skipped, the game runs */
+        if (wd_iconic() && g_wd_try != try0) { next = s + limit; continue; }      /* a minimised window: presents are skipped, the game runs */
         dumps++;
         wd_dump(s, g_wd_try - try0);
         reported = s; next = s * 4;

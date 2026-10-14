@@ -9,11 +9,21 @@
 
 uint64_t hook_address(const char *name);              /* fighter_sdk\hook_host.c (included by nnro.c) */
 
+#ifndef _WIN32
+#include <sys/uio.h>
+/* Linux: process_vm_readv on our own process fails with EFAULT instead of faulting, like ReadProcessMemory. */
+static int safe_read(uint64_t addr, void *buf, size_t n) {
+    if (addr < 0x10000) return 0;
+    struct iovec l = {buf, n}, r = {(void *)(uintptr_t)addr, n};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+}
+#else
 static int safe_read(uint64_t addr, void *buf, size_t n) {
     SIZE_T got = 0;
     if (addr < 0x10000) return 0;
     return ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)addr, buf, n, &got) && got == n;
 }
+#endif
 static uint64_t sr64(uint64_t a) { uint64_t v = 0; return safe_read(a, &v, 8) ? v : 0; }
 
 /* ---- the game's fighter entries (layout read off the lua_bind accessors of the game's own binary):
@@ -56,7 +66,9 @@ static void scan_copies(uint64_t rec) {
 
 /* SSBU_DEBUG_WATCH=1: hardware write watchpoints (debug registers of every thread) on a few fields of the first two
  * records; each write prints the guest functions on the stack of the writer (finds the code that fills the record). */
+#ifdef _WIN32
 #include <tlhelp32.h>
+#endif
 /* SSBU_DEBUG_MATCH="p1=<fighter>,p2=<fighter>,stage=<name>,form=omega,cpu=<level>,items=off|on,time=<min>|stock=<n>" */
 static struct { int p[2]; char stage[48]; int omega, cpu, items, time, stock; char text[256]; } g_dm = {{-1, -1}, "", 0, -1, -1, -1, -1, ""};
 static char g_dm_name[2][32];
@@ -105,7 +117,11 @@ void debug_mode_frame(long long frame) {
 static int fighter_kind_by_name(const char *name) {
     char *e; long v = strtol(name, &e, 0);
     if (*name && !*e) return (int)v;
+#ifdef _WIN32
     FILE *f = fopen("..\\reference\\skyline-smash\\src\\lua_const.rs", "r");
+#else
+    FILE *f = fopen("../reference/skyline-smash/src/lua_const.rs", "r");
+#endif
     if (!f) return -1;
     char key[96], line[256]; snprintf(key, sizeof key, "FIGHTER_KIND_%s:", name);
     for (char *p = key; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
@@ -135,6 +151,7 @@ static void parse_match(const char *s) {
 }
 static void match_player_hook(Ctx *c, void *user);
 static ImportFn g_orig_player_record;
+#ifdef _WIN32
 static LONG CALLBACK watch_veh(EXCEPTION_POINTERS *ep) {
     static volatile LONG shown;
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
@@ -197,6 +214,14 @@ static void watch_set(const uint64_t *addrs, int n) {
     CloseHandle(snap);
     printf("debug watch: %d watchpoints on %d threads\n", n, set); fflush(stdout);
 }
+#else
+/* TODO(Phase 8): hardware write watchpoints (Dr0-7 + vectored handler) -> perf_event_open(PERF_TYPE_BREAKPOINT) per thread of /proc/self/task + SIGTRAP handler, or drop. */
+static void watch_set(const uint64_t *addrs, int n) {
+    static int said;
+    (void)addrs; (void)n;
+    if (!said) { said = 1; printf("debug watch: hardware watchpoints are not available on Linux yet (SSBU_DEBUG_WATCH / SSBU_DEBUG_WATCHENTRY / SSBU_DEBUG_RESEARCH=2,3 do nothing)\n"); fflush(stdout); }
+}
+#endif
 
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);
 

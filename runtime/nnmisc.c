@@ -16,11 +16,18 @@
 #include <malloc.h>
 #include <setjmp.h>
 #include "plat.h"
+#ifdef _WIN32
 #include <wincrypt.h>
+#else
+#include <SDL3/SDL.h>
+#include "nnmisc_posix.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "advapi32.lib")
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -248,7 +255,15 @@ static uint8_t g_oe_event[0x40];
 static uint32_t g_oe_queue[16];
 static int g_oe_count, g_oe_event_ready, g_oe_focus_state = 1, g_oe_focus_mode = 0, g_oe_was_foreground;
 static int g_oe_opmode_notify, g_oe_perfmode_notify, g_oe_resume_notify, g_oe_focus_pending, g_oe_focus_recheck;
+#ifdef _WIN32
 static HWND g_oe_window;
+#else
+static void *g_oe_window;
+/* TODO(Phase 5): the SDL window does not exist yet. Report "focused, not minimised" (ours = our window has the input, minimised =
+ * SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED, ours = SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS). The freeze watcher
+ * (oe_watch) is not started on Linux until this reports real state. */
+static void oe_window_state(int *ours, int *minimised) { *ours = 1; *minimised = 0; }
+#endif
 static CRITICAL_SECTION g_oe_lock;
 static void oe_event_setup(void) {
     if (!g_oe_event_ready) { os_init_event((uint64_t)(uintptr_t)g_oe_event, 0); g_oe_event_ready = 1; }
@@ -271,6 +286,7 @@ extern volatile LONG g_guest_frozen;
 static volatile LONG g_oe_poll_count;
 static int g_oe_exit_requested;                           /* defined with the exit request code below */
 #define OE_MSG_RESUME 16u
+#ifdef _WIN32
 static BOOL CALLBACK oe_find_window(HWND w, LPARAM out) {
     DWORD pid = 0;
     if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return FALSE; }
@@ -317,27 +333,41 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
     }
     return 0;
 }
+#endif /* _WIN32: oe_find_window, oe_watch */
 static void oe_track_focus(void) {
     static int enabled = -1;
     static ULONGLONG last;
     static volatile LONG watcher;
     ULONGLONG now = GetTickCount64();
     if (enabled < 0) { const char *e = getenv("SSBU_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
+#ifdef _WIN32
     if (enabled && InterlockedCompareExchange(&watcher, 1, 0) == 0) CloseHandle(CreateThread(NULL, 0, oe_watch, NULL, 0, NULL));
+#else
+    (void)watcher;
+#endif
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
     last = now;
     g_oe_focus_recheck = 0;
+#ifdef _WIN32
     DWORD pid = 0;
     HWND fg = GetForegroundWindow();
     int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
     if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
     if (!g_oe_was_foreground) return;
+#else
+    int ours, minimised;
+    oe_window_state(&ours, &minimised);
+    if (ours) g_oe_was_foreground = 1;
+    if (!g_oe_was_foreground) return;
+#endif
     /* close4: the applet manager's rule (suyu am/lifecycle_manager.cpp UpdateRequestedFocusState, GetFocusStateWhile*), with
      * the window as the activity state: foreground = ForegroundVisible; visible but not the foreground window = ForegroundObscured
      * (something else has the input, as under an overlay or a library applet); minimised = Background (as behind the HOME menu).
      * The handling mode is what [sdk 0x32c3d0, table 0xa7ff70] sends for the oe mode: 0 = (notify 0, suspend 1), 1 = (notify 1,
      * suspend 0) NoSuspend, 2 = (notify 1, suspend 1), 3 = (notify 0, suspend 1) + SetOutOfFocusSuspendingEnabled(1) AlwaysSuspend. */
+#ifdef _WIN32
     int minimised = g_oe_window && IsIconic(g_oe_window);
+#endif
     int state = ours ? 1                                                    /* InFocus */
               : g_oe_focus_mode == 3 ? 1                                    /* AlwaysSuspend: the application never learns it */
               : !minimised ? 2                                              /* obscured: NotInFocus in the other three modes */
@@ -419,8 +449,14 @@ static void oe_SetOperationModeChangedNotificationEnabled(Ctx *c) { g_oe_opmode_
 /* While the game is inside such a section the console does not dim the screen or go to sleep by itself; the same is
  * asked of Windows (display and system kept awake) for as long as at least one section is open. */
 static volatile LONG g_oe_no_sleep;
+#ifdef _WIN32
 static void oe_BeginAutoSleepDisabledSection(Ctx *c) { (void)c; if (InterlockedIncrement(&g_oe_no_sleep) == 1) SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED); }
 static void oe_EndAutoSleepDisabledSection(Ctx *c) { (void)c; if (InterlockedDecrement(&g_oe_no_sleep) == 0) SetThreadExecutionState(ES_CONTINUOUS); }
+#else
+/* SDL_DisableScreenSaver is a harmless no-op until the video subsystem is up (Phase 5); SDL keeps the screen saver off until Enable. */
+static void oe_BeginAutoSleepDisabledSection(Ctx *c) { (void)c; if (InterlockedIncrement(&g_oe_no_sleep) == 1) SDL_DisableScreenSaver(); }
+static void oe_EndAutoSleepDisabledSection(Ctx *c) { (void)c; if (InterlockedDecrement(&g_oe_no_sleep) == 0) SDL_EnableScreenSaver(); }
+#endif
 static void oe_GetProgramTotalActiveTime(Ctx *c) {                    /* -> TimeSpan (nanoseconds) */
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);
@@ -468,6 +504,7 @@ static uint64_t desired_language(void) {
     static uint64_t cached;
     static const char *const supported[] = {"ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es", "es-419", "zh-Hans", "zh-Hant", "ko", "nl", "ru"};
     if (cached) return cached;
+#ifdef _WIN32
     char name[LOCALE_NAME_MAX_LENGTH * 3] = "", pick[16] = "en-US";
     const char *env = getenv("SSBU_LANGUAGE");
     wchar_t wname[LOCALE_NAME_MAX_LENGTH] = L"";
@@ -493,9 +530,16 @@ static uint64_t desired_language(void) {
             for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!_stricmp(two, supported[i])) strcpy(pick, supported[i]);
         }
     }
+#else
+    char name[128] = "", pick[16] = "en-US";
+    const char *env = getenv("SSBU_LANGUAGE");
+    if (env && env[0]) snprintf(name, sizeof name, "%s", env);
+    else misc_locale_to_tag(misc_env_locale(), name, sizeof name);       /* $LC_ALL / $LC_MESSAGES / $LANG; "C" -> en-US */
+    misc_map_language(name, pick);
+#endif
     uint64_t v = 0;
     memcpy(&v, pick, strlen(pick));
-    printf("nn::oe::GetDesiredLanguage: Windows display language \"%s\" -> \"%s\"\n", name, pick);
+    printf("nn::oe::GetDesiredLanguage: system display language \"%s\" -> \"%s\"\n", name, pick);
     cached = v;
     return v;
 }
@@ -519,7 +563,13 @@ static void err_dialog(unsigned category, unsigned number) {
     char text[160];
     if ((off && off[0] == '0') || getenv("SSBU_SEQ") || getenv("SSBU_PLAY") || getenv("SSBU_PRESS") || getenv("SSBU_SCRIPT")) return;
     snprintf(text, sizeof text, "Error Code: %04u-%04u\n\nAn error has occurred.", category, number);
+#ifdef _WIN32
     MessageBoxA(NULL, text, "Error", MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL);
+#else
+    /* SDL_ShowSimpleMessageBox works without a window or video subsystem when a dialog backend exists (zenity/kdialog/X11/Wayland); stderr otherwise. */
+    fprintf(stderr, "%s\n", text);
+    if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", text, NULL)) trace_printf("     nn::err: no message box available (%s)\n", SDL_GetError());
+#endif
 }
 static void err_ShowErrorResult(Ctx *c) {                 /* (Result): the console shows the error applet */
     uint32_t r = (uint32_t)A0;
@@ -543,6 +593,7 @@ static void prepo_PlayReport_ctor(Ctx *c) { wr8(A0, 0); wr64(A0 + 0x20, 0); wr64
 static void aoc_ListAddOnContent(Ctx *c) { RET(0); }      /* (int *out, int offset, int count) -> number written */
 
 /* ---------------------------------------------------------------- nn::util */
+#ifdef _WIN32
 static HCRYPTPROV crypt_provider(void) {
     static HCRYPTPROV prov;
     static volatile LONG lock;
@@ -551,12 +602,20 @@ static HCRYPTPROV crypt_provider(void) {
     InterlockedExchange(&lock, 0);
     return prov;
 }
+#endif
 int host_fixed_random(void *buffer, uint64_t size, const char *who, uint64_t lr);      /* os_threads.c: SSBU_FIXED_SEED */
+#ifdef _WIN32
 static void random_bytes(void *p, size_t n) {
     if (host_fixed_random(p, n, "nn::crypto / uuid random bytes", 0)) return;
     HCRYPTPROV prov = crypt_provider();
     if (!prov || !CryptGenRandom(prov, (DWORD)n, p)) for (size_t i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)rand();
 }
+#else
+static void random_bytes(void *p, size_t n) {
+    if (host_fixed_random(p, n, "nn::crypto / uuid random bytes", 0)) return;
+    if (!misc_getrandom(p, n)) for (size_t i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)rand();
+}
+#endif
 /* [sdk] GenerateUuid: 16 random bytes made an RFC 4122 version-4 UUID (byte 6 = 0x4X, byte 8 =
  * 10xxxxxx), returned by value in x0/x1 (16-byte struct; [game] 0x71016fa08c stores x0 and x1). */
 static void util_GenerateUuid(Ctx *c) {
@@ -576,6 +635,7 @@ static void util_BinaryBlockHeader_GetNextBlock(Ctx *c) { uint32_t off = rd32(A0
 
 /* ---------------------------------------------------------------- nn::crypto (Windows CryptoAPI) */
 static void crypto_RandomBytes(Ctx *c) { random_bytes((void *)(uintptr_t)A0, (size_t)A1); }
+#ifdef _WIN32
 static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t outSize, const void *data, size_t size) */
     HCRYPTHASH h = 0;
     uint8_t digest[20] = {0};
@@ -618,6 +678,46 @@ static void crypto_Md5_GetHash(Ctx *c) {                  /* (this, void *out, s
     memcpy((void *)(uintptr_t)A1, digest, A2 < sizeof digest ? (size_t)A2 : sizeof digest);
 }
 static void crypto_Md5_dtor(Ctx *c) { md5_drop(A0); }
+
+#else
+static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t outSize, const void *data, size_t size) */
+    misc_sha1 h;
+    uint8_t digest[20];
+    misc_sha1_init(&h);
+    misc_sha1_update(&h, (const void *)(uintptr_t)A2, (size_t)A3);
+    misc_sha1_final(&h, digest);
+    memcpy((void *)(uintptr_t)A0, digest, A1 < sizeof digest ? (size_t)A1 : sizeof digest);
+}
+/* Md5Impl: the guest object is not touched; the running hash is kept on the host, keyed by its address. */
+static struct { uint64_t key; misc_md5 h; } g_md5[64];
+static CRITICAL_SECTION g_md5_lock;
+static misc_md5 *md5_slot(uint64_t key, int create) {
+    misc_md5 *found = NULL;
+    EnterCriticalSection(&g_md5_lock);
+    for (int i = 0; i < 64 && !found; i++) if (g_md5[i].key == key) found = &g_md5[i].h;
+    for (int i = 0; i < 64 && !found && create; i++) if (!g_md5[i].key) { g_md5[i].key = key; misc_md5_init(&g_md5[i].h); found = &g_md5[i].h; }
+    LeaveCriticalSection(&g_md5_lock);
+    return found;
+}
+static void md5_drop(uint64_t key) {
+    EnterCriticalSection(&g_md5_lock);
+    for (int i = 0; i < 64; i++) if (g_md5[i].key == key) g_md5[i].key = 0;
+    LeaveCriticalSection(&g_md5_lock);
+}
+static void crypto_Md5_Initialize(Ctx *c) {
+    md5_drop(A0);
+    if (!md5_slot(A0, 1)) fatal(c, "nn::crypto Md5Impl: more than 64 hashes in progress");
+}
+static void crypto_Md5_Update(Ctx *c) { misc_md5 *h = md5_slot(A0, 0); if (h) misc_md5_update(h, (const void *)(uintptr_t)A1, (size_t)A2); }
+static void crypto_Md5_GetHash(Ctx *c) {                  /* (this, void *out, size_t outSize) */
+    misc_md5 *h = md5_slot(A0, 0);
+    uint8_t digest[16] = {0};
+    if (h) misc_md5_final(h, digest);
+    memcpy((void *)(uintptr_t)A1, digest, A2 < sizeof digest ? (size_t)A2 : sizeof digest);
+}
+static void crypto_Md5_dtor(Ctx *c) { md5_drop(A0); }
+
+#endif
 
 /* ---------------------------------------------------------------- nn::fs::GetSaveDataSize
  * (int64_t *outSize, int64_t *outJournalSize, const Uid&) -> Result: the sizes of the user's save data,
@@ -847,6 +947,13 @@ static void dump_unregistered(void) {
 
 /* close5 (lead) self-test: the two parental-control checks return BOOL true on a console without parental controls
  * ([sdk 0x33a620], [0x33aef0]); the image's text is read-only, its data writable (hostrt.c runtime_init). */
+#ifndef _WIN32
+#include <sys/mman.h>
+#include "vmem.h"
+/* IsBad{Read,Write}Ptr for the protection self-test below: a one-byte range answered from the region table. */
+static BOOL IsBadReadPtr(const void *p, size_t n) { vmem_info vi; (void)n; return !(vmem_query(p, &vi) && vi.state == VMEM_STATE_COMMITTED && (vi.prot & PROT_READ)); }
+static BOOL IsBadWritePtr(void *p, size_t n) { vmem_info vi; (void)n; return !(vmem_query(p, &vi) && vi.state == VMEM_STATE_COMMITTED && (vi.prot & PROT_WRITE)); }
+#endif
 int close5_lead_selftest(Ctx *c) {
     int bad = 0, n = 0;
     static const char *names[2] = {"_ZN2nn4pctl32CheckFreeCommunicationPermissionEb", "_ZN2nn4pctl27CheckStereoVisionPermissionEb"};

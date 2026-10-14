@@ -17,7 +17,51 @@
 #include <stdlib.h>
 #include <string.h>
 #include "plat.h"
+#ifdef _WIN32
 #include <psapi.h>
+#else
+#include <time.h>
+#include <sys/resource.h>
+/* Linux replacements for the psapi / kernel32 calls below. FILETIME values are in 100 ns units as on Windows.
+ * CPU "cycles" of a thread are its CPU time in ns (CLOCK of that tid, read through clock_gettime with the raw tid: no pthread_t needed). */
+typedef struct { DWORD cb, PageFaultCount; } PROCESS_MEMORY_COUNTERS;
+static BOOL GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *pmc, DWORD cb) {
+    struct rusage ru; (void)p; (void)cb;
+    if (getrusage(RUSAGE_SELF, &ru)) return FALSE;
+    pmc->PageFaultCount = (DWORD)(ru.ru_minflt + ru.ru_majflt);
+    return TRUE;
+}
+static void hitch_ft(FILETIME *f, unsigned long long t100) { f->dwLowDateTime = (DWORD)t100; f->dwHighDateTime = (DWORD)(t100 >> 32); }
+static BOOL GetProcessTimes(HANDLE p, FILETIME *c, FILETIME *e, FILETIME *k, FILETIME *u) {
+    struct rusage ru; (void)p; (void)c; (void)e;
+    if (getrusage(RUSAGE_SELF, &ru)) return FALSE;
+    hitch_ft(k, (unsigned long long)ru.ru_stime.tv_sec * 10000000ull + (unsigned long long)ru.ru_stime.tv_usec * 10ull);
+    hitch_ft(u, (unsigned long long)ru.ru_utime.tv_sec * 10000000ull + (unsigned long long)ru.ru_utime.tv_usec * 10ull);
+    return TRUE;
+}
+static BOOL GetSystemTimes(FILETIME *idle, FILETIME *kern, FILETIME *user) {       /* /proc/stat "cpu" line; kernel time includes idle as on Windows */
+    unsigned long long v[8] = {0};
+    FILE *f = fopen("/proc/stat", "r");
+    int n;
+    if (!f) return FALSE;
+    n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    fclose(f);
+    if (n < 4) return FALSE;
+    unsigned long long hz = (unsigned long long)sysconf(_SC_CLK_TCK), q = 10000000ull / (hz ? hz : 100);
+    hitch_ft(idle, (v[3] + v[4]) * q);
+    hitch_ft(kern, (v[2] + v[5] + v[6] + v[7] + v[3] + v[4]) * q);
+    hitch_ft(user, (v[0] + v[1]) * q);
+    return TRUE;
+}
+static BOOL hitch_thread_cycles(HANDLE h, ULONG64 *out) {
+    struct timespec ts;
+    DWORD tid = GetThreadId(h);
+    if (!tid || clock_gettime((clockid_t)((~(unsigned)tid << 3) | 4 | 2), &ts)) return FALSE;     /* MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED) */
+    *out = (ULONG64)ts.tv_sec * 1000000000ull + (ULONG64)ts.tv_nsec;
+    return TRUE;
+}
+#define QueryThreadCycleTime hitch_thread_cycles
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
