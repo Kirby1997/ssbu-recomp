@@ -27,7 +27,8 @@ if plat.LINUX:
     # Host sources that exist only for Windows (Media Foundation movies) are left out; sources added for Linux are listed in
     # LINUX_HOST_ADD. RECOMP_HOST_SKIP / RECOMP_HOST_ADD (comma lists) override both without editing this file.
     LINUX_HOST_SKIP = ['nnmovie_mf.c']
-    LINUX_HOST_ADD = []
+    # plat_posix.c / vmem.c / fiber_aarch64.S: the Win32 subset of plat.h, the guest address space, the fiber switch.
+    LINUX_HOST_ADD = ['plat_posix.c', 'vmem.c', 'fiber_aarch64.S']
     _skip = set(LINUX_HOST_SKIP + [x for x in os.environ.get('RECOMP_HOST_SKIP', '').split(',') if x])
     HOST_SOURCES = [x for x in HOST_SOURCES if x not in _skip] + [x for x in LINUX_HOST_ADD + os.environ.get('RECOMP_HOST_ADD', '').split(',')
                                                                   if x and x not in HOST_SOURCES]
@@ -87,7 +88,7 @@ HOST_FLAGS = ['-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(SDL_ROOT, 'include'),
               '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')]      # Khronos headers for nvn_vk.c (track V)
-HOST_FLAGS += plat.codegen_flags(shared=False) + plat.extra_include_flags()      # linux-arm64: target/sysroot, -ffp-contract=off ...; windows: nothing added
+HOST_FLAGS += plat.codegen_flags(shared=False) + plat.extra_include_flags() + plat.host_only_flags()      # linux-arm64: target/sysroot, -ffp-contract=off ...; windows: nothing added
 SDL_DIR = plat.sdl_libdir()      # SDL3 for nnpad_sdl.c; SDL3.dll (linux: libSDL3.so.0) is copied beside the exe at link (SDL3_ROOT / VULKAN_HEADERS: scripts/setup.py)
 LIBS = plat.exe_libs()
 
@@ -153,7 +154,7 @@ def cmd_link():
     if failed:
         return 1
     if plat.LINUX:
-        r = subprocess.run([CLANG] + plat.TARGET_FLAGS + ['-fno-omit-frame-pointer'] + objs + [game_import_lib()] + LIBS + ['-o', out], capture_output=True, text=True)
+        r = subprocess.run([CLANG] + plat.TARGET_FLAGS + plat.exe_link_flags() + objs + [game_import_lib()] + LIBS + ['-o', out], capture_output=True, text=True)
         if r.returncode == 0:      # bundle: libSDL3 beside the exe (rpath $ORIGIN); SDL3.dll is the windows name
             import shutil
             src = next((os.path.join(SDL_DIR, f) for f in ('libSDL3.so.0', 'libSDL3.so') if os.path.exists(os.path.join(SDL_DIR, f))), None)

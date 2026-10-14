@@ -5,6 +5,11 @@
  *     -Ddyn_syms=(*game_dyn_syms_p) -Ddyn_sym_count=(*game_dyn_sym_count_p)
  * so the tables declared in runtime.h become pointers into the DLL, filled in here before main(). */
 #include "runtime.h"
+#ifndef _WIN32      /* ELF: the one exported entry point needs default visibility (the library is built -fvisibility=hidden) */
+#define __declspec(x) SHIM_DECLSPEC_##x
+#define SHIM_DECLSPEC_dllexport __attribute__((visibility("default")))
+#define SHIM_DECLSPEC_dllimport
+#endif
 
 typedef struct {
     void (*call_indirect)(Ctx *, uint64_t);

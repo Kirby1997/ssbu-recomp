@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
-#include <windows.h>
+#include "plat.h"
 #define SSBU_EXPORT __declspec(dllexport)
 #else
 #include <pthread.h>

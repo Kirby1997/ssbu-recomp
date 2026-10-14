@@ -3,6 +3,11 @@
  * the host functions the lifted code calls are forwarded through pointers nnro.c hands over when it
  * loads the DLL. `nro_import` is what the module's PLT stubs call (see ro_study\recomp_nro.py). */
 #include "runtime.h"
+#ifndef _WIN32      /* ELF: the one exported entry point needs default visibility (the library is built -fvisibility=hidden) */
+#define __declspec(x) SHIM_DECLSPEC_##x
+#define SHIM_DECLSPEC_dllexport __attribute__((visibility("default")))
+#define SHIM_DECLSPEC_dllimport
+#endif
 
 typedef struct {
     void (*call_indirect)(Ctx *, uint64_t);

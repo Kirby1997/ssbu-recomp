@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>
+#include "plat.h"
 #include <shlwapi.h>
 #include "runtime.h"
 #include "hostrt.h"

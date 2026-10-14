@@ -62,7 +62,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #ifndef FONTLL_TEST
 #include "runtime.h"
 #include "hostrt.h"

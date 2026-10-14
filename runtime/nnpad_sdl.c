@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #include <SDL3/SDL.h>
 #include "nnpad.h"
 

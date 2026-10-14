@@ -57,7 +57,7 @@
  * <same>.userdata.bin.  The entry's hash (a keyed hash on the console, [suyu] caps_types.h comment) is this port's own
  * FNV-1a over the date and content type; an entry whose hash does not match is refused as "file not found". */
 #define COBJMACROS
-#include <windows.h>
+#include "plat.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -65,7 +65,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sdklift.h"
 
 #define A0 (c->x[0])

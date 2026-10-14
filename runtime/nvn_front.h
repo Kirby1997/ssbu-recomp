@@ -6,7 +6,7 @@
 #define NVN_FRONT_H
 #include <stdio.h>
 #include <stdint.h>
-#include <windows.h>
+#include "plat.h"
 #include <GL/gl.h>
 #include "mx_translate.h"
 

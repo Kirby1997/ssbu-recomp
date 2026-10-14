@@ -6,7 +6,7 @@
  * Environment switches of the test scripts (SSBU_RENDERER, SSBU_VK_DEVICE, SSBU_VK_PRESENT) win over the file.
  * The controllers.ini reader of nnpad_sdl.c is built around its device sections and is not reusable here: this file has
  * its own 30-line reader (key = value, ';' or '#' comments, section headers ignored). */
-#include <windows.h>
+#include "plat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -32,7 +32,7 @@
  * Nothing in this file computes a size or an alignment. */
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sdklift.h"
 #include "nvn_sdk.h"
 #include "nvn_c4.h"

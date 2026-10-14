@@ -37,6 +37,18 @@ def codegen_flags(shared):
     return TARGET_FLAGS + LINUX_CODEGEN + (LINUX_SHARED_CODE if shared else [])
 
 
+def host_only_flags():
+    """Extra compile flags of the host runtime (the executable). Linux: _GNU_SOURCE for plat.h; position-dependent code, because
+    the executable is linked -no-pie so its brk heap (and with it malloc, see vmem.c) sits low in the address space: Windows
+    never handed the game a pointer above 2^47 and this kernel's mmap/PIE area is at 0xaaaa.../0xffff... ."""
+    return ['-D_GNU_SOURCE', '-fno-pie'] if LINUX else []
+
+
+def exe_link_flags():
+    """Link flags of the executable (Linux only; see host_only_flags)."""
+    return ['-no-pie', '-fno-omit-frame-pointer'] if LINUX else []
+
+
 def default_shared_name(stem):
     """ssbu_game_eh_o1 -> ssbu_game_eh_o1.dll | libssbu_game_eh_o1.so"""
     return ('lib' + stem + '.so') if LINUX else (stem + '.dll')

@@ -2,7 +2,7 @@
  * call dispatch, import dispatch with tracing, and crash reporting. */
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 

@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <setjmp.h>
-#include <windows.h>
+#include "plat.h"
 #include <wincrypt.h>
 #include "runtime.h"
 #include "hostrt.h"

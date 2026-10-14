@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 

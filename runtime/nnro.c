@@ -26,7 +26,7 @@
  *     ro service, then info: +0 u32 = 1, +8 = nrr, +0x10 = list node (two pointers).
  *   Results are module 22; the SDK aborts on anything that is not (module 22, description 1..0x3ff).
  *   __nnmusl_init_dso returns 1 or 2; a module's _init runs its init_array unless the result is 1. */
-#include <windows.h>
+#include "plat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

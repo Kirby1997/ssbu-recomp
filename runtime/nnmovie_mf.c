@@ -67,7 +67,7 @@
  * re-synchronise (pause, seek, resume) the movie at the n-th video sample, see dec_SendInputBufferForDecode. */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "plat.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>

@@ -37,7 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <windows.h>
+#include "plat.h"
 
 #define LF_MAX 4096
 #define LF_MASK40 0xffffffffffull
