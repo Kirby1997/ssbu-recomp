@@ -1,8 +1,9 @@
 """Extract the values of data symbols the game imports from the SDK module (nn::util constants and
 tables, nn::hid ids) out of the real `sdk` binary, and emit them as C arrays in sdkdata.c."""
+import os
 import struct
 
-SDK = r'..\binaries\13.0.4\sdk.elf'
+SDK = os.path.join('..', 'binaries', '13.0.4', 'sdk.elf')   # relative to the current directory, as before
 d = open(SDK, 'rb').read()
 OFF = 0x1000
 # locate .dynsym / .dynstr through the section headers nso2elf wrote

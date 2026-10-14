@@ -144,6 +144,26 @@ def extended(n, option, shift):
     return '(%s << %d)' % (e, shift) if shift else e
 
 
+# ---------------------------------------------------------------- barriers
+# DMB / DSB option (CRm): the low two bits give the access types ordered (3 all, 2 stores, 1 loads); 0 is reserved and
+# treated as SY. The shareability domain (ISH / OSH / NSH / SY) makes no difference to a host process.
+# The RT_* macros are defined per host in runtime.h (on x86-64 they keep the code this lifter produced before: nothing).
+def barrier(w):
+    crm, op2 = bits(w, 11, 8), bits(w, 7, 5)
+    if op2 == 2:                                     # clrex: a later STXR must fail
+        return 'c->ex_addr = ~0ull;'
+    if op2 == 6:                                     # isb: no memory effect for the guest
+        return 'RT_COMPILER_BARRIER();'
+    if op2 == 4:                                     # dsb (any option): full barrier
+        return 'RT_FENCE_FULL();'
+    kind = crm & 3                                   # op2 == 5: dmb
+    if kind == 1:
+        return 'RT_FENCE_ACQ();'                     # dmb ishld / oshld / nshld / ld
+    if kind == 2:
+        return 'RT_FENCE_ST();'                      # dmb ishst / oshst / nshst / st
+    return 'RT_FENCE_FULL();'                        # dmb ish / osh / nsh / sy
+
+
 # ---------------------------------------------------------------- lifter
 class Fn:
     """Lifting context for one guest function (address range [entry, end))."""
@@ -267,7 +287,7 @@ class Fn:
         if (w & 0xffffffe0) in (0xd51b4400, 0xd51b4420):
             return ';'                                   # fpcr / fpsr write
         if (w & 0xfffff0ff) in (0xd503305f, 0xd50330bf, 0xd503309f, 0xd50330df):
-            return ';'                                   # clrex / dmb / dsb / isb
+            return barrier(w)                            # clrex / dmb / dsb / isb
         raise Unimpl('system')
 
     # ---- loads and stores
@@ -340,8 +360,8 @@ class Fn:
                 else:
                     body = 'wrv(a, &c->v[%d], %d);' % (rt, nbytes)
                 return '{ %s uint64_t a = %s; %s %s }' % (pre, a, body, post)
-            if size == 3 and opc == 2:
-                return ';'                               # prfm
+            if size == 3 and opc == 2 and not (bits(w, 24, 24) == 0 and bits(w, 21, 21) == 1 and bits(w, 11, 10) == 0):
+                return ';'                               # prfm (not the 64-bit LSE / LDAPR encodings: Unimpl below)
             pre, a, post = self.addr_mode(w, size)
             nb = 8 << size
             if opc == 0:
@@ -366,14 +386,16 @@ class Fn:
                 raise Unimpl('excl-pair')
             nb = 8 << size
             rs = bits(w, 20, 16)
-            if o2:                                       # ldar / stlr: ordered, not exclusive
-                if load:
-                    return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
-                return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
+            o0 = bits(w, 15, 15)                         # acquire (loads) / release (stores)
+            if o2:                                       # ldar / stlr (and ldlar / stllr): ordered, not exclusive
+                if load:                                 # rdacq / wrrel: runtime.h, LDAR / STLR on an ARM host
+                    return SET(rt, 1, 'rdacq%d(%s)' % (nb, XS(rn)))
+                return 'wrrel%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
             if load:                                     # ldxr / ldaxr: remember address and value
-                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, SET(rt, 1, 'c->ex_val'))
-            # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
-            return SET(rs, 0, 'stx%d(c, %s, %s)' % (nb, XS(rn), R(rt, size == 3)))
+                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = %s%d(a); %s }' % (XS(rn), 'rdacq' if o0 else 'rd', nb,
+                                                                                         SET(rt, 1, 'c->ex_val'))
+            # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap; stlx: sequentially consistent)
+            return SET(rs, 0, '%s%d(c, %s, %s)' % ('stlx' if o0 else 'stx', nb, XS(rn), R(rt, size == 3)))
         if bits(w, 31, 31) == 0 and bits(w, 29, 24) in (0x0c, 0x0d):   # AdvSIMD structure load/store
             q, post, load, rm = bits(w, 30, 30), bits(w, 23, 23), bits(w, 22, 22), bits(w, 20, 16)
             size = bits(w, 11, 10)

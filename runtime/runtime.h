@@ -45,18 +45,84 @@ void guest_svc(Ctx *c, uint32_t number);
     static inline void wr##bits(uint64_t a, uint##bits##_t v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 
-/* STXR: store only if the location still holds the value the matching LDXR read. Returns 0 on success. */
+/* Memory ordering of the guest (recomp.py emits these for LDAR / STLR / LDAXR / STLXR / DMB / DSB / ISB).
+ *
+ *   guest                        macro                    ARM host (aarch64)              x86-64 host (default)
+ *   ldar / ldaxr                 rdacq<N>(a)              __atomic_load_n SEQ_CST = LDAR  rd<N>: plain load
+ *   stlr                         wrrel<N>(a, v)           __atomic_store_n SEQ_CST = STLR wr<N>: plain store
+ *   stxr / stlxr                 stx<N> / stlx<N>         CAS acquire / CAS SEQ_CST       CAS SEQ_CST (both)
+ *   dmb ish / sy / osh / nsh,    RT_FENCE_FULL()          dmb ish                         nothing
+ *     any dsb
+ *   dmb ishld (any *ld)          RT_FENCE_ACQ()           dmb ishld                       nothing
+ *   dmb ishst (any *st)          RT_FENCE_ST()            dmb ishst                       nothing
+ *   isb                          RT_COMPILER_BARRIER()    compiler barrier                nothing
+ *   clrex                        c->ex_addr = ~0ull       (plain C, both hosts)
+ *
+ * x86-64 is TSO: every plain load is an acquire and every plain store a release, so the x86 definitions keep exactly
+ * the code the lifter produced before these macros existed (barriers were empty statements, ldar / stlr plain
+ * accesses). That leaves out the StoreLoad order of STLR -> LDAR and DMB ISH (and lets the compiler move ordinary
+ * accesses across a guest barrier), as before; -DRECOMP_X86_STRICT_FENCES=1 makes the x86 versions exact (mfence /
+ * xchg / compiler barriers) for experiments. An ARM host is weakly ordered and needs the real instructions.
+ * LDXR / STXR are never emitted as LDXR / STXR: the monitor would be cleared by spills between the two. Instead STXR is
+ * a compare-and-swap against the value LDXR read (ABA-equal to the guest only as far as a CAS is). */
+#if defined(__aarch64__)
+#define RT_FENCE_FULL()         __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define RT_FENCE_ACQ()          __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define RT_FENCE_ST()           __asm__ __volatile__("dmb ishst" ::: "memory")
+#define RT_COMPILER_BARRIER()   __asm__ __volatile__("" ::: "memory")
+#define RT_ORDERED_ATOMIC 1
+#elif defined(RECOMP_X86_STRICT_FENCES) && RECOMP_X86_STRICT_FENCES
+#define RT_FENCE_FULL()         __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define RT_FENCE_ACQ()          __asm__ __volatile__("" ::: "memory")
+#define RT_FENCE_ST()           __asm__ __volatile__("" ::: "memory")
+#define RT_COMPILER_BARRIER()   __asm__ __volatile__("" ::: "memory")
+#define RT_ORDERED_ATOMIC 1
+#else
+#define RT_FENCE_FULL()         ((void)0)
+#define RT_FENCE_ACQ()          ((void)0)
+#define RT_FENCE_ST()           ((void)0)
+#define RT_COMPILER_BARRIER()   ((void)0)
+#define RT_ORDERED_ATOMIC 0
+#endif
+
+#if RT_ORDERED_ATOMIC
+#define DEF_ORD(bits) \
+    static inline uint##bits##_t rdacq##bits(uint64_t a) { return __atomic_load_n((uint##bits##_t *)(uintptr_t)a, __ATOMIC_SEQ_CST); } \
+    static inline void wrrel##bits(uint64_t a, uint##bits##_t v) { __atomic_store_n((uint##bits##_t *)(uintptr_t)a, v, __ATOMIC_SEQ_CST); }
+#else
+#define DEF_ORD(bits) \
+    static inline uint##bits##_t rdacq##bits(uint64_t a) { return rd##bits(a); } \
+    static inline void wrrel##bits(uint64_t a, uint##bits##_t v) { wr##bits(a, v); }
+#endif
+DEF_ORD(8) DEF_ORD(16) DEF_ORD(32) DEF_ORD(64)
+
+/* STXR: store only if the location still holds the value the matching LDXR read. Returns 0 on success.
+ * On an ARM host stx<N> (STXR) is an ACQUIRE compare-and-swap and stlx<N> (STLXR) a sequentially consistent one.
+ * STXR cannot be relaxed: after LDAXR (an acquire load: LDAR) another thread can take and release the location
+ * (0 -> 1 -> 0) before our CAS, which then still succeeds (ABA; the guest's monitor would have failed the STXR). Only
+ * an acquire CAS synchronises with that newest release; with a relaxed one the guest's critical section can read data
+ * older than the previous owner's writes (tests/arm_host/litmus.c, "lock ldaxr/stxr .. stlr", lost updates). The
+ * lifter does not know which load an STXR pairs with, so every STXR is acquire (for LDXR / STXR it is merely stronger
+ * than the guest asked). On x86-64 both stay sequentially consistent: the same lock cmpxchg, and the same compiler
+ * barrier, that the previous __sync_bool_compare_and_swap gave (the x86 barrier macros above are empty). */
+#if defined(__aarch64__)
+#define RT_STX_ORDER __ATOMIC_ACQUIRE
+#else
+#define RT_STX_ORDER __ATOMIC_SEQ_CST
+#endif
 void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);
-#define DEF_STX(bits) \
-    static inline uint32_t stx##bits(Ctx *c, uint64_t a, uint##bits##_t v) { \
+#define DEF_STX(name, bits, order) \
+    static inline uint32_t name##bits(Ctx *c, uint64_t a, uint##bits##_t v) { \
         if (c->ex_addr != a) { stx_diag(c, a, 0, 0, v, -bits); return 1; } \
         c->ex_addr = ~0ull; \
-        if (__sync_bool_compare_and_swap((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)c->ex_val, v)) { c->ex_fail = 0; return 0; } \
+        uint##bits##_t expected = (uint##bits##_t)c->ex_val; \
+        if (__atomic_compare_exchange_n((uint##bits##_t *)(uintptr_t)a, &expected, v, 0, order, __ATOMIC_RELAXED)) { c->ex_fail = 0; return 0; } \
         uint##bits##_t seen; memcpy(&seen, (void *)(uintptr_t)a, sizeof seen); \
         stx_diag(c, a, c->ex_val, seen, v, bits); \
         return 1; \
     }
-DEF_STX(8) DEF_STX(16) DEF_STX(32) DEF_STX(64)
+DEF_STX(stx, 8, RT_STX_ORDER) DEF_STX(stx, 16, RT_STX_ORDER) DEF_STX(stx, 32, RT_STX_ORDER) DEF_STX(stx, 64, RT_STX_ORDER)
+DEF_STX(stlx, 8, __ATOMIC_SEQ_CST) DEF_STX(stlx, 16, __ATOMIC_SEQ_CST) DEF_STX(stlx, 32, __ATOMIC_SEQ_CST) DEF_STX(stlx, 64, __ATOMIC_SEQ_CST)
 
 static inline V128 rdv(uint64_t a, int n) { V128 v; v.d[0] = 0; v.d[1] = 0; memcpy(&v, (void *)(uintptr_t)a, (size_t)n); return v; }
 static inline void wrv(uint64_t a, const V128 *v, int n) { memcpy((void *)(uintptr_t)a, v, (size_t)n); }
@@ -131,11 +197,24 @@ static inline uint64_t sdiv64(uint64_t a, uint64_t b) {
     return (uint64_t)((int64_t)a / (int64_t)b);
 }
 
-/* float -> integer with AArch64 saturation semantics */
-static inline uint32_t f2s32(double v) { if (v != v) return 0; if (v >= 2147483647.0) return 0x7fffffffu; if (v <= -2147483648.0) return 0x80000000u; return (uint32_t)(int32_t)v; }
-static inline uint32_t f2u32(double v) { if (v != v || v <= 0) return 0; if (v >= 4294967295.0) return 0xffffffffu; return (uint32_t)v; }
-static inline uint64_t f2s64(double v) { if (v != v) return 0; if (v >= 9223372036854775807.0) return 0x7fffffffffffffffull; if (v <= -9223372036854775808.0) return 0x8000000000000000ull; return (uint64_t)(int64_t)v; }
-static inline uint64_t f2u64(double v) { if (v != v || v <= 0) return 0; if (v >= 18446744073709551615.0) return ~0ull; return (uint64_t)v; }
+/* float -> integer with AArch64 saturation semantics (the callers round first: trunc / rint / floor / ...) */
+static inline uint32_t f2s32_soft(double v) { if (v != v) return 0; if (v >= 2147483647.0) return 0x7fffffffu; if (v <= -2147483648.0) return 0x80000000u; return (uint32_t)(int32_t)v; }
+static inline uint32_t f2u32_soft(double v) { if (v != v || v <= 0) return 0; if (v >= 4294967295.0) return 0xffffffffu; return (uint32_t)v; }
+static inline uint64_t f2s64_soft(double v) { if (v != v) return 0; if (v >= 9223372036854775807.0) return 0x7fffffffffffffffull; if (v <= -9223372036854775808.0) return 0x8000000000000000ull; return (uint64_t)(int64_t)v; }
+static inline uint64_t f2u64_soft(double v) { if (v != v || v <= 0) return 0; if (v >= 18446744073709551615.0) return ~0ull; return (uint64_t)v; }
+#if defined(__aarch64__)
+/* FCVTZS / FCVTZU saturate and give 0 for NaN by themselves (tests/arm_host/fp_native_test.c checks them against the
+ * versions above). */
+static inline uint32_t f2s32(double v) { uint32_t r; __asm__("fcvtzs %w0, %d1" : "=r"(r) : "w"(v)); return r; }
+static inline uint32_t f2u32(double v) { uint32_t r; __asm__("fcvtzu %w0, %d1" : "=r"(r) : "w"(v)); return r; }
+static inline uint64_t f2s64(double v) { uint64_t r; __asm__("fcvtzs %x0, %d1" : "=r"(r) : "w"(v)); return r; }
+static inline uint64_t f2u64(double v) { uint64_t r; __asm__("fcvtzu %x0, %d1" : "=r"(r) : "w"(v)); return r; }
+#else
+static inline uint32_t f2s32(double v) { return f2s32_soft(v); }
+static inline uint32_t f2u32(double v) { return f2u32_soft(v); }
+static inline uint64_t f2s64(double v) { return f2s64_soft(v); }
+static inline uint64_t f2u64(double v) { return f2u64_soft(v); }
+#endif
 
 #include "fpexact.h"
 #include "neon.h"
