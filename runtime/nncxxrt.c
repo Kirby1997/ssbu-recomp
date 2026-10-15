@@ -34,6 +34,10 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "eh_runtime.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include "plat_crash.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -73,6 +77,17 @@ void cxxrt_guest_region(uint64_t base, uint64_t size) {
 }
 void cxxrt_mem_changed(void) { InterlockedIncrement(&g_mem_epoch); }
 void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery, %lld from the per-thread record of game-managed memory\n", (long long)g_rd_asked, (long long)g_rd_cached); }
+#ifndef _WIN32
+/* Linux: vmem.c answers from its region table for everything made through it (guest image, SDK image, nn::os address
+ * regions and memory blocks, NRO modules: a lookup, no page-table walk) and probes other host memory (malloc heap,
+ * thread and fiber stacks) with process_vm_readv; cheap enough that the per-thread record above is not needed. */
+int cxxrt_readable(uint64_t p, size_t n) {
+    (void)g_rd_nocache;
+    if (p < 0x10000) return 0;
+    g_rd_asked++;
+    return vmem_readable((const void *)(uintptr_t)p, n ? n : 1);
+}
+#else
 int cxxrt_readable(uint64_t p, size_t n) {
     static __declspec(thread) struct { uint64_t lo, hi; LONG epoch; } t_ok[4];
     static __declspec(thread) unsigned t_next;
@@ -91,6 +106,7 @@ int cxxrt_readable(uint64_t p, size_t n) {
     if (guest && g_mem_epoch == epoch) { unsigned k = t_next++ & 3; t_ok[k].lo = (uint64_t)(uintptr_t)mi.BaseAddress; t_ok[k].hi = t_ok[k].lo + mi.RegionSize; t_ok[k].epoch = epoch; }
     return p + n <= (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
 }
+#endif
 /* Calls guest (or host-table) code at addr with up to three arguments; returns x0. */
 uint64_t cxxrt_call(Ctx *c, uint64_t addr, uint64_t a0, uint64_t a1, uint64_t a2) {
     uint64_t lr = c->x[30];
@@ -108,6 +124,18 @@ void cxxrt_guest_delete(Ctx *c, uint64_t p) {            /* the game's own opera
     cxxrt_call(c, del, p, 0, 0);
     c->x[0] = x0;
 }
+#ifndef _WIN32
+void cxxrt_print_guest_stack(void) {                     /* frame-pointer walk (plat_crash.c): host frames -> lifted functions */
+    uint64_t pcs[600];
+    int n = crash_backtrace(pcs, 600);
+    printf("guest call stack (innermost first):\n");
+    uint64_t last = 0;
+    for (int i = 0, shown = 0; i < n && shown < 48; i++) {
+        uint64_t g = guest_function_of(pcs[i] - 4);     /* a return address: name the call, not what follows it */
+        if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); trace_printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+    }
+}
+#else
 void cxxrt_print_guest_stack(void) {
     CONTEXT ctx;
     RtlCaptureContext(&ctx);
@@ -124,6 +152,7 @@ void cxxrt_print_guest_stack(void) {
         if (!ctx.Rip) break;
     }
 }
+#endif
 static void fatal(Ctx *c, const char *fmt, ...) {
     char msg[768];
     va_list ap;
@@ -339,10 +368,25 @@ static const MainResume *g_main_resume;
 static int g_main_resume_n;
 void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t));               /* nnunwind.c */
 static void eh_bind_main(void) {
+#ifdef _WIN32
     HMODULE dll = NULL;
+#endif
     typedef void (*BindFn)(void (*)(Ctx *, void (*)(Ctx *, uint64_t)), const MainResume **, int *);
+#ifdef _WIN32
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&fn_table[0], &dll)) return;
     BindFn bind = (BindFn)(void *)GetProcAddress(dll, "game_eh_bind");
+#else
+    /* the library that holds fn_table (libssbu_game*.so): dladdr names it, RTLD_NOLOAD gives its handle without loading
+     * anything (and only that library is searched, as GetProcAddress on the module) */
+    Dl_info di;
+    BindFn bind = NULL;
+    if (!dladdr((const void *)&fn_table[0], &di) || !di.dli_fname) return;
+    void *dll = dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (!dll) dll = dlopen(NULL, RTLD_LAZY);             /* fn_table in the executable itself (its link map has no name) */
+    if (!dll) return;
+    bind = (BindFn)dlsym(dll, "game_eh_bind");
+    dlclose(dll);                                        /* NOLOAD took a reference; the library stays (DT_NEEDED) */
+#endif
     if (bind) bind(nro_catch_call, &g_main_resume, &g_main_resume_n);
     trace_printf("nncxxrt: main %s\n", bind ? "has landing-pad resume entries" : "was lifted without resume entries (exceptions cannot be handled in main code)");
 }

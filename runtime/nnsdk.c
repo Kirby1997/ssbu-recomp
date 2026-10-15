@@ -81,7 +81,11 @@ static void ldn_MakeIpv4Address(Ctx *c) { RET(((A0 & 0xff) << 24) | ((A1 & 0xff)
 /* ---- nn::os: virtual memory, used by the game's own allocator (jemalloc) */
 void cxxrt_guest_region(uint64_t base, uint64_t size); void cxxrt_mem_changed(void);      /* nncxxrt.c (P3) */
 static void os_AllocateAddressRegion(Ctx *c) {
+#ifdef _WIN32
     void *p = VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);      /* write watch: nvn_gl.c asks the OS which texture pages were written (P3) */
+#else
+    void *p = VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE, PAGE_NOACCESS);      /* vmem.c reservation (no write watch: its only reader was the GL renderer, not built here) */
+#endif
     if (p) cxxrt_guest_region((uint64_t)(uintptr_t)p, A1);      /* nncxxrt.c: readable checks inside this region are remembered (P3) */
     wr64(A0, (uint64_t)p);
     RET(p ? 0 : 0x1015);                                 /* any non-zero nn::Result means failure */

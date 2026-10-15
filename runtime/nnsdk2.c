@@ -500,9 +500,24 @@ static int mem_selftest(Ctx *c) {
     return bad;
 }
 
+#ifndef _WIN32
+#include <sys/mman.h>
+/* Guest stack of a test context: committed read-write through vmem.c with the lowest 64 KiB PROT_NONE, so an overflow
+ * faults (crash report) instead of running into the allocation below it (vmem.c packs allocations next to each other). */
+static uint8_t *guest_stack_alloc(size_t size) {
+    uint8_t *s = vmem_alloc(size, PROT_READ | PROT_WRITE);
+    if (s && vmem_protect(s, 0x10000, PROT_NONE, NULL)) printf("nnsdk2: cannot put a guard below the test stack at %p\n", (void *)s);
+    return s;
+}
+#endif
+
 static void selftest(void) {
     Ctx *c = _aligned_malloc(sizeof *c, 16);
+#ifdef _WIN32
     uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    uint8_t *stack = guest_stack_alloc(8 << 20);
+#endif
     memset(c, 0, sizeof *c);
     c->x[31] = P(stack + (8 << 20) - 0x1000);
     c->tpidr = P(VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));   /* the thread's own block: lifted libc keeps errno there */
@@ -585,7 +600,11 @@ static void eh_main_test_report(FILE *out) {
 static void eh_main_test(void) {
     static const char thrower[] = "_ZNKSt3__120__vector_base_commonILb1EE20__throw_length_errorEv";
     Ctx *c = _aligned_malloc(sizeof *c, 16);
+#ifdef _WIN32
     uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    uint8_t *stack = guest_stack_alloc(8 << 20);
+#endif
     int sym = -1;
     memset(c, 0, sizeof *c);
     c->x[31] = P(stack + (8 << 20) - 0x1000);

@@ -5,6 +5,11 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include "plat_crash.h"      /* signals + frame-pointer walks replace the SEH filter and RtlVirtualUnwind */
+#endif
 
 #define FILE_OFF 0x1000ULL
 #define FILE_IMAGE 0x52a8570ULL
@@ -103,7 +108,11 @@ uint64_t hostfn_address(const char *name, ImportFn fn) {
     if (i == g_hostfn_count && i < MAX_HOSTFN) {
         strncpy(g_hostfn[i].name, name, sizeof g_hostfn[i].name - 1);
         g_hostfn[i].fn = fn;
+#ifdef _WIN32
         g_hostfn_count = i + 1;
+#else
+        __atomic_store_n(&g_hostfn_count, i + 1, __ATOMIC_RELEASE);   /* call_indirect reads it without the lock: the entry must be complete first */
+#endif
         fresh = 1;
     }
     ReleaseSRWLockExclusive(&g_hostfn_lock);
@@ -177,7 +186,11 @@ static void icall_record(Ctx *c, uint64_t addr) {
             break;
         }
     }
+#ifdef _WIN32
     g_icall_lock = 0;
+#else
+    __atomic_store_n(&g_icall_lock, 0, __ATOMIC_RELEASE);     /* a plain store does not order the table writes above on ARM */
+#endif
 }
 uint64_t icall_first_x0(uint64_t target) {
     for (int i = 0; i < ICALL_MAX; i++) if (g_icall[i].target == target) return g_icall[i].x0;
@@ -201,7 +214,11 @@ void call_indirect(Ctx *c, uint64_t addr) {
         fn(c);
         return;
     }
+#ifdef _WIN32
     if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16) {
+#else
+    if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)__atomic_load_n(&g_hostfn_count, __ATOMIC_ACQUIRE) * 16) {   /* pairs with hostfn_address */
+#endif
         int i = (int)((addr - HOSTFN_BASE) / 16);
         if (InterlockedIncrement64(&g_hostfn[i].calls) == 1) {
             g_hostfn[i].first = InterlockedIncrement64(&g_hostfn_seq);
@@ -321,8 +338,13 @@ void host_import(Ctx *c, int sym) {
     LARGE_INTEGER q0, q1, fq;
     uint64_t ra = c->x[30], x1 = c->x[1], x2 = c->x[2];
     char txt[72]; txt[0] = 0;
+#ifdef _WIN32
     {   MEMORY_BASIC_INFORMATION mi;               /* the third argument as text, when it is one (read BEFORE the call: the registers change) */
         if (x2 > 0x10000 && VirtualQuery((const void *)(uintptr_t)x2, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize > x2 + 80) {
+#else
+    {   /* vmem.c: region table, else a process_vm_readv probe (VirtualQuery of host memory would parse /proc/self/maps per call) */
+        if (x2 > 0x10000 && vmem_readable((const void *)(uintptr_t)x2, 80)) {
+#endif
             const unsigned char *s = (const unsigned char *)(uintptr_t)x2; int k = 0;
             for (; k < 70 && s[k] >= 32 && s[k] < 127; k++) txt[k] = (char)s[k];
             txt[k] = 0;
@@ -445,17 +467,26 @@ void report_and_exit(int code) {
 void guest_trap(const char *what, uint64_t addr) {
     printf("\nGUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
     trace_printf("GUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
+#ifdef _WIN32
     RaiseException(0xE0000001, 0, 0, NULL);
     report_and_exit(2);
+#else
+    crash_report_here(0xE0000001, "guest trap");      /* as the SEH filter: dump + report_and_exit(4) (2 is only reached under a debugger on Windows) */
+#endif
 }
 void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
     printf("\nUNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
     trace_printf("UNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
+#ifdef _WIN32
     RaiseException(0xE0000002, 0, 0, NULL);
     report_and_exit(3);
+#else
+    crash_report_here(0xE0000002, "untranslated instruction");
+#endif
 }
 void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kernel call)", number); }
 
+#ifdef _WIN32
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
     printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
@@ -480,6 +511,21 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     report_and_exit(4);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#else
+/* plat_crash.c has printed the signal (or crash_report_here's code), the fault address and the host call stack (frame
+ * pointers from the signal's ucontext); the guest side of the report is the same as the Windows filter's. */
+static void crash_report(const crash_info *ci) {
+    dump_guest_registers();
+    printf("guest call stack (innermost first):\n");
+    uint64_t last = 0;
+    for (int i = 0, shown = 0; i < ci->npcs && shown < 40; i++) {
+        uint64_t pc = ci->pcs[i] - (ci->sig && i == 0 ? 0 : 4);   /* a signal's pcs[0] is the faulting pc; the rest are return addresses: name the call */
+        uint64_t g = guest_function_of(pc);
+        if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+    }
+    report_and_exit(4);
+}
+#endif
 
 /* ---------------------------------------------------------------- loader */
 void runtime_init(const char *elf, const char *trace_path) {
@@ -499,6 +545,7 @@ void runtime_init(const char *elf, const char *trace_path) {
                (void *)g_by_host[0].fn, (void *)g_by_host[fn_table_count - 1].fn);
     }
     g_trace = fopen(trace_path, "w");
+#ifdef _WIN32
     SetUnhandledExceptionFilter(crash_filter);
 
     void *mem = VirtualAlloc((void *)GUEST_BASE, IMAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -506,6 +553,16 @@ void runtime_init(const char *elf, const char *trace_path) {
     /* data symbols provided by other modules: zero-filled placeholders, IMPORT_SLOT bytes each */
     void *imp = VirtualAlloc((void *)IMPORT_BASE, (SIZE_T)dyn_sym_count * IMPORT_SLOT, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area\n"); exit(1); }
+#else
+    crash_install(crash_report, 4);                  /* SIGSEGV/BUS/ILL/FPE/TRAP; this thread's alternate stack (others: crash_thread_init) */
+    vmem_init();                                     /* normally done first thing in main; idempotent */
+    /* both inside the guest window vmem_init reserved (GUEST 0x71, IMPORT 0x73): carved out of it, zero-filled */
+    void *mem = vmem_reserve(GUEST_BASE, IMAGE_SIZE, PROT_READ | PROT_WRITE);
+    if (mem != (void *)GUEST_BASE) { fprintf(stderr, "cannot map guest image at 0x%llx: %s\n", GUEST_BASE, strerror(errno)); vmem_dump(stderr); exit(1); }
+    /* data symbols provided by other modules: zero-filled placeholders, IMPORT_SLOT bytes each */
+    void *imp = vmem_reserve(IMPORT_BASE, (size_t)dyn_sym_count * IMPORT_SLOT, PROT_READ | PROT_WRITE);
+    if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area: %s\n", strerror(errno)); vmem_dump(stderr); exit(1); }
+#endif
     FILE *f = fopen(elf, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", elf); exit(1); }
     fseek(f, (long)FILE_OFF, SEEK_SET);
@@ -541,8 +598,13 @@ void runtime_init(const char *elf, const char *trace_path) {
      * relocations are applied (all of them land in the data segment: the image would not load on the console otherwise), so a
      * wild write into code or constants faults instead of corrupting silently. SSBU_NO_PROTECT=1 leaves the old mapping. */
     if (!getenv("SSBU_NO_PROTECT")) {
+#ifdef _WIN32
         DWORD oldp;
         if (!VirtualProtect((void *)GUEST_BASE, GUEST_RO_END, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
+#else
+        int rc = vmem_protect((void *)GUEST_BASE, GUEST_RO_END, PROT_READ, NULL);
+        if (rc) { fprintf(stderr, "cannot protect the image's text and read-only data: %s\n", strerror(-rc)); exit(1); }
+#endif
         printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + GUEST_RO_END);
     }
 }
@@ -569,6 +631,11 @@ void runtime_init(const char *elf, const char *trace_path) {
 #include "fake_openlist.h"
 
 /* 0 = real code; 1 = empty body; 2 = only stores constants (x0 := *x0 when *sets_x0) */
+#ifndef _WIN32
+/* aarch64 host: the same test on A64 code (plat_crash.c a64_trivial: ret / mov-movk constants / str-stp to [x0, #off]
+ * / b tail jumps; the x86-64 decoder below is the Windows build's). */
+int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) { return a64_trivial((const void *)fn, x0, sets_x0); }
+#else
 int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     const unsigned char *p = (const unsigned char *)fn;
     int stores = 0;
@@ -602,6 +669,7 @@ int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     }
     return 0;
 }
+#endif
 
 static int audit_listed(const char *name) {
     int lo = 0, hi = (int)(sizeof audit_whitelist / sizeof audit_whitelist[0]) - 1;
@@ -663,7 +731,12 @@ static void audit_hostfn(const char *name, ImportFn fn) {
 
 static void audit_write(const char *path, int with_counts) {
     FILE *f = fopen(path, "w");
+#ifdef _WIN32
     uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+#else
+    Dl_info di;                                              /* the executable's load address (GetModuleHandle(NULL) is a dlopen handle here) */
+    uintptr_t base = dladdr((void *)audit_write, &di) ? (uintptr_t)di.dli_fbase : 0;
+#endif
     if (!f) { printf("audit: cannot write %s\n", path); return; }
     fprintf(f, "# list\tname\tcalls\thandler_rva\tkind\tx0\tdata_redirect\n");
     for (int i = 0; i < dyn_sym_count; i++) {
