@@ -8,6 +8,9 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include "plat_crash.h"
+#endif
 
 #define NNINIT_STARTUP (GUEST_BASE + 0x2c55e0ULL)
 #define NN_MAIN (GUEST_BASE + 0x2c5620ULL)
@@ -158,6 +161,13 @@ static DWORD WINAPI profiler(LPVOID arg) {
                 printf("[prof] f_%llx lr %llx: %u\n", (unsigned long long)g_prof[j].callee, (unsigned long long)g_prof[j].caller, g_prof[j].n);
         return 0;
     }
+#ifndef _WIN32
+    /* TODO(linux): sample with tgkill(SIGRTMIN) to the target and a handler that walks the frame-pointer chain of its
+     * ucontext (the executable is built with -fno-omit-frame-pointer); mode f above works as is. */
+    (void)end;
+    printf("[prof] SSBU_PROF sampling mode: not implemented on Linux yet (use SSBU_PROF=<start>,<duration>,f)\n");
+    return 0;
+#else
     while (GetTickCount64() < end) {
         CONTEXT ctx;
         uint64_t chain[64];
@@ -191,6 +201,7 @@ static DWORD WINAPI profiler(LPVOID arg) {
     for (int j = 0; j < g_prof_used; j++)
         printf("[prof] f_%llx <- f_%llx: %u\n", (unsigned long long)g_prof[j].callee, (unsigned long long)g_prof[j].caller, g_prof[j].n);
     return 0;
+#endif
 }
 
 static size_t main_stack_size_from_npdm(void) {
@@ -229,6 +240,9 @@ void main_stack_report(void) {
 
 static DWORD WINAPI guest_main(LPVOID arg) {
     (void)arg;
+#ifndef _WIN32
+    crash_thread_init();                     /* alternate signal stack (host_thread_start did it already: idempotent) */
+#endif
     static Ctx c;
     /* close5: the main thread's stack has the size the program's own meta data asks for (main.npdm, META header +0x1c:
      * 0x100000 for this game; read from the file next to the ELF), with no-access pages below and above it, so that an
@@ -276,6 +290,9 @@ static DWORD WINAPI guest_main(LPVOID arg) {
 }
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
+    vmem_init();                             /* the guest address space, before SDL / Vulkan / anything else maps memory */
+#endif
     g_elf = argc > 1 ? argv[1] : "..\\binaries\\13.0.4\\main.elf";
     setvbuf(stdout, NULL, _IONBF, 0);
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
@@ -320,7 +337,17 @@ int main(int argc, char **argv) {
     display_init();
     int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */
     /* the lifted code uses the host stack for every guest call: give it plenty */
+#ifdef _WIN32
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+#else
+    /* os_threads.c: a pthread on a 1 GiB stack below 2^47 (vmem) with a guard page; t is plat's waitable thread handle */
+    struct host_thread *host_thread_create(size_t stack, LPTHREAD_START_ROUTINE fn, void *arg, const char *name, int suspended);
+    HANDLE host_thread_handle(struct host_thread *t);
+    void host_thread_release(struct host_thread *t);
+    struct host_thread *main_ht = host_thread_create((size_t)1 << 30, guest_main, NULL, "guest_main", 0);
+    HANDLE t = host_thread_handle(main_ht);
+    if (!t) { fprintf(stderr, "cannot start the main guest thread\n"); return 1; }
+#endif
     if (getenv("SSBU_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
     DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
@@ -349,6 +376,9 @@ int main(int argc, char **argv) {
                 }
             }
             /* where is the main host thread really? sample its instruction pointer and unwind */
+#ifndef _WIN32
+            printf("  host stack samples: not implemented on Linux yet (TODO: tgkill + SIGRTMIN, frame-pointer walk)\n");
+#else
             for (int s = 0; s < 3; s++) {
                 Sleep(50);
                 CONTEXT ctx;
@@ -372,6 +402,7 @@ int main(int argc, char **argv) {
                 printf("\n");
                 ResumeThread(t);
             }
+#endif
             for (int s = 0; s < 8; s++) {            /* is it moving? sample a few times */
                 Sleep(37);
                 printf("  sample %d: f_%llx lr=%llx x0=%llx x1=%llx x8=%llx x9=%llx x11=%llx x12=%llx\n", s,
@@ -407,5 +438,8 @@ int main(int argc, char **argv) {
         }
         report_and_exit(0);
     }
+#ifndef _WIN32
+    host_thread_release(main_ht);           /* ended: pthread_join once, the stack goes */
+#endif
     return 0;
 }

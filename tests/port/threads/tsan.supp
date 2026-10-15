@@ -1,0 +1,3 @@
+# Known, benign: nn::os::SetThreadName on a running thread replaces Obj.name (release store, the old copy is never
+# freed) while the thread or a diagnostic reads it with a plain load (address dependency orders the bytes on ARM).
+race:os_SetThreadName

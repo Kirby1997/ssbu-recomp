@@ -10,6 +10,11 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include "plat_crash.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -37,6 +42,10 @@ typedef struct Obj {
     uint64_t target, user;                   /* multi-wait holders */
     struct Obj *holders[64];                 /* multi-wait */
     int holder_count;
+#ifndef _WIN32
+    struct host_thread *host;                /* threads: the pthread and its stack (released at DestroyThread) */
+    uint8_t *fiber_stack;                    /* fibers: vmem allocation of the host stack */
+#endif
 } Obj;
 
 #define BUCKETS 65536
@@ -74,7 +83,10 @@ static DWORD ns_to_ms(int64_t ns) { return ns <= 0 ? 0 : (DWORD)((ns + 999999) /
 /* nn::os::SleepThread takes nanoseconds and the console's timer is good to a few microseconds. Sleep() counts whole
  * milliseconds on a 1 ms (or 15.6 ms) grid, so the wait runs on a high-resolution waitable timer (100 ns units,
  * Windows 10 1803 and later); Sleep() is only the fallback. A zero or negative span yields, as on the console. */
+/* Linux: clock_nanosleep to an absolute CLOCK_MONOTONIC deadline (no drift when a signal interrupts it), with the
+ * thread's timer slack set to 1 ns on its first sleep (default 50 us: every sleep would be up to 50 us late). */
 static void sleep_ns(int64_t ns) {
+#ifdef _WIN32
     static __declspec(thread) HANDLE timer;
     static __declspec(thread) int no_timer;
     LARGE_INTEGER due;
@@ -84,13 +96,29 @@ static void sleep_ns(int64_t ns) {
         if (!timer) no_timer = 1;
     }
     due.QuadPart = -((ns + 99) / 100);
+#else
+    static __declspec(thread) int slack_set;
+    const int timer = 1;
+    if (ns <= 0) { SwitchToThread(); return; }
+    if (!slack_set) { prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL); slack_set = 1; }
+#endif
     /* Session 8 (track V), SSBU_SLEEP_LOG=1: a line for every sleep that lasted 2 ms longer than asked (first 200). */
     static int lg = -1; static LONG nl;
     if (lg < 0) lg = getenv("SSBU_SLEEP_LOG") && atoi(getenv("SSBU_SLEEP_LOG"));
     LARGE_INTEGER q0, q1, fq;
     if (lg) QueryPerformanceCounter(&q0);
+#ifdef _WIN32
     if (!timer || !SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) Sleep(ns_to_ms(ns));
     else WaitForSingleObject(timer, INFINITE);
+#else
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t at = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec + ns;
+        ts.tv_sec = (time_t)(at / 1000000000LL); ts.tv_nsec = (long)(at % 1000000000LL);
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+    }
+#endif
     if (lg) {
         extern long long nvn_front_frame_next(void);
         QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&fq);
@@ -99,12 +127,12 @@ static void sleep_ns(int64_t ns) {
             static __declspec(thread) long long fr0, cnt, zero; static __declspec(thread) double a_sum, s_sum, a_max; static LONG nf;
             long long fr = nvn_front_frame_next();
             if (fr != fr0) {
-                if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
+                if (fr0 > 1900 && s_sum > 8.0 && InterlockedIncrement(&nf) <= 300) printf("sleep_log: frame %lld, thread %lu: %lld sleeps in the frame, asked %.3f ms in all (longest asked %.3f), slept %.3f ms\n", fr0, (unsigned long)GetCurrentThreadId(), cnt, a_sum, a_max, s_sum);
                 fr0 = fr; cnt = 0; a_sum = s_sum = a_max = 0;
             }
             cnt++; a_sum += asked; s_sum += ms; if (asked > a_max) a_max = asked;
         }
-        if (ms > asked + 2.0 && InterlockedIncrement(&nl) <= 600) { printf("sleep_log: frame %lld, thread %lu: asked %.3f ms, slept %.3f ms (%s)\n", nvn_front_frame_next(), GetCurrentThreadId(), asked, ms, timer ? "high-resolution timer" : "Sleep"); fflush(stdout); }
+        if (ms > asked + 2.0 && InterlockedIncrement(&nl) <= 600) { printf("sleep_log: frame %lld, thread %lu: asked %.3f ms, slept %.3f ms (%s)\n", nvn_front_frame_next(), (unsigned long)GetCurrentThreadId(), asked, ms, timer ? "high-resolution timer" : "Sleep"); fflush(stdout); }
     }
 }
 
@@ -128,14 +156,66 @@ static void sleep_ns(int64_t ns) {
  * Off by default: three pinned processors on a busy PC cost frame rate (measured in the round: see R6_fake_audit.md). */
 static int g_cc = -1;
 static DWORD_PTR g_cc_core[3];
+#ifndef _WIN32
+/* Linux: no "every second processor" rule (the Frame has no SMT; big.LITTLE instead: cpu_capacity 216 cpu0-1, 855
+ * cpu2-4, 803 cpu5-6, 1024 cpu7). The processors of the largest /sys/devices/system/cpu/cpuN/cpu_capacity first (1024
+ * where the file is missing), lowest number first among equals, never two of one core's SMT siblings
+ * (topology/thread_siblings_list): cpu7, cpu2, cpu3 on the Frame. */
+static long sys_cpu_read(int cpu, const char *file, char *buf, size_t n) {
+    char path[96];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/%s", cpu, file);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t got = fread(buf, 1, n - 1, f);
+    fclose(f);
+    buf[got] = 0;
+    return (long)got;
+}
+static uint64_t cpu_siblings(int cpu) {               /* "0-1,4" -> mask; the cpu itself if unknown */
+    char b[128];
+    uint64_t m = 0;
+    if (sys_cpu_read(cpu, "topology/thread_siblings_list", b, sizeof b) > 0)
+        for (char *p = b; *p;) {
+            char *e;
+            long lo = strtol(p, &e, 10), hi = lo;
+            if (e == p) break;
+            if (*e == '-') { p = e + 1; hi = strtol(p, &e, 10); }
+            for (long i = lo; i <= hi && i < 64; i++) if (i >= 0) m |= 1ull << i;
+            p = *e == ',' ? e + 1 : e;
+            if (*p == '\n') break;
+        }
+    return m | 1ull << cpu;
+}
+int pick_big_cpus(DWORD_PTR allowed, DWORD_PTR *out, int want) {
+    long cap[64];
+    uint64_t taken = 0;
+    int n = 0;
+    for (int i = 0; i < 64; i++) {
+        char b[32];
+        cap[i] = !(allowed >> i & 1) ? -1 : sys_cpu_read(i, "cpu_capacity", b, sizeof b) > 0 ? atol(b) : 1024;
+    }
+    while (n < want) {
+        int best = -1;
+        for (int i = 0; i < 64; i++) if (cap[i] >= 0 && !(taken >> i & 1) && (best < 0 || cap[i] > cap[best])) best = i;
+        if (best < 0) break;
+        taken |= cpu_siblings(best);
+        out[n++] = (DWORD_PTR)1 << best;
+    }
+    return n;
+}
+#endif
 static int console_cores(void) {
     if (g_cc < 0) {
         int n = 0, on = 0;
         if (getenv("SSBU_OS_CONSOLE_CORES")) {
             DWORD_PTR proc = 0, sys = 0;
             GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+#ifdef _WIN32
             for (int b = (int)(sizeof(DWORD_PTR) * 8) - 1; b >= 0 && n < 3; b--)      /* from the top, every second processor: not two hardware threads of one core */
                 if (proc >> b & 1) { g_cc_core[n++] = (DWORD_PTR)1 << b; b--; }
+#else
+            n = pick_big_cpus(proc, g_cc_core, 3);
+#endif
             on = n == 3;
             printf("nn::os: console core model %s (SSBU_OS_CONSOLE_CORES): host processor masks %llx %llx %llx for cores 0 1 2\n", on ? "ON" : "NOT possible (fewer than 3 usable processors)",
                    (unsigned long long)g_cc_core[0], (unsigned long long)g_cc_core[1], (unsigned long long)g_cc_core[2]);
@@ -175,6 +255,139 @@ static uint8_t g_main_thread[0x400];
 uint64_t os_main_thread_type(void) { return (uint64_t)(uintptr_t)g_main_thread; }   /* boot.c: stored at thread block +0x1f8, as [sdk 0x3349dc] does */
 uint64_t g_main_stack_base, g_main_stack_size;        /* set by boot.c */
 static volatile LONG g_thread_count;
+#ifndef _WIN32
+/* A fiber may be resumed by another host thread: t_fiber / t_thread_fiber are only read and written through these
+ * accessors in code that can switch (fiber.h, TLS HAZARD). */
+PLAT_TLS_ACCESSORS(uint64_t, t_fiber)
+PLAT_TLS_ACCESSORS(void *, t_thread_fiber)
+
+/* ---- host threads (Linux). Guest threads and boot.c's main guest thread run on pthreads whose stacks come from
+ * vmem_alloc: below 2^47 like every other host address the guest may be handed (glibc would map them at 0xffff...),
+ * with a 64 KiB PROT_NONE guard below. glibc keeps the thread descriptor and the static TLS block at the top of a
+ * caller-provided stack, so _Thread_local data is low too. The HANDLE (host_thread_handle) is plat's own object for the
+ * thread (DuplicateHandle of GetCurrentThread() inside it): waitable any number of times and by any number of threads,
+ * with timeouts; SetThreadPriority / SetThreadAffinityMask / GetThreadId work on it. DIFF: GetExitCodeThread on it
+ * gives 0 (plat signals the end from its TSD destructor); the return value of fn is host_thread_exit_code. The stack
+ * goes at host_thread_release: pthread_join exactly once, after the thread has ended (later if it is still running). */
+#define HOST_STACK_GUARD 0x10000u
+typedef struct host_thread {
+    pthread_t pt;
+    uint8_t *map;                            /* vmem allocation: guard, then the stack */
+    size_t size;
+    LPTHREAD_START_ROUTINE fn;
+    void *arg;
+    HANDLE h, ready, gate;                   /* plat thread handle (the creator's reference); events: h is set / fn may run */
+    int done;                                /* fn returned (atomic) */
+    DWORD code;
+    struct host_thread *next;                /* release list */
+    char name[16];
+} host_thread;
+static pthread_mutex_t g_reap_mu = PTHREAD_MUTEX_INITIALIZER;
+static host_thread *g_reap;
+
+static void name15(char out[16], const char *s) { snprintf(out, 16, "%s", s ? s : ""); }   /* pthread names: 15 chars */
+/* size bytes of stack (rounded up to 64 KiB) above a PROT_NONE guard; returns the allocation base, NULL on failure */
+static uint8_t *low_stack_alloc(size_t size) {
+    uint8_t *m = vmem_alloc(HOST_STACK_GUARD + size, VMEM_RESERVE_ONLY);
+    if (!m) return NULL;
+    if (vmem_commit(m + HOST_STACK_GUARD, size, PROT_READ | PROT_WRITE)) { vmem_release(m); return NULL; }
+    return m;
+}
+static void *host_thread_start(void *p) {
+    host_thread *t = p;
+    crash_thread_init();                     /* plat_crash.c: alternate signal stack, so an overflow still gets a report */
+    if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
+    prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);  /* sleeps and timed waits: 1 ns slack instead of 50 us */
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->h, 0, FALSE, DUPLICATE_SAME_ACCESS)) t->h = NULL;
+    SetEvent(t->ready);
+    if (!t->h) return NULL;
+    WaitForSingleObject(t->gate, INFINITE);
+    t->code = t->fn(t->arg);
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+/* Join and free every released thread that has ended; the others stay on the list. */
+static void host_thread_reap(void) {
+    pthread_mutex_lock(&g_reap_mu);
+    for (host_thread **pp = &g_reap; *pp;) {
+        host_thread *t = *pp;
+        if (!__atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) { pp = &t->next; continue; }
+        *pp = t->next;
+        pthread_join(t->pt, NULL);           /* fn has returned: only the thread's exit is left */
+        vmem_release(t->map);
+        CloseHandle(t->gate);
+        free(t);
+    }
+    pthread_mutex_unlock(&g_reap_mu);
+}
+/* A thread running fn(arg) on a stack of `stack` bytes, named `name` (first 15 chars). suspended: fn starts at
+ * host_thread_resume. NULL on failure. */
+host_thread *host_thread_create(size_t stack, LPTHREAD_START_ROUTINE fn, void *arg, const char *name, int suspended) {
+    host_thread_reap();
+    host_thread *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->size = stack < 0x40000 ? 0x40000 : (stack + 0xffff) & ~(size_t)0xffff;   /* >= PTHREAD_STACK_MIN (128 KiB on arm64) */
+    t->fn = fn;
+    t->arg = arg;
+    name15(t->name, name);
+    t->map = low_stack_alloc(t->size);
+    t->ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    t->gate = CreateEventA(NULL, TRUE, !suspended, NULL);
+    int e = -1;
+    if (t->map && t->ready && t->gate) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        e = pthread_attr_setstack(&at, t->map + HOST_STACK_GUARD, t->size);
+        if (e == 0) e = pthread_create(&t->pt, &at, host_thread_start, t);
+        pthread_attr_destroy(&at);
+    }
+    if (e == 0) WaitForSingleObject(t->ready, INFINITE);
+    if (t->ready) CloseHandle(t->ready);
+    t->ready = NULL;
+    if (e == 0 && !t->h) { pthread_join(t->pt, NULL); e = -1; }
+    if (e != 0) {
+        fprintf(stderr, "host thread %s: cannot create (stack 0x%zx bytes: %s)\n", t->name, t->size, !t->map ? "no address space" : e > 0 ? strerror(e) : "no handle");
+        if (t->map) vmem_release(t->map);
+        if (t->gate) CloseHandle(t->gate);
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+void host_thread_resume(host_thread *t) { if (t) SetEvent(t->gate); }
+HANDLE host_thread_handle(host_thread *t) { return t ? t->h : NULL; }
+DWORD host_thread_exit_code(host_thread *t) { return t && __atomic_load_n(&t->done, __ATOMIC_ACQUIRE) ? t->code : STILL_ACTIVE; }
+void host_thread_set_name(host_thread *t, const char *name) {
+    if (!t) return;
+    name15(t->name, name);
+    pthread_setname_np(t->pt, t->name);      /* ESRCH/ENOENT once it has ended: harmless */
+}
+/* The caller is done with t (and has closed or keeps its own copy of the handle). */
+void host_thread_release(host_thread *t) {
+    if (!t) return;
+    pthread_mutex_lock(&g_reap_mu);
+    t->next = g_reap;
+    g_reap = t;
+    pthread_mutex_unlock(&g_reap_mu);
+    host_thread_reap();
+}
+/* A fiber on a stack below 2^47. plat_fiber_create maps its stack wherever mmap puts it (0xffff... on this kernel):
+ * the fiber is made with plat's smallest stack, that one is unmapped again and the saved SP moved to a vmem stack
+ * (fiber.h's register layout is public: PLAT_FIBER_SP). *stack receives the vmem allocation (vmem_release it after
+ * plat_fiber_delete). */
+static plat_fiber *low_fiber_create(size_t size, plat_fiber_fn fn, void *arg, uint8_t **stack) {
+    size = size < 0x10000 ? 0x10000 : (size + 0xffff) & ~(size_t)0xffff;
+    uint8_t *m = low_stack_alloc(size);
+    plat_fiber *f = m ? plat_fiber_create(0x10000, fn, arg) : NULL;
+    if (!f) { if (m) vmem_release(m); return NULL; }
+    munmap(f->stack_map, f->stack_map_size);
+    f->stack_map = NULL;
+    f->stack_map_size = 0;
+    f->regs[PLAT_FIBER_SP] = (uint64_t)(uintptr_t)(m + HOST_STACK_GUARD + size) & ~(uint64_t)15;
+    *stack = m;
+    return f;
+}
+#endif
 
 static Ctx *new_ctx(uint64_t stack_top) {
     Ctx *c = _aligned_malloc(sizeof *c, 16);
@@ -263,7 +476,11 @@ static void oslog(const char *fmt, ...) {
     if (n >= (int)sizeof line) n = (int)sizeof line - 1;
     while (InterlockedCompareExchange(&g_oslog_lock, 1, 0)) YieldProcessor();
     if (g_oslog_n + n < (LONG)sizeof g_oslog - 1) { memcpy(g_oslog + g_oslog_n, line, (size_t)n); g_oslog_n += n; }
+#ifdef _WIN32
     g_oslog_lock = 0;
+#else
+    __atomic_store_n(&g_oslog_lock, 0, __ATOMIC_RELEASE);   /* a plain store is not a release on ARM */
+#endif
 }
 void os_thread_report(FILE *out) {
     if (!g_oslog_n) return;
@@ -274,8 +491,15 @@ static void os_StartThread(Ctx *c) {
     oslog("  start  %-28s entry %llx priority %2d ideal core %d mask %llx stack 0x%llx (called from %llx)\n", o->name ? (const char *)(uintptr_t)o->name : "?",
           (unsigned long long)o->fn, o->priority, o->ideal_core, (unsigned long long)o->core_mask, (unsigned long long)o->stack_size, (unsigned long long)c->x[30]);
     InterlockedIncrement(&g_thread_count);
+#ifdef _WIN32
     o->thread = CreateThread(NULL, (SIZE_T)256 << 20, thread_main, o, STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED, NULL);
     if (o->thread) { SetThreadPriority(o->thread, host_priority(o->priority)); apply_sched(o->thread, o->core_mask); ResumeThread(o->thread); }
+#else
+    if (o->host) host_thread_release(o->host);       /* started again without DestroyThread: its stack goes once it has ended */
+    o->host = host_thread_create((size_t)256 << 20, thread_main, o, o->name ? (const char *)(uintptr_t)o->name : NULL, 1);
+    o->thread = host_thread_handle(o->host);
+    if (o->thread) { SetThreadPriority(o->thread, host_priority(o->priority)); apply_sched(o->thread, o->core_mask); host_thread_resume(o->host); }
+#endif
 }
 /* boot.c, on the main guest thread before the game starts: main.npdm gives it core 0 and priority 44 - 28 = 16 */
 void os_apply_main_sched(void) {
@@ -284,10 +508,26 @@ void os_apply_main_sched(void) {
     SetThreadPriority(GetCurrentThread(), host_priority(OS_DEFAULT_PRIORITY));
 }
 static void os_WaitThread(Ctx *c) { Obj *o = obj(A0); if (o->thread) WaitForSingleObject(o->thread, INFINITE); }
+#ifdef _WIN32
 static void os_DestroyThread(Ctx *c) { Obj *o = obj(A0); if (o->thread) { CloseHandle(o->thread); o->thread = NULL; } }
+#else
+/* nn::os::DestroyThread comes after WaitThread (any number of those: they wait on the handle); the pthread is joined
+ * once, here or at a later release if it has not ended yet. */
+static void os_DestroyThread(Ctx *c) {
+    Obj *o = obj(A0);
+    if (o->thread) { CloseHandle(o->thread); o->thread = NULL; }
+    if (o->host) { host_thread_release(o->host); o->host = NULL; }
+}
+#endif
 static void os_SetThreadName(Ctx *c) {               /* the guest string may be a temporary: keep a copy */
     char *copy = _strdup((const char *)(uintptr_t)A1);
+#ifdef _WIN32
     obj(A0)->name = (uint64_t)(uintptr_t)copy;
+#else
+    /* release: the running thread and the diagnostics read the name without a lock (the old copy is never freed) */
+    __atomic_store_n(&obj(A0)->name, (uint64_t)(uintptr_t)copy, __ATOMIC_RELEASE);
+    if (obj(A0)->host) host_thread_set_name(obj(A0)->host, copy);   /* already started: the host thread's name (15 chars) */
+#endif
 }
 static void os_GetCurrentThread(Ctx *c) { RET(t_thread ? t_thread : (uint64_t)g_main_thread); }
 static Obj *thread_obj(uint64_t key);
@@ -436,12 +676,24 @@ static void cv_signal(Ctx *c) { WakeConditionVariable(&obj(A0)->cv); }
 static void cv_broadcast(Ctx *c) { WakeAllConditionVariable(&obj(A0)->cv); }
 /* std::condition_variable: the argument is a unique_lock<mutex> whose first word is the mutex pointer */
 static void std_cv_wait(Ctx *c) { SleepConditionVariableCS(&obj(A0)->cv, &obj(rd64(A1))->cs, INFINITE); }
+#ifdef _WIN32
 static void std_cv_timedwait(Ctx *c) {                /* deadline: system_clock nanoseconds since 1970 */
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     int64_t now = (int64_t)(((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ULL) * 100);
     SleepConditionVariableCS(&obj(A0)->cv, &obj(rd64(A1))->cs, ns_to_ms((int64_t)A2 - now));
 }
+#else
+/* Same with CLOCK_REALTIME read directly (ns). The wait itself is plat's CONDITION_VARIABLE (CLOCK_MONOTONIC, ms,
+ * rounded up): a step of the real-time clock during the wait is not followed. libc++'s wait_until reads the clock
+ * again after this returns and waits again or reports the timeout, so the guest still sees its deadline. */
+static void std_cv_timedwait(Ctx *c) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    SleepConditionVariableCS(&obj(A0)->cv, &obj(rd64(A1))->cs, ns_to_ms((int64_t)A2 - now));
+}
+#endif
 
 /* ---------------------------------------------------------------- semaphores */
 static void sem_init(Ctx *c) { obj_reset(A0); Obj *o = obj(A0); o->count = (int)A1; o->max = (int)A2; }
@@ -532,6 +784,7 @@ static void mw_waitany(Ctx *c) { Obj *m = obj(A0); uint64_t r; while (!(r = mw_p
 static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
 
 /* ---------------------------------------------------------------- fibers */
+#ifdef _WIN32
 static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
     Ctx *c = new_ctx(o->stack + o->stack_size);
@@ -564,6 +817,55 @@ static void fib_switch(Ctx *c) {
 }
 static void fib_current(Ctx *c) { RET(t_fiber); }
 static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber) { DeleteFiber(o->fiber); o->fiber = NULL; } }
+#else
+/* Linux: plat_fiber (fiber.h) directly. Each host thread gets its own fiber object on its first switch (the per-thread
+ * "converted" slot t_thread_fiber; plat's ConvertThreadToFiber / SwitchToFiber bookkeeping is not used), the running
+ * fiber is known from t_fiber, so every switch names both sides. A fiber suspended on thread A may be resumed by B:
+ * after a switch (and after call_guest, which can switch) TLS is reached only through the accessors, and the thread
+ * block the guest sees (tpidr) is the one of the thread that resumed it (o->tp, set by the switcher). Guest mutexes
+ * held across a switch are CRITICAL_SECTIONs, which may be left on another thread than the one that entered them
+ * (plat.h); no host lock is held across a switch here. */
+static void fiber_main(void *arg) {
+    Obj *o = arg;
+    Ctx *c = new_ctx(o->stack + o->stack_size);
+    VirtualFree((void *)(uintptr_t)c->tpidr, 0, MEM_RELEASE);   /* a fiber has no thread block of its own: it uses the one of the thread running it */
+    for (;;) {
+        c->tpidr = o->tp;
+        c->x[0] = o->arg;
+        hitch_cur_ctx(c);
+        call_guest(c, o->fn);                         /* returns the fiber to switch to next, or null; possibly on another thread */
+        uint64_t next = c->x[0];
+        if (next) obj(next)->tp = c->tpidr;
+        t_fiber_set(next);
+        plat_fiber *to = next ? obj(next)->fiber : t_thread_fiber_get();   /* null: back to the thread running us now */
+        if (to != o->fiber) plat_fiber_switch(o->fiber, to);
+    }
+}
+static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, stack, stackSize, flags) */
+    Obj *o = obj(A0);
+    o->fn = A1; o->arg = A2; o->stack = A3; o->stack_size = A4;
+    o->fiber = low_fiber_create((size_t)256 << 20, fiber_main, o, &o->fiber_stack);
+    if (!o->fiber) guest_trap("nn::os::InitializeFiber: cannot allocate the host stack", c->x[30] - 4);
+    RET(0);
+}
+static void fib_switch(Ctx *c) {
+    plat_fiber *base = t_thread_fiber_get();
+    if (!base) { base = plat_fiber_convert_thread(NULL); t_thread_fiber_set(base); }
+    uint64_t next = A0, self = t_fiber_get();
+    plat_fiber *from = self ? obj(self)->fiber : base, *to = next ? obj(next)->fiber : base;
+    if (next) obj(next)->tp = c->tpidr;               /* the thread block (errno, ...) belongs to the host thread, not to the fiber */
+    t_fiber_set(next);
+    if (to != from) plat_fiber_switch(from, to);
+    if (self) c->tpidr = obj(self)->tp;               /* resumed, possibly by another thread */
+    hitch_cur_ctx(c);
+}
+static void fib_current(Ctx *c) { RET(t_fiber_get()); }
+static void fib_finalize(Ctx *c) {
+    Obj *o = obj(A0);
+    if (o->fiber) { plat_fiber_delete(o->fiber); o->fiber = NULL; }
+    if (o->fiber_stack) { vmem_release(o->fiber_stack); o->fiber_stack = NULL; }
+}
+#endif
 
 /* ---------------------------------------------------------------- misc */
 static void os_ConvertToTick(Ctx *c) { RET((uint64_t)((double)(int64_t)A0 * (double)TICK_HZ / 1e9)); }
@@ -587,7 +889,7 @@ int host_fixed_random(void *buffer, uint64_t size, const char *who, uint64_t lr)
     }
     LONG n = ++calls;
     InterlockedExchange(&lock, 0);
-    if (n <= 16) printf("fixed seed: %s call %ld, %llu bytes, caller %llx\n", who, n, (unsigned long long)size, (unsigned long long)lr);
+    if (n <= 16) printf("fixed seed: %s call %ld, %llu bytes, caller %llx\n", who, (long)n, (unsigned long long)size, (unsigned long long)lr);
     return 1;
 }
 static void os_GenerateRandomBytes(Ctx *c) {
