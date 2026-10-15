@@ -248,15 +248,29 @@ void call_indirect(Ctx *c, uint64_t addr) {
 /* Register context of the guest code running on this host thread, for crash reports. */
 static __declspec(thread) Ctx *t_cur_ctx;
 
+#ifdef _WIN32
 void call_guest(Ctx *c, uint64_t addr) {
     Ctx *saved = t_cur_ctx;
     t_cur_ctx = c;
     call_indirect(c, addr);
     t_cur_ctx = saved;
 }
+#define t_cur_ctx_get() t_cur_ctx
+#else
+/* The guest code may switch fibers and come back on another host thread: the write after call_indirect must recompute the
+ * thread pointer, not reuse the one cached before the call (fiber.h PLAT_TLS_ACCESSORS). */
+#include "fiber.h"
+PLAT_TLS_ACCESSORS(Ctx *, t_cur_ctx)
+void call_guest(Ctx *c, uint64_t addr) {
+    Ctx *saved = t_cur_ctx_get();
+    t_cur_ctx_set(c);
+    call_indirect(c, addr);
+    t_cur_ctx_set(saved);
+}
+#endif
 
 static void dump_guest_registers(void) {
-    Ctx *c = t_cur_ctx;
+    Ctx *c = t_cur_ctx_get();
     if (!c) return;
     printf("last guest function entered: f_%llx\n", (unsigned long long)c->fn);
     printf("guest registers:\n");
