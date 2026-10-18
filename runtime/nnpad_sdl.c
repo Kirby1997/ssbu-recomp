@@ -14,6 +14,9 @@
 #include "plat.h"
 #include <SDL3/SDL.h>
 #include "nnpad.h"
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 #define MAXDEV 16
 #define MAXCFG 64
@@ -288,6 +291,7 @@ static char *read_file(const char *path, size_t *len) {
     b[got] = 0; if (len) *len = got;
     return b;
 }
+#ifdef _WIN32
 static ULONGLONG file_mtime(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA a;
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
@@ -308,6 +312,30 @@ static void make_dirs(const char *file) {
     snprintf(b, sizeof b, "%s", file);
     for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; CreateDirectoryA(b, NULL); *p = '\\'; }
 }
+#else
+static ULONGLONG file_mtime(const char *path) {   /* ns since the epoch; 0 = no such file */
+    struct stat st;
+    if (stat(path, &st)) return 0;
+    return (ULONGLONG)st.st_mtim.tv_sec * 1000000000ull + (ULONGLONG)st.st_mtim.tv_nsec;
+}
+static void cfg_path(char *out) {                 /* <exe dir>/../config/controllers.ini, as on Windows */
+    const char *e = getenv("SSBU_CONFIG");
+    if (e && e[0]) { snprintf(out, MAX_PATH, "%s", e); return; }
+    char exe[MAX_PATH], tmp[MAX_PATH];
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    char *s = strrchr(exe, '/');
+    if (s) *s = 0;
+    snprintf(tmp, sizeof tmp, "%s/../config/controllers.ini", exe);
+    if (!_fullpath(out, tmp, MAX_PATH)) snprintf(out, MAX_PATH, "%s", tmp);
+}
+static void make_dirs(const char *file) {         /* every parent directory of `file` (no drive letter to skip) */
+    char b[MAX_PATH];
+    snprintf(b, sizeof b, "%s", file);
+    for (char *p = b + 1; *p; p++) if (*p == '/') { *p = 0; mkdir(b, 0777); *p = '/'; }
+}
+static BOOL DeleteFileA(const char *path) { return unlink(path) == 0; }
+static int _putenv_s(const char *name, const char *value) { return value[0] ? setenv(name, value, 1) : unsetenv(name); }    /* "" removes, as on Windows */
+#endif
 static void cfg_load(int first) {                 /* lock held */
     static Cfg n;
     char *text;
@@ -424,7 +452,9 @@ static void reassign_all(void) {                  /* [players] changed in the fi
 static void poll_devices(void) {                  /* lock held */
     int n = 0;
     SDL_UpdateJoysticks();
+#ifdef _WIN32
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#endif                                            /* Linux: the display thread owns the event queue (window + keyboard) */
     SDL_JoystickID *ids = SDL_GetJoysticks(&n);
     for (int i = 0; i < MAXDEV; i++) {
         int alive = 0;
@@ -674,6 +704,60 @@ int nnpad_kb_vk(int idx) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
     return idx >= 0 && idx < 24 ? g_cfg.kb_vk[idx] : 0;
 }
+#ifndef _WIN32
+/* Virtual key -> SDL scancode(s). Letters and digits go through the current keymap (the key that types 'Z' is VK 'Z',
+ * as GetAsyncKeyState sees it on an AZERTY layout), falling back to the US position; SHIFT / CTRL / ALT are either side.
+ * SDL_GetKeyboardState is maintained by the display thread's event pump: no window, no keys (all up). */
+int nnpad_key_down(int vk) {
+    int n = 0, sc[2] = {SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN};
+    const bool *ks = SDL_GetKeyboardState(&n);
+    if (!ks || vk <= 0 || vk > 0xff) return 0;
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        sc[0] = (int)SDL_GetScancodeFromKey((SDL_Keycode)(vk >= 'A' && vk <= 'Z' ? vk + 32 : vk), NULL);
+        if (sc[0] == SDL_SCANCODE_UNKNOWN) sc[0] = vk >= 'A' ? SDL_SCANCODE_A + (vk - 'A') : vk == '0' ? SDL_SCANCODE_0 : SDL_SCANCODE_1 + (vk - '1');
+    } else if (vk >= VK_F1 && vk < VK_F1 + 12) sc[0] = SDL_SCANCODE_F1 + (vk - VK_F1);
+    else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9) sc[0] = vk == VK_NUMPAD0 ? SDL_SCANCODE_KP_0 : SDL_SCANCODE_KP_1 + (vk - VK_NUMPAD0 - 1);
+    else switch (vk) {
+    case VK_BACK: sc[0] = SDL_SCANCODE_BACKSPACE; break;
+    case VK_TAB: sc[0] = SDL_SCANCODE_TAB; break;
+    case VK_RETURN: sc[0] = SDL_SCANCODE_RETURN; sc[1] = SDL_SCANCODE_KP_ENTER; break;
+    case VK_SHIFT: sc[0] = SDL_SCANCODE_LSHIFT; sc[1] = SDL_SCANCODE_RSHIFT; break;
+    case VK_CONTROL: sc[0] = SDL_SCANCODE_LCTRL; sc[1] = SDL_SCANCODE_RCTRL; break;
+    case VK_MENU: sc[0] = SDL_SCANCODE_LALT; sc[1] = SDL_SCANCODE_RALT; break;
+    case VK_ESCAPE: sc[0] = SDL_SCANCODE_ESCAPE; break;
+    case VK_SPACE: sc[0] = SDL_SCANCODE_SPACE; break;
+    case VK_LEFT: sc[0] = SDL_SCANCODE_LEFT; break;
+    case VK_UP: sc[0] = SDL_SCANCODE_UP; break;
+    case VK_RIGHT: sc[0] = SDL_SCANCODE_RIGHT; break;
+    case VK_DOWN: sc[0] = SDL_SCANCODE_DOWN; break;
+    case 0x21: sc[0] = SDL_SCANCODE_PAGEUP; break;
+    case 0x22: sc[0] = SDL_SCANCODE_PAGEDOWN; break;
+    case 0x23: sc[0] = SDL_SCANCODE_END; break;
+    case 0x24: sc[0] = SDL_SCANCODE_HOME; break;
+    case 0x2D: sc[0] = SDL_SCANCODE_INSERT; break;
+    case 0x2E: sc[0] = SDL_SCANCODE_DELETE; break;
+    case 0xA0: sc[0] = SDL_SCANCODE_LSHIFT; break;          /* VK_LSHIFT .. VK_RMENU */
+    case 0xA1: sc[0] = SDL_SCANCODE_RSHIFT; break;
+    case 0xA2: sc[0] = SDL_SCANCODE_LCTRL; break;
+    case 0xA3: sc[0] = SDL_SCANCODE_RCTRL; break;
+    case 0xA4: sc[0] = SDL_SCANCODE_LALT; break;
+    case 0xA5: sc[0] = SDL_SCANCODE_RALT; break;
+    case 0xBA: sc[0] = SDL_SCANCODE_SEMICOLON; break;       /* VK_OEM_*: US positions */
+    case 0xBB: sc[0] = SDL_SCANCODE_EQUALS; break;
+    case 0xBC: sc[0] = SDL_SCANCODE_COMMA; break;
+    case 0xBD: sc[0] = SDL_SCANCODE_MINUS; break;
+    case 0xBE: sc[0] = SDL_SCANCODE_PERIOD; break;
+    case 0xBF: sc[0] = SDL_SCANCODE_SLASH; break;
+    case 0xC0: sc[0] = SDL_SCANCODE_GRAVE; break;
+    case 0xDB: sc[0] = SDL_SCANCODE_LEFTBRACKET; break;
+    case 0xDC: sc[0] = SDL_SCANCODE_BACKSLASH; break;
+    case 0xDD: sc[0] = SDL_SCANCODE_RIGHTBRACKET; break;
+    case 0xDE: sc[0] = SDL_SCANCODE_APOSTROPHE; break;
+    }
+    for (int i = 0; i < 2; i++) if (sc[i] > SDL_SCANCODE_UNKNOWN && sc[i] < n && ks[sc[i]]) return 1;
+    return 0;
+}
+#endif
 
 /* ================================================================ tools: --pad-test, --pad-map */
 static int active_sources(const Dev *d, char out[][24], int max) {
@@ -875,7 +959,11 @@ int nnpad_selftest(const NnHidHooks *h) {
     SDL_JoystickID id[10];
     SDL_Joystick *js[10];
     uint64_t btn; int32_t st[4]; uint32_t attr;
+#ifdef _WIN32
     GetTempPathA(MAX_PATH, path); strcat(path, "ssbu_pad_selftest\\controllers.ini");
+#else
+    GetTempPathA(MAX_PATH, path); strcat(path, "ssbu_pad_selftest/controllers.ini");
+#endif
     make_dirs(path);
     DeleteFileA(path);
     _putenv_s("SSBU_CONFIG", path);

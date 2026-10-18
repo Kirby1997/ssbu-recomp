@@ -24,6 +24,25 @@ void nnpad_swap(int a, int b);                   /* SwapNpadAssignment */
 int  nnpad_keyboard_player(void);                /* 0..7, -1 = nobody; fixed once resolved (see controllers.ini) */
 int  nnpad_kb_vk(int idx);                       /* configured virtual key: 0..15 = Pro buttons, 16..19 = left stick left/up/right/down, 20..23 = right stick; 0 = unbound */
 int  nnpad_tool(int argc, char **argv);          /* --pad-test / --pad-map <n> / SSBU_PAD_TEST: returns the exit code, or -1 if this is no tool request */
+#ifndef _WIN32
+/* Keys stay Windows virtual-key codes everywhere (controllers.ini "0x<code>", the test scripts); on Linux nnpad_sdl.c
+ * reads them from SDL's keyboard state (SDL_GetKeyboardState, kept current by the display thread's event pump). */
+#define VK_BACK 0x08
+#define VK_TAB 0x09
+#define VK_RETURN 0x0D
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_ESCAPE 0x1B
+#define VK_SPACE 0x20
+#define VK_LEFT 0x25
+#define VK_UP 0x26
+#define VK_RIGHT 0x27
+#define VK_DOWN 0x28
+#define VK_NUMPAD0 0x60
+#define VK_F1 0x70
+int  nnpad_key_down(int vk);                     /* the key is held (layout-aware for letters and digits); 0 for unknown codes */
+#endif
 
 /* self-test hooks implemented by nnhid.c (they call the handlers the game calls) */
 typedef struct {

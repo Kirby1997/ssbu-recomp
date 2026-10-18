@@ -32,7 +32,15 @@
  *              SSBU_AUDIO_LOG=1         print the statistics every second instead of every 10 s
  *              SSBU_AUDIO_MUTE=1        no host device (clock-driven)
  *              SSBU_AUDIO_TONE=1        add a quiet 440 Hz test tone to the first second (checks the host path)
- *              SSBU_OPUS_DLL=<file>     libopus DLL for the Opus decoder (default libopus-0.dll, then MSYS2's)
+ *              SSBU_OPUS_DLL=<file>     libopus DLL for the Opus decoder (default libopus-0.dll, then MSYS2's;
+ *                                       Linux: libopus.so.0)
+ *
+ * Linux: the device is an SDL3 audio stream (SDL_OpenAudioDeviceStream, S16 stereo at the game's rate, PipeWire /
+ * PulseAudio / ALSA as SDL picks). SDL3 has no per-buffer "done" callback: every buffer records the byte count put to
+ * the stream up to its end, and it is released (in order) once the device has consumed that many bytes, i.e. put total
+ * - SDL_GetAudioStreamQueued >= its end; the play position is the same number / 4. SSBU_VOLUME=<0..100> (default 100)
+ * is the stream gain; SSBU_AUDIO_FRAMES sets SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES (default 512, one game buffer).
+ * Device changes: SDL playback-device added / removed events signal the game's device notification.
  *
  * HardwareOpusDecoder: the game only imports the constructor; everything else goes through the object's
  * virtual table (0x71039937b8 and following): +0x00 destructor, +0x10 GetWorkBufferSize(sampleRate, channels),
@@ -45,7 +53,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "plat.h"
+#ifdef _WIN32
 #include <mmsystem.h>
+#else
+#include <math.h>
+#include <SDL3/SDL.h>
+#include "plat_crash.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -71,8 +85,19 @@ void os_signal_event(uint64_t key);
 #define SLOTS 64                                      /* more than the game's maximum of 16 buffers */
 #define WAV_SECONDS 30
 
+#ifndef _WIN32                                       /* SDL3 stream in the waveOut calls this file makes */
+typedef SDL_AudioStream *HWAVEOUT;
+static void waveOutRestart(HWAVEOUT w) { SDL_ResumeAudioStreamDevice(w); }
+static void waveOutPause(HWAVEOUT w) { SDL_PauseAudioStreamDevice(w); }
+static void waveOutReset(HWAVEOUT w) { SDL_ClearAudioStream(w); }       /* the queue is dropped: every buffer counts as consumed */
+static void waveOutClose(HWAVEOUT w) { SDL_DestroyAudioStream(w); }     /* also closes the device it opened */
+#endif
 typedef struct {
+#ifdef _WIN32
     WAVEHDR hdr;
+#else
+    unsigned long long end;                           /* g_bytes_put after this buffer: released once the device consumed that much */
+#endif
     int16_t *pcm;                                     /* host copy, stereo */
     size_t capacity;                                  /* bytes allocated for pcm */
     uint64_t guest;                                   /* the guest's AudioOutBuffer */
@@ -107,6 +132,19 @@ static unsigned g_queue_max;
  * reached the end of everything handed to it: the output really ran out of samples (waveOut marks a buffer "done" when
  * its own pipeline has taken it, which can be earlier than the moment it is heard). */
 static unsigned long long g_frames_submitted, g_starved;
+#ifndef _WIN32
+static unsigned long long g_bytes_put;                /* bytes put to the SDL stream since it was opened (never reset) */
+static int g_sdl_audio;
+/* Bytes the device has taken from the stream since it was opened (the queue after SDL_ClearAudioStream is empty). */
+static unsigned long long sdl_consumed(void) {
+    int q = g_wave ? SDL_GetAudioStreamQueued(g_wave) : 0;
+    return q < 0 || (unsigned long long)q > g_bytes_put ? g_bytes_put : g_bytes_put - (unsigned long long)q;
+}
+static void SDLCALL sdl_wants_more(void *user, SDL_AudioStream *st, int additional, int total) {   /* SDL's audio thread */
+    (void)user; (void)st; (void)additional; (void)total;
+    SetEvent(g_wake);                                 /* audio_thread looks for buffers to release (as waveOut's CALLBACK_EVENT) */
+}
+#endif
 static FILE *g_wav;
 static int g_tone_left, g_heard;
 static unsigned long long g_tone_phase;
@@ -181,13 +219,24 @@ static unsigned add_tone(int16_t *pcm, unsigned frames, unsigned peak) {
 static int collect_finished(int everything) {
     int n = 0;
     LONGLONG now = now_ticks();
+#ifndef _WIN32
+    unsigned long long consumed = g_wave ? sdl_consumed() : 0;
+#endif
     while (g_head != g_tail) {
         Slot *s = &g_slots[g_head % SLOTS];
         if (!everything) {
+#ifdef _WIN32
             if (s->prepared) { if (!(s->hdr.dwFlags & WHDR_DONE)) break; }
+#else
+            if (s->prepared) { if (consumed < s->end) break; }
+#endif
             else if (!g_started || now < s->due) break;
         }
+#ifdef _WIN32
         if (s->prepared) { waveOutUnprepareHeader(g_wave, &s->hdr, sizeof s->hdr); s->prepared = 0; }
+#else
+        s->prepared = 0;
+#endif
         g_released[g_rel_tail++ % SLOTS] = s->guest;
         g_head++;
         g_total_released++;
@@ -200,6 +249,9 @@ static int collect_finished(int everything) {
 
 static DWORD WINAPI audio_thread(LPVOID arg) {
     (void)arg;
+#ifndef _WIN32
+    crash_thread_init();
+#endif
     LONGLONG next_report = now_ticks() + g_freq.QuadPart;
     unsigned seconds = 0;
     int every_second = getenv("SSBU_AUDIO_LOG") != NULL;
@@ -253,6 +305,7 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
     g_clock_due = 0;
     os_init_event(g_event, 1);
     g_wave = NULL;
+#ifdef _WIN32
     if (!getenv("SSBU_AUDIO_MUTE")) {
         WAVEFORMATEX f;
         memset(&f, 0, sizeof f);
@@ -280,6 +333,32 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
             printf("nn::audio: host volume %d%%%s\n", percent, percent ? "" : " (test copy: silent; SSBU_VOLUME=<0..100> to change)");
         }
     }
+#else
+    if (!getenv("SSBU_AUDIO_MUTE")) {
+        const char *frames = getenv("SSBU_AUDIO_FRAMES");
+        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames && frames[0] ? frames : "512");
+        if (!g_sdl_audio) g_sdl_audio = SDL_InitSubSystem(SDL_INIT_AUDIO) ? 1 : -1;
+        if (g_sdl_audio < 0) printf("nn::audio: SDL audio did not start (%s): no sound, buffers are released by the clock\n", SDL_GetError());
+        else {
+            SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, g_rate};
+            g_wave = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);     /* opens paused */
+            if (!g_wave) printf("nn::audio: SDL_OpenAudioDeviceStream failed (%s): no sound, buffers are released by the clock\n", SDL_GetError());
+            else {
+                SDL_SetAudioStreamGetCallback(g_wave, sdl_wants_more, NULL);
+                SDL_AudioSpec dev;
+                int dev_frames = 0;
+                SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(g_wave), &dev, &dev_frames);
+                const char *vol = getenv("SSBU_VOLUME");     /* the Windows exe-name rule (test copies silent) is an env var here */
+                int percent = vol && vol[0] ? atoi(vol) : 100;
+                if (percent < 0) percent = 0;
+                if (percent > 100) percent = 100;
+                SDL_SetAudioStreamGain(g_wave, (float)percent / 100.0f);
+                printf("nn::audio: SDL audio driver %s, device \"%s\" %d Hz %d ch, %d frames per device buffer; host volume %d%%\n", SDL_GetCurrentAudioDriver(),
+                       SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(g_wave)) ? SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(g_wave)) : "?", dev.freq, dev.channels, dev_frames, percent);
+            }
+        }
+    }
+#endif
     const char *wav = getenv("SSBU_WAV");
     if (wav && !g_wav) {
         g_wav = fopen(wav, "wb");
@@ -325,6 +404,7 @@ static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBu
             fwrite(s->pcm, 4, frames, g_wav);
             g_wav_bytes += (unsigned long long)frames * 4;
         }
+#ifdef _WIN32
         if (g_wave) {
             if (g_started && g_heard && g_frames_submitted) {
                 MMTIME mt;
@@ -341,6 +421,14 @@ static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBu
                 else waveOutUnprepareHeader(g_wave, &s->hdr, sizeof s->hdr);
             }
         }
+#else
+        if (g_wave) {
+            /* play position (frames) = put - queued; at the end of everything put = the output ran out of samples */
+            if (g_started && g_heard && g_frames_submitted && sdl_consumed() / 4 >= g_bytes_put / 4) g_starved++;
+            g_frames_submitted += frames;
+            if (SDL_PutAudioStreamData(g_wave, s->pcm, (int)(frames * 4))) { g_bytes_put += (unsigned long long)frames * 4; s->end = g_bytes_put; s->prepared = 1; }
+        }
+#endif
         if (!s->prepared) {                           /* clock-driven: one buffer after the other in real time */
             LONGLONG now = now_ticks();
             if (g_clock_due < now) g_clock_due = now;
@@ -445,13 +533,14 @@ static void audio_CloseAudioOut(Ctx *c) {             /* (AudioOut *) */
  * service object is created, i.e. it arrives signalled, and again whenever the output device changes.
  * Here: the output device is the Windows default render endpoint; IMMNotificationClient::OnDefaultDeviceChanged
  * (render, console role) signals the event. */
+static volatile LONG g_device_acquired, g_device_changes;
+#ifdef _WIN32
 typedef struct NotifyClient { const void *const *vtbl; } NotifyClient;
 typedef struct { const void *const *vtbl; } ComObj;
 static const GUID k_clsid_enumerator = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
 static const GUID k_iid_enumerator = {0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
 static const GUID k_iid_notify = {0x7991eec9, 0x7e89, 0x4d85, {0x83, 0x90, 0x6c, 0x70, 0x3c, 0xec, 0x60, 0xc0}};
 static const GUID k_iid_unknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
-static volatile LONG g_device_acquired, g_device_changes;
 static HRESULT STDMETHODCALLTYPE nc_query(NotifyClient *self, const GUID *iid, void **out) {
     if (!memcmp(iid, &k_iid_notify, sizeof *iid) || !memcmp(iid, &k_iid_unknown, sizeof *iid)) { *out = self; return S_OK; }
     *out = NULL; return E_NOINTERFACE;
@@ -484,13 +573,30 @@ static DWORD WINAPI device_watch_thread(void *arg) {
     Sleep(INFINITE);                                          /* keeps the apartment and the registration alive */
     return 0;
 }
+#else
+/* Linux: SDL's playback device added / removed events (the stream follows the default device by itself). The watch runs
+ * on the thread that pumps events (display.c); without a pump nothing is reported, as with a failed COM registration. */
+static bool SDLCALL device_watch(void *user, SDL_Event *e) {
+    (void)user;
+    if ((e->type == SDL_EVENT_AUDIO_DEVICE_ADDED || e->type == SDL_EVENT_AUDIO_DEVICE_REMOVED) && !e->adevice.recording) {
+        InterlockedIncrement(&g_device_changes);
+        printf("nn::audio: an output device was %s: device notification signalled\n", e->type == SDL_EVENT_AUDIO_DEVICE_ADDED ? "added" : "removed");
+        if (g_device_event) os_signal_event(g_device_event);
+    }
+    return true;
+}
+#endif
 #define AUDIO_DEVICE_NOTIFICATION_ALREADY_ACQUIRED 0x499u
 static void audio_AcquireAudioDeviceNotificationForOutput(Ctx *c) {   /* (nn::os::SystemEvent *) -> Result */
     if (InterlockedCompareExchange(&g_device_acquired, 1, 0) != 0) { RET(AUDIO_DEVICE_NOTIFICATION_ALREADY_ACQUIRED); return; }
     os_init_event(A0, 1);
     g_device_event = A0;
     os_signal_event(A0);                                      /* the service's event arrives signalled */
+#ifdef _WIN32
     CloseHandle(CreateThread(NULL, 0, device_watch_thread, NULL, 0, NULL));
+#else
+    if (!getenv("SSBU_AUDIO_MUTE") && SDL_InitSubSystem(SDL_INIT_EVENTS)) SDL_AddEventWatch(device_watch, NULL);
+#endif
     RET(0);
 }
 
@@ -529,6 +635,7 @@ static void opus_load(void) {
     if (g_opus_tried) return;
     g_opus_tried = 1;
     const char *env = getenv("SSBU_OPUS_DLL");
+#ifdef _WIN32
     const char *const tries[] = { env, "libopus-0.dll", "opus.dll", "C:\\msys64\\ucrt64\\bin\\libopus-0.dll", "C:\\msys64\\mingw64\\bin\\libopus-0.dll", "C:\\msys64\\clang64\\bin\\libopus-0.dll" };
     const char *used = NULL;
     for (unsigned i = 0; i < sizeof tries / sizeof tries[0] && !g_opus_dll; i++) {
@@ -536,6 +643,15 @@ static void opus_load(void) {
         g_opus_dll = LoadLibraryExA(tries[i], NULL, strchr(tries[i], '\\') ? LOAD_WITH_ALTERED_SEARCH_PATH : 0);
         used = tries[i];
     }
+#else
+    const char *const tries[] = { env, "libopus.so.0", "libopus.so" };      /* dlopen: Opus 1.5.2 on the Steam Frame */
+    const char *used = NULL;
+    for (unsigned i = 0; i < sizeof tries / sizeof tries[0] && !g_opus_dll; i++) {
+        if (!tries[i]) continue;
+        g_opus_dll = LoadLibraryA(tries[i]);
+        used = tries[i];
+    }
+#endif
     if (g_opus_dll) {
         p_opus_decoder_get_size = (int (*)(int))GetProcAddress(g_opus_dll, "opus_decoder_get_size");
         p_opus_decoder_init = (int (*)(void *, int, int))GetProcAddress(g_opus_dll, "opus_decoder_init");

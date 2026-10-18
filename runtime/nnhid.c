@@ -14,6 +14,12 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "nnpad.h"
+#ifndef _WIN32
+/* display_sdl.h (window agent): whether the game window has the keyboard focus. Weak until display.c provides it:
+ * without a window there is no keyboard (SDL's keyboard state needs the display thread's event pump anyway). */
+void display_window_state(int *focused, int *minimised) __attribute__((weak));
+static SHORT GetAsyncKeyState(int vk) { return nnpad_key_down(vk) ? (SHORT)0x8000 : 0; }   /* bit 15 = held now */
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -167,7 +173,7 @@ static void seq_tick(void) {                              /* once per poll of pl
     {   /* SSBU_SEQ_LOG=<n>: the draw count every n polls, to find the ranges for @draws */
         static int every = -1;
         if (every < 0) every = getenv("SSBU_SEQ_LOG") ? atoi(getenv("SSBU_SEQ_LOG")) : 0;
-        if (every > 0 && g_seq_polls % every == 0) printf("input sequence: poll %lld: %ld draws\n", (long long)g_seq_polls, g_frame_draws_seen);
+        if (every > 0 && g_seq_polls % every == 0) printf("input sequence: poll %lld: %ld draws\n", (long long)g_seq_polls, (long)g_frame_draws_seen);
     }
     if (g_seq_index >= g_seq_count) return;
     if (g_seq[g_seq_index].kind == SEQ_MARK) {
@@ -181,7 +187,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         g_seq_left = 0;
         g_seq_run = d >= g_seq[g_seq_index].lo && d <= g_seq[g_seq_index].hi ? g_seq_run + 1 : 0;
         if (g_seq_run >= g_seq[g_seq_index].need && !g_seq_holding) {
-            printf("input sequence: poll %lld step %d: %d..%d draws per frame for %d polls (now %ld)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi, g_seq[g_seq_index].need, d);
+            printf("input sequence: poll %lld step %d: %d..%d draws per frame for %d polls (now %ld)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi, g_seq[g_seq_index].need, (long)d);
             seq_begin(g_seq_index + 1);
             return;
         }
@@ -189,7 +195,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         if (g_seq_holding && since >= 8) g_seq_holding = 0;
         if (!g_seq_holding && since >= g_seq[g_seq_index].wait && g_seq_run == 0) {
             g_seq_holding = 1; since = 0;
-            printf("input sequence: poll %lld step %d keys %s for 8 (%ld draws), repeated until %d..%d draws\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, d, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi);
+            printf("input sequence: poll %lld step %d keys %s for 8 (%ld draws), repeated until %d..%d draws\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, (long)d, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi);
         }
         return;
     }
@@ -197,7 +203,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         LONG d = g_frame_draws_seen;
         g_seq_run = d >= g_seq[g_seq_index].lo && d <= g_seq[g_seq_index].hi ? g_seq_run + 1 : 0;
         if (g_seq_run >= g_seq[g_seq_index].need) {
-            printf("input sequence: poll %lld step %d: %d..%d draws per frame for %d polls (now %ld)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi, g_seq[g_seq_index].need, d);
+            printf("input sequence: poll %lld step %d: %d..%d draws per frame for %d polls (now %ld)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi, g_seq[g_seq_index].need, (long)d);
             seq_begin(g_seq_index + 1);
         }
         return;
@@ -207,7 +213,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         if (!g_seq[g_seq_index].keys[0]) { seq_begin(g_seq_index + 1); return; }
         g_seq_holding = 1;
         g_seq_left = g_seq[g_seq_index].hold;
-        printf("input sequence: poll %lld step %d keys %s for %d (%ld draws)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, g_seq[g_seq_index].hold, g_frame_draws_seen);
+        printf("input sequence: poll %lld step %d keys %s for %d (%ld draws)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].keys, g_seq[g_seq_index].hold, (long)g_frame_draws_seen);
         { void nvn_front_shot_step(int step); nvn_front_shot_step(g_seq_index); }      /* track V: SSBU_SHOT_STEPS=1 saves the frame of every key step (renderer comparison) */
         return;
     }
@@ -230,10 +236,17 @@ static int keyboard_ours(void) {
     if (mode < 0) mode = (getenv("SSBU_SEQ") || getenv("SSBU_PLAY")) && !getenv("SSBU_SEQ_KEYBOARD") ? 0 : 1;
     if (!mode) return 0;
     if (checked_at != g_sampling) {                       /* once per poll */
+#ifdef _WIN32
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
         checked_at = g_sampling;
         ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+#else
+        int focused = 0, minimised = 0;
+        checked_at = g_sampling;
+        if (display_window_state) display_window_state(&focused, &minimised);
+        ours = focused && !minimised;
+#endif
     }
     return ours;
 }
@@ -277,7 +290,7 @@ static void anchor_tick(void) {                           /* once per poll */
         static const char *const names[4] = {"black", "low", "mid", "high"};
         g_anchor_class = cls; g_anchor_cand = -1;
         g_anchor++; g_anchor_poll = g_anchor_cand_poll;
-        printf("input anchor %d at poll %lld: %s (%ld draws per frame)\n", g_anchor, g_anchor_poll, names[cls], g_frame_draws_seen);
+        printf("input anchor %d at poll %lld: %s (%ld draws per frame)\n", g_anchor, g_anchor_poll, names[cls], (long)g_frame_draws_seen);
     }
 }
 
@@ -348,8 +361,9 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly) {
  * high-frequency one: the low motor gets the larger low-band amplitude of the two handles, the high motor the
  * larger high-band amplitude.
  *
- * Real pads and the keyboard count only while a window of this process has the focus, and never in scripted runs
- * (SSBU_SEQ / SSBU_PLAY without SSBU_SEQ_KEYBOARD), so tests are not disturbed by a pad lying on the desk.
+ * Real pads and the keyboard count only while a window of this process has the focus (Linux under gamescope: pads
+ * always, see devices_live), and never in scripted runs (SSBU_SEQ / SSBU_PLAY without SSBU_SEQ_KEYBOARD), so tests are
+ * not disturbed by a pad lying on the desk.
  *
  * What the SDK itself does was read in sdk.elf: GetNpadControllerColor accepts only success, hid 603 and hid 604
  * from the service (anything else aborts) and 604 = 0x4b8ca is "no controller of that kind"; handles are
@@ -440,6 +454,7 @@ static void hid_setup(void) {
         x_get_state = synth_get_state; x_set_state = synth_set_state; x_get_caps = synth_get_caps;
         printf("nn::hid: SYNTHETIC XInput pad on slot 0, driven by the input sequence (test aid; the sequence's keyboard path is off)\n");
     }
+#ifdef _WIN32
     static const char *const dlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
     for (int i = 0; i < 3 && !x_get_state; i++) {
         HMODULE m = LoadLibraryA(dlls[i]);
@@ -448,6 +463,7 @@ static void hid_setup(void) {
         x_set_state = (void *)GetProcAddress(m, "XInputSetState");
         x_get_caps = (void *)GetProcAddress(m, "XInputGetCapabilities");
     }
+#endif                                                        /* Linux: no XInput; pads only through SDL (SSBU_XINPUT_SYNTH still works) */
     const char *kb = getenv("SSBU_KEYBOARD_PLAYER"), *layout = getenv("SSBU_PAD_LAYOUT"), *backend = getenv("SSBU_PAD_BACKEND");
     int k = kb && kb[0] ? atoi(kb) : 1;
     g_keyboard_player = k >= 1 && k <= 8 ? k - 1 : -1;
@@ -462,7 +478,25 @@ static void hid_setup(void) {
            g_keyboard_player + 1, g_label_layout ? "label" : "position");
 }
 
+#ifdef _WIN32
 static int devices_live(void) { return g_x_synth || g_pad_test || keyboard_ours(); }   /* same rule for pads and keyboard; a synthetic pad is always live */
+#else
+/* Linux: under gamescope (the Steam Frame; detected as display.c does) pads do not wait for the keyboard focus: a window
+ * that Steam did not launch never gets it (it reads focused 0 in every run), and gamescope shows one game at a time.
+ * On a desktop session pads keep the focus rule, as on Windows (SDL reads them in the background:
+ * JOYSTICK_ALLOW_BACKGROUND_EVENTS), so a game in the background does not take a pad. A scripted run (SSBU_SEQ /
+ * SSBU_PLAY without SSBU_SEQ_KEYBOARD) ignores real pads everywhere, as keyboard_ours does; the keyboard keeps the focus rule. */
+static int devices_live(void) {
+    static int mode = -1;                                 /* 0 scripted run, 1 gamescope, 2 desktop (the focus rule) */
+    if (g_x_synth || g_pad_test) return 1;
+    if (mode < 0) {
+        const char *wl = getenv("WAYLAND_DISPLAY"), *de = getenv("XDG_CURRENT_DESKTOP");
+        int gamescope = getenv("GAMESCOPE_WAYLAND_DISPLAY") || (wl && strstr(wl, "gamescope")) || (de && !_stricmp(de, "gamescope"));
+        mode = (getenv("SSBU_SEQ") || getenv("SSBU_PLAY")) && !getenv("SSBU_SEQ_KEYBOARD") ? 0 : gamescope ? 1 : 2;
+    }
+    return mode == 2 ? keyboard_ours() : mode;
+}
+#endif
 
 /* A disconnected XInput slot is expensive to ask, so it is probed once a second; a connected one at most once per ms. */
 static int x_present(int slot) {
@@ -1045,7 +1079,11 @@ static int th_six(uint32_t id, float accel[3], float gyro[3], int *rest) {
     *rest = (int)c.x[0];
     return rd32((uint64_t)(uintptr_t)buf + 0x58) == 1;
 }
+#ifdef _WIN32
 static void th_test_mode(int on) { g_pad_test = on; if (on) { _putenv("SSBU_REC=NUL"); hid_setup(); } }
+#else
+static void th_test_mode(int on) { g_pad_test = on; if (on) { _putenv("SSBU_REC=/dev/null"); hid_setup(); } }   /* "NUL" would be a file in the cwd */
+#endif
 static uint32_t th_led(uint32_t id) { Ctx c; memset(&c, 0, sizeof c); c.x[0] = (uint64_t)(uintptr_t)&id; hid_GetPlayerLedPattern(&c); return (uint32_t)c.x[0]; }
 int nnhid_pad_selftest(void) {
     NnHidHooks h = {th_style, th_state, th_vibrate, th_six, th_test_mode, th_led};
