@@ -20,6 +20,10 @@
 #include <string.h>
 #include "plat.h"
 #include "sdklift.h"
+#ifndef _WIN32
+#define HOSTPATH_FILE_API                                /* hostpath.h: Find*, CreateDirectoryA... on POSIX (UTF-8 names, NTFS-like order) */
+#include "hostpath.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -68,6 +72,19 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
     d->magic = DIR_MAGIC;
     for (int r = 0; r < nroots; r++) {
         snprintf(pattern, sizeof pattern, "%s\\*", roots[r]);
+#ifndef _WIN32                                           /* host names are UTF-8: no wide round trip */
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, dup = 0;
+            char name[0x301];
+            memset(name, 0, sizeof name);
+            if (strlen(fd.cFileName) > 0x300) continue;
+            strcpy(name, fd.cFileName);
+            if (r == nroots - 1 && nroots == 2 && fs_dir_hidden((const char *)(uintptr_t)A1, name)) continue;
+#else
         WIN32_FIND_DATAW fd;
         wchar_t wpattern[MAX_PATH + 4];
         MultiByteToWideChar(CP_ACP, 0, pattern, -1, wpattern, MAX_PATH + 4);
@@ -84,6 +101,11 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
                 WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1, ansi, sizeof ansi, NULL, NULL);
                 if (fs_dir_hidden((const char *)(uintptr_t)A1, ansi)) continue;
             }
+#endif
+#ifndef _WIN32
+            if (r == 0) dup = d->count > 0 && _stricmp(d->entries[d->count - 1].name, name) == 0;   /* one sorted listing so far (romfs folders can be large): a case twin is the previous entry */
+            else
+#endif
             for (int k = 0; k < d->count && !dup; k++) dup = _stricmp(d->entries[k].name, name) == 0;
             if (dup) continue;
             if (is_dir ? !(mode & 1) : !(mode & 2)) {
@@ -96,7 +118,11 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
             e->is_file = !is_dir;
             e->size = is_dir ? 0 : (int64_t)(((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
             d->count++;
+#ifndef _WIN32
+        } while (FindNextFileA(h, &fd));
+#else
         } while (FindNextFileW(h, &fd));
+#endif
         FindClose(h);
     }
     if (nroots == 2) {                                       /* drop the entries the open mode does not ask for */

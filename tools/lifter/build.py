@@ -28,7 +28,8 @@ if plat.LINUX:
     # LINUX_HOST_ADD. RECOMP_HOST_SKIP / RECOMP_HOST_ADD (comma lists) override both without editing this file.
     LINUX_HOST_SKIP = ['nnmovie_mf.c']
     # plat_posix.c / vmem.c / fiber_aarch64.S / plat_crash.c: the Win32 subset of plat.h, the guest address space, the fiber switch, the crash handler, low-heap malloc policy (must stay in the exe: .preinit_array).
-    LINUX_HOST_ADD = ['plat_posix.c', 'vmem.c', 'fiber_aarch64.S', 'plat_crash.c', 'plat_heap.c']
+    # hostpath.c: the Win32 file calls of nnfs.c / nnfsdir.c over POSIX, case-insensitive paths, host_exe_dir (also used by nvn_vk_posix.h).
+    LINUX_HOST_ADD = ['plat_posix.c', 'vmem.c', 'fiber_aarch64.S', 'plat_crash.c', 'plat_heap.c', 'hostpath.c']
     _skip = set(LINUX_HOST_SKIP + [x for x in os.environ.get('RECOMP_HOST_SKIP', '').split(',') if x])
     HOST_SOURCES = [x for x in HOST_SOURCES if x not in _skip] + [x for x in LINUX_HOST_ADD + os.environ.get('RECOMP_HOST_ADD', '').split(',')
                                                                   if x and x not in HOST_SOURCES]

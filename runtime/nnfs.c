@@ -30,6 +30,14 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#define HOSTPATH_FILE_API                                /* hostpath.h: the Win32 file calls below on POSIX, Windows paths in any case */
+#include "hostpath.h"
+#include <signal.h>
+#include <pwd.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -86,8 +94,13 @@ static void fs_unlock(void) { LeaveCriticalSection(&g_fs_lock); }
 static void fs_roots(void) {
     if (g_rom_root[0]) return;
     const char *env = getenv("SSBU_ROMFS"), *user = getenv("SSBU_USERDATA");
+#ifdef _WIN32
     strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", MAX_PATH - 1);
     strncpy(g_user_root, user && user[0] ? user : "..\\userdata", MAX_PATH - 1);
+#else                                                    /* the Windows layout, relative to the exe's folder (not the working directory) */
+    if (env && env[0]) snprintf(g_rom_root, MAX_PATH, "%s", env); else snprintf(g_rom_root, MAX_PATH, "%s../romfs", host_exe_dir());
+    if (user && user[0]) snprintf(g_user_root, MAX_PATH, "%s", user); else snprintf(g_user_root, MAX_PATH, "%s../userdata", host_exe_dir());
+#endif
     CreateDirectoryA(g_user_root, NULL);
 }
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
@@ -95,9 +108,13 @@ const char *fs_user_root(void) { fs_roots(); return g_user_root; }
 static int is_dir(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
 static int exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
 static void make_parents(const char *path) {             /* creates every missing folder above `path` */
+#ifdef _WIN32
     char tmp[MAX_PATH];
     snprintf(tmp, sizeof tmp, "%s", path);
     for (char *p = tmp + 3; *p; p++) if (*p == '\\') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '\\'; }
+#else
+    host_make_parents(path);                             /* no drive letter to skip; '/' and '\\' both separate */
+#endif
 }
 static void remove_tree(const char *dir) {
     char pat[MAX_PATH], sub[MAX_PATH];
@@ -287,12 +304,23 @@ static void journal_list(FILE *j, const char *work, const char *rel) {     /* ev
 }
 /* Applies a decided commit: marker lines are "W <working folder>", "R <committed folder>", then "D rel" (delete),
  * "M rel" (make folder), "F rel" (move file). Every step can be repeated, so a commit interrupted here is finished by
- * running it again. */
+ * running it again. All D lines come before the first F line, and an F line's working file exists until it is moved:
+ * so once any F source is gone, every D was done before, and a D must not run again -- a file deleted and created again
+ * in the same commit ("D a" + "F a") would otherwise be deleted after its new version was moved in. */
 static int journal_apply(const char *marker) {
     char line[MAX_PATH + 8], work[MAX_PATH] = "", root[MAX_PATH] = "", a[MAX_PATH], b[MAX_PATH];
     FILE *j = fopen(marker, "r");
-    int n = 0;
+    int n = 0, deletes_done = 0;
     if (!j) return -1;
+    while (!deletes_done && fgets(line, sizeof line, j)) {    /* first pass: has the move phase started? */
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (len < 3) continue;
+        if (line[0] == 'W') snprintf(work, sizeof work, "%s", line + 2);
+        else if (line[0] == 'F' && work[0]) { join(a, work, line + 2); deletes_done = !exists(a); }
+    }
+    rewind(j);
+    work[0] = 0;
     while (fgets(line, sizeof line, j)) {
         size_t len = strlen(line);
         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
@@ -301,8 +329,17 @@ static int journal_apply(const char *marker) {
         if (line[0] == 'W') snprintf(work, sizeof work, "%s", arg);
         else if (line[0] == 'R') snprintf(root, sizeof root, "%s", arg);
         else if (!root[0] || !work[0]) continue;
-        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else DeleteFileA(a); n++; }
-        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL); }
+        else if (line[0] == 'D' && deletes_done) n++;
+        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else DeleteFileA(a); n++;
+#ifndef _WIN32
+            host_fsync_parent(a);                         /* on disk before the marker goes: a deleted file must not come back */
+#endif
+        }
+        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL);
+#ifndef _WIN32
+            host_fsync_parent(a);
+#endif
+        }
         else if (line[0] == 'F') {
             join(a, work, arg); join(b, root, arg);
             if (exists(a)) { make_parents(b); if (!MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { fclose(j); return -2; } }
@@ -311,14 +348,39 @@ static int journal_apply(const char *marker) {
     }
     fclose(j);
     DeleteFileA(marker);
+#ifndef _WIN32
+    host_fsync_parent(marker);                            /* else a crash could replay this marker later over newer working files */
+#endif
     return n;
 }
+/* A decided commit of `root` that is not finished (a move failed, or the process died): 1, and `work` = the working
+ * folder it moves from. That folder holds the rest of the commit: it must not be dropped while the marker exists. */
+static int commit_pending(const char *root, char *work) {
+    char marker[MAX_PATH], line[MAX_PATH + 8];
+    snprintf(marker, sizeof marker, "%s.commit", root);
+    work[0] = 0;
+    FILE *j = fopen(marker, "r");
+    if (!j) return 0;
+    while (fgets(line, sizeof line, j)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (len >= 3 && line[0] == 'W') { snprintf(work, MAX_PATH, "%s", line + 2); break; }
+    }
+    fclose(j);
+    return 1;
+}
+static int commit_pending_from(const char *root, const char *work) { char w[MAX_PATH]; return commit_pending(root, w) && _stricmp(w, work) == 0; }
 static int pid_alive(DWORD pid) {
+#ifdef _WIN32
     HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
     if (!p) return GetLastError() == ERROR_ACCESS_DENIED;
     int alive = WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
     CloseHandle(p);
     return alive;
+#else
+    if (pid == 0 || pid > 0x7fffffffu) return 0;         /* kill() of a negative pid would address a process group */
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+#endif
 }
 /* Before a save-type folder is mounted: finish a commit that was decided but not applied, and drop the working
  * folders and half-written journals of processes that no longer run. */
@@ -332,6 +394,9 @@ static void journal_recover(const char *root) {
         printf("nn::fs: a commit of %s was interrupted after it was decided: finished now (%d changes)\n", root, n);
         trace_printf("     fs journal: interrupted commit of %s rolled forward (%d changes)\n", root, n);
     }
+    char pending[MAX_PATH];                                /* still unfinished (a move failed again): its working folder stays */
+    const char *pending_leaf = commit_pending(root, pending) && pending[0] ? pending + strlen(pending) : NULL;
+    while (pending_leaf && pending_leaf > pending && pending_leaf[-1] != '\\' && pending_leaf[-1] != '/') pending_leaf--;
     snprintf(pat, sizeof pat, "%s.*", root);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -341,6 +406,7 @@ static void journal_recover(const char *root) {
             if (!kind) continue;
             DWORD pid = (DWORD)strtoul(ext + 1, NULL, 10);
             if (!pid || pid == GetCurrentProcessId() || pid_alive(pid)) continue;
+            if (pending_leaf && _stricmp(pending_leaf, fd.cFileName) == 0) continue;
             snprintf(path, sizeof path, "%s\\..\\%s", root, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else DeleteFileA(path);
             trace_printf("     fs journal: uncommitted %s of process %lu discarded (%s)\n", kind, (unsigned long)pid, fd.cFileName);
@@ -362,7 +428,8 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     snprintf(m->root, MAX_PATH, "%s", root);
     if (kind != MK_ROM) {
         snprintf(m->work, MAX_PATH, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
-        remove_tree(m->work);                              /* a second mount in this process starts from the committed state */
+        if (!commit_pending_from(root, m->work))           /* a second mount in this process starts from the committed state, */
+            remove_tree(m->work);                          /* unless the folder still holds the rest of a decided commit (part of that state) */
         CreateDirectoryA(m->work, NULL);
     }
     m->kind = kind;
@@ -404,7 +471,8 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
     Mount *m = name ? mount_find(name, strlen(name)) : NULL;
     if (m) {
         for (int i = 0; i < OPEN_MAX; i++) if (g_open[i].h && g_open[i].mount == m) { CloseHandle(g_open[i].h); g_open[i].h = NULL; }   /* [sdk 0x1f4870] the accessor closes what is left open */
-        if (m->work[0]) remove_tree(m->work);
+        if (m->work[0] && commit_pending_from(m->root, m->work)) journal_recover(m->root);   /* a Commit whose moves failed: finish it now */
+        if (m->work[0] && !commit_pending_from(m->root, m->work)) remove_tree(m->work);      /* else the next mount finishes it */
         tomb_clear(m);
         trace_printf("     fs unmount \"%s\"\n", name);
         m->kind = 0;
@@ -435,16 +503,20 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
         fprintf(j, "W\t%s\nR\t%s\n", m->work, m->root);
         for (int i = 0; i < m->tomb_n; i++) fprintf(j, "D\t%s\n", m->tomb[i]);
         journal_list(j, m->work, "");
+#ifdef _WIN32
         ok = fflush(j) == 0 && FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(j)));
+#else
+        ok = fflush(j) == 0 && fsync(fileno(j)) == 0;    /* journal on disk before the rename below decides the commit */
+#endif
         fclose(j);
     }
     if (ok) ok = MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);      /* the commit is decided here */
     if (ok) { changes = journal_apply(marker); ok = changes >= 0; }
-    if (ok) tomb_clear(m);
+    if (ok || changes == -2) tomb_clear(m);                /* -2: a move failed, so every deletion was done (the marker finishes the rest) */
     commit_done(mx);
     fs_unlock();
     trace_printf("     fs commit \"%s\": %s (%d changes)\n", name, ok ? "ok" : "FAILED", changes);
-    if (!ok) printf("nn::fs::Commit(\"%s\") failed on the host (Windows error %lu); the committed save data is unchanged or will be completed at the next mount\n", name, GetLastError());
+    if (!ok) printf("nn::fs::Commit(\"%s\") failed on the host (Windows error %lu); the committed save data is unchanged or will be completed at the next mount\n", name, (unsigned long)GetLastError());
     RET(ok ? 0 : RESULT_GENERIC_FAILURE);
 }
 static void fs_ok(Ctx *c) { RET(0); }
@@ -462,6 +534,25 @@ static uint32_t romfs_buckets(uint32_t n) {
     return n;
 }
 static void romfs_walk(const char *dir, uint32_t *dirs, uint32_t *files, uint64_t *dir_bytes, uint64_t *file_bytes) {
+#ifndef _WIN32                                           /* names are UTF-8 already; d_type spares a stat per entry */
+    char sub[MAX_PATH], rp[MAX_PATH];
+    host_path_resolve(dir, rp, sizeof rp);
+    DIR *dh = opendir(rp);
+    struct dirent *de;
+    if (!dh) return;
+    while ((de = readdir(dh)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        uint64_t len = strlen(de->d_name);
+        int isdir = de->d_type == DT_DIR;
+        if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) { struct stat st; isdir = fstatat(dirfd(dh), de->d_name, &st, 0) == 0 && S_ISDIR(st.st_mode); }
+        if (isdir) {
+            (*dirs)++; *dir_bytes += 0x18 + ((len + 3) & ~3ull);
+            snprintf(sub, sizeof sub, "%s/%s", rp, de->d_name);
+            romfs_walk(sub, dirs, files, dir_bytes, file_bytes);
+        } else { (*files)++; *file_bytes += 0x20 + ((len + 3) & ~3ull); }
+    }
+    closedir(dh);
+#else
     wchar_t wpat[MAX_PATH + 4];
     char pat[MAX_PATH + 4], sub[MAX_PATH], utf8[1024];
     WIN32_FIND_DATAW fd;
@@ -481,6 +572,7 @@ static void romfs_walk(const char *dir, uint32_t *dirs, uint32_t *files, uint64_
         } else { (*files)++; *file_bytes += 0x20 + (uint64_t)((len + 3) & ~3); }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
+#endif
 }
 static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
     uint32_t dirs = 1, files = 0;
@@ -775,9 +867,17 @@ static void acc_GetNickname(Ctx *c) {
         char utf8[512] = "";
         if (env && env[0]) snprintf(utf8, sizeof utf8, "%s", env);
         else {
+#ifdef _WIN32
             wchar_t wname[257] = L"";
             DWORD n = 257;
             if (GetUserNameW(wname, &n)) WideCharToMultiByte(CP_UTF8, 0, wname, -1, utf8, sizeof utf8, NULL, NULL);
+#else                                                    /* the login name (UTF-8 already) */
+            struct passwd pw, *res = NULL;
+            char buf[1024];
+            const char *u = getenv("USER");
+            if (u && u[0]) snprintf(utf8, sizeof utf8, "%s", u);
+            else if (getpwuid_r(getuid(), &pw, buf, sizeof buf, &res) == 0 && res && res->pw_name) snprintf(utf8, sizeof utf8, "%s", res->pw_name);
+#endif
         }
         if (!utf8[0]) strcpy(utf8, "Player");
         size_t len = strlen(utf8);

@@ -12,6 +12,9 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include "hostpath.h"
+#endif
 
 #define A0 (c->x[0])
 #define RET(v) (c->x[0] = (uint64_t)(v))
@@ -31,7 +34,14 @@ static void load_font(unsigned type) {
         g_fonts[type].tried = 1;
         char path[MAX_PATH];
         const char *dir = getenv("SSBU_FONTS");
+#ifdef _WIN32
         snprintf(path, sizeof path, "%s\\%s", dir ? dir : "..\\sysdata\\fonts", font_files[type]);
+#else                                                    /* <exe folder>/../sysdata/fonts; any case (a dump copied from Windows) */
+        char given[MAX_PATH];
+        if (dir && dir[0]) snprintf(given, sizeof given, "%s/%s", dir, font_files[type]);
+        else snprintf(given, sizeof given, "%s../sysdata/fonts/%s", host_exe_dir(), font_files[type]);
+        host_path_resolve(given, path, sizeof path);
+#endif
         FILE *f = fopen(path, "rb");
         if (f) {
             fseek(f, 0, SEEK_END);

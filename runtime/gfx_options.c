@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gfx_options.h"
+#ifndef _WIN32
+#include "hostpath.h"
+#endif
 
 static const char *const k_default_ini =
 "; graphics.ini: display and rendering options of the native build (read once at start by gfx_options.c).\r\n"
@@ -87,22 +90,45 @@ static void trim(char *s) {
     while (*b == ' ' || *b == '\t') b++;
     if (b != s) memmove(s, b, strlen(b) + 1);
 }
+#ifndef _WIN32                                           /* GfxOptions.path is 260 bytes, MAX_PATH is 4096 here: never write past it */
+static void opt_out(char *out, const char *given) {
+    char full[MAX_PATH];
+    host_path_resolve(given, full, sizeof full);         /* '\\' ok, any case (a config folder copied from Windows) */
+    if (strlen(full) >= sizeof ((GfxOptions *)0)->path) printf("graphics.ini: the path %s is longer than %zu bytes: cut\n", full, sizeof ((GfxOptions *)0)->path - 1);
+    snprintf(out, sizeof ((GfxOptions *)0)->path, "%s", full);
+}
+#endif
 static void opt_path(char *out) {
     const char *e = getenv("SSBU_GRAPHICS_CONFIG"), *c = getenv("SSBU_CONFIG");
     char tmp[MAX_PATH], exe[MAX_PATH];
+#ifndef _WIN32
+    if (e && e[0]) { opt_out(out, e); return; }
+#else
     if (e && e[0]) { snprintf(out, MAX_PATH, "%s", e); return; }
+#endif
     if (c && c[0]) {
         snprintf(tmp, sizeof tmp, "%s", c);
         char *s = strrchr(tmp, '\\'), *s2 = strrchr(tmp, '/');
         if (s2 > s) s = s2;
+#ifndef _WIN32
+        if (s) { *s = 0; snprintf(exe, sizeof exe, "%s/graphics.ini", tmp); } else snprintf(exe, sizeof exe, "graphics.ini");
+        opt_out(out, exe);
+#else
         if (s) { *s = 0; snprintf(out, MAX_PATH, "%s\\graphics.ini", tmp); } else snprintf(out, MAX_PATH, "graphics.ini");
+#endif
         return;
     }
+#ifndef _WIN32                                           /* <exe folder>/../config/graphics.ini */
+    snprintf(tmp, sizeof tmp, "%s../config/graphics.ini", host_exe_dir());
+    if (!_fullpath(exe, tmp, MAX_PATH)) snprintf(exe, sizeof exe, "%s", tmp);
+    opt_out(out, exe);
+#else
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     char *s = strrchr(exe, '\\');
     if (s) *s = 0;
     snprintf(tmp, sizeof tmp, "%s\\..\\config\\graphics.ini", exe);
     if (!_fullpath(out, tmp, MAX_PATH)) snprintf(out, MAX_PATH, "%s", tmp);
+#endif
 }
 static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     (void)once; (void)arg; (void)ctx;
@@ -115,7 +141,11 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     if (!f) {
         char b[MAX_PATH];
         snprintf(b, sizeof b, "%s", o->path);
+#ifdef _WIN32
         for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; CreateDirectoryA(b, NULL); *p = '\\'; }
+#else
+        host_make_parents(b);                            /* no drive letter to skip */
+#endif
         if ((f = fopen(o->path, "wb")) != NULL) { fwrite(k_default_ini, 1, strlen(k_default_ini), f); fclose(f); written = 1; }
         f = fopen(o->path, "rb");
     }
