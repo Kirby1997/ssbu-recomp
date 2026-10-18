@@ -54,6 +54,18 @@ static VStage *g_vstage[4096], *g_vh[4096];        /* by hb, by h */
 static uint32_t g_vstage_ids;
 static int (*g_glsl_to_spirv)(int, const char *, uint32_t **, size_t *, char *, size_t);
 static void (*g_spirv_free)(uint32_t *);
+#ifndef _WIN32
+/* vk_glslang_shim.c: linked statically into the exe (a separate build unit; the weak references are then defined), else loaded from libssbu_glslang.so (build_glslang.sh) next to the exe / on the library path */
+__attribute__((weak)) int ssbu_glsl_to_spirv(int stage, const char *src, uint32_t **words, size_t *count, char *log, size_t log_size);
+__attribute__((weak)) void ssbu_spirv_free(uint32_t *words);
+static int vk_glslang_bind(void) {
+    if (ssbu_glsl_to_spirv && ssbu_spirv_free) { g_glsl_to_spirv = ssbu_glsl_to_spirv; g_spirv_free = ssbu_spirv_free; return 1; }
+    HMODULE m = LoadLibraryA("libssbu_glslang.so");
+    if (!m) { char p[600]; snprintf(p, sizeof p, "%slibssbu_glslang.so", vkp_exe_dir()); m = LoadLibraryA(p); }
+    g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "ssbu_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "ssbu_spirv_free") : NULL;
+    return g_glsl_to_spirv && g_spirv_free;
+}
+#endif
 enum { H_STAGE_DRAW, H_STAGE_WAIT, H_PIPE_DRAW, H_PIPE_WAIT, H_N };
 static LONG64 g_hold_n[H_N], g_hold_tk[H_N], g_hold_max;
 static LONG64 g_w_progs, g_w_stages, g_w_pipes, g_pred_made, g_pred_used, g_set_held, g_set_held_tk;
@@ -1501,10 +1513,14 @@ static void prewarm_start(void) {
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SSBU_VK_CACHE")) printf("nvn_vk: cache folder %s (SSBU_VK_CACHE)\n", vkc_dir());
+#ifdef _WIN32
     {   HMODULE m = LoadLibraryA("ssbu_glslang.dll");
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "ssbu_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "ssbu_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("ssbu_glslang.dll cannot be loaded (build_glslang.bat makes it)");
     }
+#else
+    if (!vk_glslang_bind()) vkd_fail("the glslang shim is neither linked in nor loadable (libssbu_glslang.so: runtime/build_glslang.sh)");
+#endif
     {   /* the driver's pipeline cache, ours on disk: keyed by GPU and driver version (the driver checks its own header too) */
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;
@@ -1544,6 +1560,9 @@ static void prewarm_start(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     g_pw_nthread = (int)si.dwNumberOfProcessors - 2;
+#ifndef _WIN32
+    if (si.dwNumberOfProcessors >= 8) g_pw_nthread = (int)si.dwNumberOfProcessors - 3;           /* 8 cores: 5 workers (cpu2-6 of the Steam Frame) */
+#endif
     if (g_pw_nthread < 1) g_pw_nthread = 1;
     if (g_pw_nthread > 16) g_pw_nthread = 16;
     if (getenv("SSBU_VK_WORKERS") && atoi(getenv("SSBU_VK_WORKERS")) > 0 && atoi(getenv("SSBU_VK_WORKERS")) <= 16) g_pw_nthread = atoi(getenv("SSBU_VK_WORKERS"));
@@ -2150,7 +2169,9 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
  * (lowest, and at most g_prep_fight_cap of them, in a fight); the game's own work always goes first; nobody waits for it.
  * At the end the driver's pipeline cache is written, so a later start pays file reads and cache hits only.
  * SSBU_VK_PREP=0 off, =1 on also without libraries (stages only); SSBU_VK_PREP_FIGHT=<n> workers in a fight (0 = pause). */
+#ifdef _WIN32
 #include <psapi.h>
+#endif
 static int g_prep_nfiles, g_prep_read, g_prep_bad;
 static LONG64 g_prep_t0, g_prep_t1, g_prep_vars, g_prep_fight_frames;
 static HANDLE g_prep_thread;
@@ -2161,11 +2182,21 @@ static volatile int g_store_pct;
 #include "nvn_vk_store.c"                          /* session 11: the container store made by the host from data.arc */
 static int prepfile_cmp(const void *a, const void *b) { const PrepFile *x = a, *y = b; return x->size < y->size ? 1 : x->size > y->size ? -1 : strcmp(x->name, y->name); }
 static void prep_line(const char *what) {
+#ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX pm;
+#else
+    struct { uint64_t PrivateUsage, WorkingSetSize; } pm = {0, 0};     /* /proc/self/statm: pages (size resident shared ...): private = resident - shared */
+    {   unsigned long long sz, res, shr;
+        FILE *sm = fopen("/proc/self/statm", "r");
+        if (sm) { if (fscanf(sm, "%llu %llu %llu", &sz, &res, &shr) == 3) { long pg = sysconf(_SC_PAGESIZE); pm.WorkingSetSize = res * (uint64_t)pg; pm.PrivateUsage = (res > shr ? res - shr : 0) * (uint64_t)pg; } fclose(sm); }
+    }
+#endif
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     long long made = 0, libs = 0;
+#ifdef _WIN32
     memset(&pm, 0, sizeof pm); pm.cb = sizeof pm;
     K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
+#endif
     EnterCriticalSection(&g_sh_lock);
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->ok) made++; if (v->lib) libs++; if (v->lib2) libs++; }
     long long q = (long long)g_pq_queued, d = (long long)g_pq_done;
@@ -2416,10 +2447,14 @@ int nvn_vk_prepare_shaders(const char *dir) {
     InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
     CreateDirectoryA("../cache", NULL); CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
+#ifdef _WIN32
     {   HMODULE m = LoadLibraryA("ssbu_glslang.dll");
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "ssbu_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "ssbu_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) { printf("prepare-shaders: ssbu_glslang.dll cannot be loaded (build_glslang.bat makes it)\n"); return 2; }
     }
+#else
+    if (!vk_glslang_bind()) { printf("prepare-shaders: the glslang shim is neither linked in nor loadable (libssbu_glslang.so: runtime/build_glslang.sh)\n"); return 2; }
+#endif
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     g_pw_nthread = (int)si.dwNumberOfProcessors > 16 ? 16 : (int)si.dwNumberOfProcessors;

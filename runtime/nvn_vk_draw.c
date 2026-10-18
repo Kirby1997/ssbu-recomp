@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include "tex_decode.h"
+#include "nvn_vk_posix.h"                           /* Linux: the file-system names below (CreateDirectoryA, MoveFileExA, FindFirstFileA...), paths relative to the exe folder */
 static int have_targets_live(void);
 
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
@@ -115,7 +116,7 @@ typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; in
 static VBlock *g_blk[2048];
 static int g_nblk;
 static LONG64 g_mem_total, g_mem_leak;
-static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
+static VMem vk_mem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
     uint32_t type = 32;
     for (uint32_t i = 0; i < D.mp.memoryTypeCount && type == 32; i++) if ((rq.memoryTypeBits >> i & 1) && (D.mp.memoryTypes[i].propertyFlags & want) == want) type = i;
@@ -175,7 +176,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
     bi.size = size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VKC(vkCreateBuffer(V.device, &bi, NULL, &b));
     vkGetBufferMemoryRequirements(V.device, b, &rq);
-    *mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
+    *mem = vk_mem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
     VKC(vkBindBufferMemory(V.device, b, mem->mem, mem->off));
     return b;
 }
@@ -488,7 +489,7 @@ static VTex *rs_temp(VTex *like, int w, int h) {
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VKC(vkCreateImage(V.device, &ci, NULL, &vt->img));
     vkGetImageMemoryRequirements(V.device, vt->img, &rq);
-    vt->mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    vt->mem = vk_mem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
     VKC(vkBindImageMemory(V.device, vt->img, vt->mem.mem, vt->mem.off));
     vt->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     vt->next = g_vtex_all; if (g_vtex_all) g_vtex_all->prev = vt; g_vtex_all = vt;
@@ -604,7 +605,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (r != VK_SUCCESS) vkd_fail("vkCreateImage (NVN format 0x%x -> %d, target %d, %dx%dx%d, %d levels, %d layers, %d samples): %s", b->format, (int)vt->fmt, b->target, vt->w, vt->h, vt->d, vt->levels, vt->layers, vt->samples, vk_result_name(r));
         VkMemoryRequirements rq;
         vkGetImageMemoryRequirements(V.device, vt->img, &rq);
-        vt->mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+        vt->mem = vk_mem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
         VKC(vkBindImageMemory(V.device, vt->img, vt->mem.mem, vt->mem.off));
         vt->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         vt->next = g_vtex_all; if (g_vtex_all) g_vtex_all->prev = vt; g_vtex_all = vt;
@@ -1407,7 +1408,7 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         int found = 0;
         for (uint32_t i = 0; i < D.mp.memoryTypeCount; i++) if ((rq.memoryTypeBits >> i & 1) && (D.mp.memoryTypes[i].propertyFlags & want) == want) found = 1;
         if (!found) want &= ~(VkFlags)VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        c->mem = vmem_alloc(rq, want, 2);
+        c->mem = vk_mem_alloc(rq, want, 2);
         VKC(vkBindBufferMemory(V.device, c->buf, c->mem.mem, c->mem.off));
         R.cb_made++;
     }
@@ -2345,7 +2346,7 @@ static void overlay_draw(uint32_t index) {
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VKC(vkCreateImage(V.device, &ci, NULL, &g_ovl.img));
         vkGetImageMemoryRequirements(V.device, g_ovl.img, &rq);
-        g_ovl.mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+        g_ovl.mem = vk_mem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
         VKC(vkBindImageMemory(V.device, g_ovl.img, g_ovl.mem.mem, g_ovl.mem.off));
         image_barrier(g_ovl.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdClearColorImage(R.cmd, g_ovl.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c0, 1, &sr2);
@@ -2563,7 +2564,7 @@ static VTex *dummy_image(VkImageType type, uint32_t layers, VkFlags flags) {
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT; ci.flags = flags;
     VKC(vkCreateImage(V.device, &ci, NULL, &vt->img));
     vkGetImageMemoryRequirements(V.device, vt->img, &rq);
-    vt->mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    vt->mem = vk_mem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
     VKC(vkBindImageMemory(V.device, vt->img, vt->mem.mem, vt->mem.off));
     vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&z, 0, sizeof z);
@@ -2647,6 +2648,9 @@ static void prewarm_start(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     g_pw_nthread = (int)si.dwNumberOfProcessors - 2;
+#ifndef _WIN32
+    if (si.dwNumberOfProcessors >= 8) g_pw_nthread = (int)si.dwNumberOfProcessors - 3;           /* 8 cores: 5 workers (cpu2-6 of the Steam Frame) */
+#endif
     if (g_pw_nthread < 1) g_pw_nthread = 1;
     if (g_pw_nthread > 16) g_pw_nthread = 16;
     if (getenv("SSBU_VK_WORKERS") && atoi(getenv("SSBU_VK_WORKERS")) > 0 && atoi(getenv("SSBU_VK_WORKERS")) <= 16) g_pw_nthread = atoi(getenv("SSBU_VK_WORKERS"));

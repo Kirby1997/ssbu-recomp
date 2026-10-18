@@ -16,6 +16,22 @@
  * stack per helper thread.
  * While a build is under way the folder holds "store_building.txt"; a start that finds it builds again. */
 #include "hostrt.h"
+#ifndef _WIN32
+/* Linux: the whole archive is one read-only private mapping (no 64 MB views); "views" are base + offset. The base is placed
+ * below 2^47 (the guest's zstd decoder reads from it; host pointers the guest sees stay below 2^47). */
+static const uint8_t *vks_base;
+static size_t vks_base_len;
+#define VKS_VIEW(lo, len) (vks_base + (lo))
+#define VKS_UNVIEW(p) ((void)(p))
+#define VKS_CLOSE(fh) (munmap((void *)vks_base, vks_base_len), vks_base = NULL, close(fh))
+#define VKS_ELF "../binaries/13.0.4/main.elf"
+#define vks_map_file vkp_map_file
+#else
+#define VKS_VIEW(lo, len) MapViewOfFile(VKS.map, FILE_MAP_READ, (DWORD)((lo) >> 32), (DWORD)(lo), (SIZE_T)(len))
+#define VKS_UNVIEW(p) UnmapViewOfFile(p)
+#define VKS_CLOSE(fh) (CloseHandle(VKS.map), CloseHandle(fh))
+#define VKS_ELF "..\\binaries\\13.0.4\\main.elf"
+#endif
 
 #define VKS_DCTX_SIZE 0x271f0u
 #define VKS_ZSTD_DECOMPRESS 0x71039a4040ULL
@@ -138,7 +154,7 @@ static DWORD WINAPI vks_thread(void *arg) {
         if (s >= nslice || g_m4_quit) break;
         uint64_t lo = s * VKS_SLICE, hi = lo + VKS_SLICE < VKS.total ? lo + VKS_SLICE : VKS.total;
         uint64_t vlen = hi + VKS_ROOM < VKS.total ? hi + VKS_ROOM - lo : VKS.total - lo;
-        const uint8_t *v = MapViewOfFile(VKS.map, FILE_MAP_READ, (DWORD)(lo >> 32), (DWORD)lo, (SIZE_T)vlen);
+        const uint8_t *v = VKS_VIEW(lo, vlen);
         if (!v) { InterlockedIncrement(&VKS.fail); continue; }
         uint64_t end = hi - lo, lim = vlen >= 4 ? vlen - 3 : 0;
         if (end > lim) end = lim;
@@ -173,11 +189,11 @@ static DWORD WINAPI vks_thread(void *arg) {
                     }
                     if (!want) continue;
                 }
-                fv = MapViewOfFile(VKS.map, FILE_MAP_READ, (DWORD)(fo >> 32), (DWORD)fo, (SIZE_T)flen);
+                fv = VKS_VIEW(fo, flen);
                 if (!fv) { InterlockedIncrement(&VKS.fail); continue; }
                 InterlockedDecrement64(&VKS.opened);                                 /* vks_frame counts it again */
                 used = vks_frame(c, fv + (lo + p - fo), flen - (lo + p - fo), fv + (lo + p - fo), flen - (lo + p - fo));
-                UnmapViewOfFile(fv);
+                VKS_UNVIEW(fv);
                 if (used > 4) p += used - 1;                                          /* the frame is done: go on behind it */
             } else if (m == 0x48534E42u && p + 0x60 <= vlen && q[0xC] == 0xff && q[0xD] == 0xfe) {       /* a container stored without compression */
                 uint32_t size;
@@ -186,12 +202,12 @@ static DWORD WINAPI vks_thread(void *arg) {
                 for (int k = 0x20; k + 4 <= 0x60; k++) if (!memcmp(q + k, "grsc", 4)) { grsc = 1; break; }
                 if (grsc && size >= 0x60 && size <= (64u << 20) && lo + p + size <= VKS.total) {
                     uint64_t fo = (lo + p) & ~0xffffull, flen = lo + p + size - fo;
-                    const uint8_t *fv = MapViewOfFile(VKS.map, FILE_MAP_READ, (DWORD)(fo >> 32), (DWORD)fo, (SIZE_T)flen);
-                    if (fv) { vks_keep(fv + (lo + p - fo), size, 1); UnmapViewOfFile(fv); }
+                    const uint8_t *fv = VKS_VIEW(fo, flen);
+                    if (fv) { vks_keep(fv + (lo + p - fo), size, 1); VKS_UNVIEW(fv); }
                 }
             }
         }
-        UnmapViewOfFile(v);
+        VKS_UNVIEW(v);
         InterlockedExchangeAdd64(&VKS.scanned, (LONG64)(hi - lo));
     }
     _aligned_free(stack);
@@ -204,32 +220,55 @@ static DWORD WINAPI vks_thread(void *arg) {
 static int vks_build(const char *dir) {
     char arc[400], mark[400];
     const char *rom = getenv("SSBU_ROMFS");
-    LARGE_INTEGER fq, sz;
+    LARGE_INTEGER fq;
+#ifdef _WIN32
+    LARGE_INTEGER sz;
+#endif
     QueryPerformanceFrequency(&fq);
     LONG64 t0 = tk(), last = t0;
+#ifdef _WIN32
     snprintf(arc, sizeof arc, "%s\\data.arc", rom && rom[0] ? rom : "..\\romfs");
+#else
+    snprintf(arc, sizeof arc, "%s/data.arc", rom && rom[0] ? rom : "../romfs");
+#endif
+#ifdef _WIN32
     HANDLE fh = CreateFileA(arc, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (fh == INVALID_HANDLE_VALUE || !GetFileSizeEx(fh, &sz)) { printf("nvn_vk_store: %s cannot be opened: no container store\n", arc); if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh); return 0; }
     memset(&VKS, 0, sizeof VKS);
     VKS.total = (uint64_t)sz.QuadPart;
     VKS.map = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!VKS.map) { printf("nvn_vk_store: %s cannot be mapped: no container store\n", arc); CloseHandle(fh); return 0; }
+#else
+    char pb[512];
+    int fh = open(vkp_path(arc, pb, sizeof pb), O_RDONLY);
+    struct stat sb;
+    if (fh < 0 || fstat(fh, &sb) != 0) { printf("nvn_vk_store: %s cannot be opened: no container store\n", arc); if (fh >= 0) close(fh); return 0; }
+    memset(&VKS, 0, sizeof VKS);
+    VKS.total = (uint64_t)sb.st_size;
+    vks_base_len = (size_t)VKS.total;
+    vks_base = VKS.total ? vks_map_file(fh, VKS.total) : NULL;
+    if (!vks_base) { printf("nvn_vk_store: %s cannot be mapped: no container store\n", arc); close(fh); return 0; }
+#endif
     snprintf(VKS.dir, sizeof VKS.dir, "%s", dir);
     CreateDirectoryA("../cache", NULL); CreateDirectoryA(dir, NULL);
     snprintf(mark, sizeof mark, "%s/store_building.txt", dir);
-    { FILE *f = fopen(mark, "wb"); if (f) { fputs("the container store is being written\n", f); fclose(f); } else { printf("nvn_vk_store: the folder %s cannot be written: no container store\n", dir); CloseHandle(VKS.map); CloseHandle(fh); return 0; } }
+    { FILE *f = fopen(mark, "wb"); if (f) { fputs("the container store is being written\n", f); fclose(f); } else { printf("nvn_vk_store: the folder %s cannot be written: no container store\n", dir); VKS_CLOSE(fh); return 0; } }
     InitializeCriticalSection(&VKS.lock);
     VKS.fn_alloc = hostfn_address("vk_store_zstd_alloc", vks_h_alloc);
     VKS.fn_free = hostfn_address("vk_store_zstd_free", vks_h_free);
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     VKS.nthread = (int)si.dwNumberOfProcessors / 2;
+#ifndef _WIN32
+    if (si.dwNumberOfProcessors >= 8) VKS.nthread = (int)si.dwNumberOfProcessors - 3;       /* 8 cores (Steam Frame): 5 workers, the main / render threads keep the prime and one big core */
+#endif
     if (VKS.nthread > 12) VKS.nthread = 12;
     if (VKS.nthread < 2) VKS.nthread = 2;
     if (getenv("SSBU_VK_STORE_THREADS") && atoi(getenv("SSBU_VK_STORE_THREADS")) > 0 && atoi(getenv("SSBU_VK_STORE_THREADS")) <= 32) VKS.nthread = atoi(getenv("SSBU_VK_STORE_THREADS"));
     printf("nvn_vk_store: no container store in %s: reading %s (%.1f GB) with the game's own zstd decoder on %d threads (frame %lld)\n", dir, arc, (double)VKS.total / 1073741824.0, VKS.nthread, (long long)nvn_front_frame_next());
     fflush(stdout);
     HANDLE th[32];
+    if (VKS.nthread > (int)(sizeof th / sizeof th[0])) VKS.nthread = (int)(sizeof th / sizeof th[0]);
     for (int i = 0; i < VKS.nthread; i++) th[i] = CreateThread(NULL, 0, vks_thread, NULL, 0, NULL);
     for (;;) {
         DWORD w = WaitForMultipleObjects((DWORD)VKS.nthread, th, TRUE, 500);
@@ -242,11 +281,11 @@ static int vks_build(const char *dir) {
         }
     }
     for (int i = 0; i < VKS.nthread; i++) CloseHandle(th[i]);
-    CloseHandle(VKS.map); CloseHandle(fh);
+    VKS_CLOSE(fh);
     {   /* the containers built into the game's EXECUTABLE ("TextureShader", "IconShader", "ui2d_BuildinShader_Nvn_Binary",
          * "font_BuildinShader_Nvn_Binary": 4 in 13.0.4, two of them in its data segment, where the game changes them in place
          * when it starts): read from the file the runtime was started with, not from memory */
-        const char *elf = __argc > 1 && __argv && __argv[1] && __argv[1][0] != '-' ? __argv[1] : "..\\binaries\\13.0.4\\main.elf";
+        const char *elf = __argc > 1 && __argv && __argv[1] && __argv[1][0] != '-' ? __argv[1] : VKS_ELF;
         FILE *ef = fopen(elf, "rb");
         LONG before = VKS.ncont;
         if (ef) {
