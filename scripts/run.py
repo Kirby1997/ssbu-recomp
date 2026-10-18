@@ -28,6 +28,7 @@ def main():
     ap.add_argument('--seconds', type=int, default=0, help='stop after this many seconds (0 = play until you quit)')
     ap.add_argument('--seq', help='input sequence file (tests/seq_*.txt): lines starting with # are comments')
     ap.add_argument('--exe', help='exe name inside build/work; a copy of ssbu_native is made if missing (default ssbu_native.exe; linux-arm64: ssbu_native)')
+    ap.add_argument('--refresh', action='store_true', help='copy ssbu_native over --exe again when the copy is older than it')
     ap.add_argument('--seed', help='SSBU_FIXED_SEED value (deterministic random numbers)')
     ap.add_argument('--log', help='write the game output to this file instead of the console')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE, may be repeated')
@@ -40,10 +41,19 @@ def main():
     base_exe = 'ssbu_native' if linux else 'ssbu_native.exe'
     a.exe = a.exe or base_exe
     exe = os.path.join(work, a.exe)
+    native = os.path.join(work, base_exe)
     if not os.path.exists(exe):
-        shutil.copy2(os.path.join(work, base_exe), exe)           # (the copy finds libSDL3.so / the game library through $ORIGIN, i.e. in the same folder)
+        shutil.copy2(native, exe)           # (the copy finds libSDL3.so / the game library through $ORIGIN, i.e. in the same folder)
         if linux:
             os.chmod(exe, 0o755)
+    elif exe != native and os.path.getmtime(exe) < os.path.getmtime(native):
+        # a copy made before the last link runs the old runtime; an exe linked on purpose with other sources
+        # (RECOMP_EXE) is older too, so it is only replaced when asked
+        if a.refresh:
+            shutil.copy2(native, exe)
+            print('%s was older than %s: copied again' % (a.exe, base_exe))
+        else:
+            print('note: %s is older than %s and may run an older runtime (--refresh copies it again)' % (a.exe, base_exe))
     env = {k: v for k, v in os.environ.items() if not k.startswith(('RECOMP_', 'SSBU_'))}
     if linux:      # the Frame's desktop session variables are needed when started from ssh; SDL picks wayland/x11 itself
         env.setdefault('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid())

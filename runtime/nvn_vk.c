@@ -153,9 +153,11 @@ static const char *vk_result_name(VkResult r) {
     snprintf(buf, sizeof buf, "VkResult %d", (int)r);
     return buf;
 }
+static void vkd_lost_report(void);                                    /* nvn_vk_draw.c (PR #32): what the driver and the markers say about the loss */
 static void vk_fatal(const char *what, VkResult r) {
     printf("nvn_vk: %s failed: %s\n", what, vk_result_name(r));
     fflush(stdout);
+    if (r == VK_ERROR_DEVICE_LOST && V.device) vkd_lost_report();
     ExitProcess(5);
 }
 /* A call that may fail while running (present path): counted, reported a few times, the frame goes on. */
@@ -448,7 +450,7 @@ int nvn_vk_init(void *hwnd) {
     static const char *const k_mode[4] = {"immediate", "mailbox", "fifo", "fifo_relaxed"};
     const char *want = getenv("SSBU_VK_PRESENT");
     V.mode = have[VK_PRESENT_MODE_MAILBOX_KHR] ? VK_PRESENT_MODE_MAILBOX_KHR : have[VK_PRESENT_MODE_IMMEDIATE_KHR] ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
-    if (!want && gfx_options()->present) {         /* track O: vsync = on | off | mailbox in graphics.ini (the environment switch wins) */
+    if (!want && gfx_options()->present && gfx_options()->present < 4) {      /* 4 display, 5 auto: mailbox, the tick comes from display.c (session 14) */       /* track O: vsync = on | off | mailbox in graphics.ini (the environment switch wins) */
         static const char *const k_opt[4] = {NULL, "fifo", "immediate", "mailbox"};
         want = k_opt[gfx_options()->present & 3];
         printf("nvn_vk: graphics.ini vsync = %s: present mode %s asked for\n", gfx_options()->present == 1 ? "on" : gfx_options()->present == 2 ? "off" : "mailbox", want);

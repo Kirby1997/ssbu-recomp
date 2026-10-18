@@ -39,10 +39,26 @@ void guest_trap(const char *what, uint64_t addr);
 void guest_unimpl(uint64_t pc, uint32_t insn, const char *what);
 void guest_svc(Ctx *c, uint32_t number);
 
+/* Track R1 round 3 (only in a build with -DR1_MARK, e.g. ssbu_game_p15r1.dll): every guest store marks its 4 KB page in a
+ * byte-per-page map, so a save knows exactly which pages the simulation wrote. Two windows: the game's address region
+ * (r1_lo1, r1_n1 bytes; set by the runtime) and the image / module area 0x7100000000.. (r1_n2 bytes). Both start empty
+ * (n = 0): nothing is marked until the runtime sets them. Without R1_MARK: no code. */
+#ifdef R1_MARK
+extern __declspec(dllexport) uint8_t *r1_m1, *r1_m2;
+extern __declspec(dllexport) uint64_t r1_lo1, r1_n1, r1_n2;
+static inline void r1m(uint64_t a) {
+    uint64_t o = a - r1_lo1;
+    if (o < r1_n1) r1_m1[o >> 12] = 1;
+    else { o = a - 0x7100000000ull; if (o < r1_n2) r1_m2[o >> 12] = 1; }
+}
+#define R1M(a, n) do { r1m(a); r1m((a) + (n) - 1); } while (0)
+#else
+#define R1M(a, n) ((void)0)
+#endif
 /* Guest memory is mapped at its real address: a guest pointer is a host pointer. */
 #define DEF_MEM(bits) \
     static inline uint##bits##_t rd##bits(uint64_t a) { uint##bits##_t v; memcpy(&v, (void *)(uintptr_t)a, sizeof v); return v; } \
-    static inline void wr##bits(uint64_t a, uint##bits##_t v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); }
+    static inline void wr##bits(uint64_t a, uint##bits##_t v) { R1M(a, sizeof v); memcpy((void *)(uintptr_t)a, &v, sizeof v); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 
 /* Memory ordering of the guest (recomp.py emits these for LDAR / STLR / LDAXR / STLXR / DMB / DSB / ISB).
@@ -88,7 +104,7 @@ DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 #if RT_ORDERED_ATOMIC
 #define DEF_ORD(bits) \
     static inline uint##bits##_t rdacq##bits(uint64_t a) { return __atomic_load_n((uint##bits##_t *)(uintptr_t)a, __ATOMIC_SEQ_CST); } \
-    static inline void wrrel##bits(uint64_t a, uint##bits##_t v) { __atomic_store_n((uint##bits##_t *)(uintptr_t)a, v, __ATOMIC_SEQ_CST); }
+    static inline void wrrel##bits(uint64_t a, uint##bits##_t v) { R1M(a, sizeof v); __atomic_store_n((uint##bits##_t *)(uintptr_t)a, v, __ATOMIC_SEQ_CST); }
 #else
 #define DEF_ORD(bits) \
     static inline uint##bits##_t rdacq##bits(uint64_t a) { return rd##bits(a); } \
@@ -115,6 +131,7 @@ void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, 
     static inline uint32_t name##bits(Ctx *c, uint64_t a, uint##bits##_t v) { \
         if (c->ex_addr != a) { stx_diag(c, a, 0, 0, v, -bits); return 1; } \
         c->ex_addr = ~0ull; \
+        R1M(a, bits / 8); \
         uint##bits##_t expected = (uint##bits##_t)c->ex_val; \
         if (__atomic_compare_exchange_n((uint##bits##_t *)(uintptr_t)a, &expected, v, 0, order, __ATOMIC_RELAXED)) { c->ex_fail = 0; return 0; } \
         uint##bits##_t seen; memcpy(&seen, (void *)(uintptr_t)a, sizeof seen); \
@@ -125,7 +142,7 @@ DEF_STX(stx, 8, RT_STX_ORDER) DEF_STX(stx, 16, RT_STX_ORDER) DEF_STX(stx, 32, RT
 DEF_STX(stlx, 8, __ATOMIC_SEQ_CST) DEF_STX(stlx, 16, __ATOMIC_SEQ_CST) DEF_STX(stlx, 32, __ATOMIC_SEQ_CST) DEF_STX(stlx, 64, __ATOMIC_SEQ_CST)
 
 static inline V128 rdv(uint64_t a, int n) { V128 v; v.d[0] = 0; v.d[1] = 0; memcpy(&v, (void *)(uintptr_t)a, (size_t)n); return v; }
-static inline void wrv(uint64_t a, const V128 *v, int n) { memcpy((void *)(uintptr_t)a, v, (size_t)n); }
+static inline void wrv(uint64_t a, const V128 *v, int n) { R1M(a, (uint64_t)n); memcpy((void *)(uintptr_t)a, v, (size_t)n); }
 static inline void vzero(V128 *v) { v->d[0] = 0; v->d[1] = 0; }
 
 static inline uint64_t adds64(Ctx *c, uint64_t a, uint64_t b, uint32_t cin) {

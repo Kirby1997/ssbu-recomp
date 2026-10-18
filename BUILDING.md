@@ -18,7 +18,7 @@ One command, eleven resumable steps. When it ends it prints how to start the gam
 |---|---|---|
 | Windows 10/11 x64 | 11 | |
 | Python | 3.14 (3.10 or newer should do) | https://www.python.org/downloads/ |
-| Python packages | numpy, lz4, zstandard, Pillow, unicorn | `pip install numpy lz4 zstandard Pillow unicorn` (the build needs only these; the fighter tools and `tools/lifter/patches/kinds_scan.py` also use `capstone`) |
+| Python packages | numpy, lz4, zstandard, Pillow, unicorn, capstone | `pip install numpy lz4 zstandard Pillow unicorn capstone` (the build needs only these; `capstone` is for the differential test in step `check`, and the fighter tools and `tools/lifter/patches/kinds_scan.py` use it too) |
 | LLVM/clang | **9.0.0** (8.0.0 also works) | https://github.com/llvm/llvm-project/releases/tag/llvmorg-9.0.0 (Windows installer, 64-bit) |
 | MSVC Build Tools, with the "C++ x64/x86 build tools" and a Windows 10/11 SDK | 2026 (v18) / SDK 10.0.26100 | https://visualstudio.microsoft.com/downloads/ ("Build Tools"). clang finds it by itself; `build_glslang.bat` finds it with `vswhere` |
 | SDL3, development package for Visual C++ (`SDL3-devel-<ver>-VC.zip`) | 3.4.18 | https://github.com/libsdl-org/SDL/releases |
@@ -26,12 +26,27 @@ One command, eleven resumable steps. When it ends it prints how to start the gam
 | glslang, Windows x86_64 release package (`glslang-*-windows-x86_64-release.zip`, has `include/` and `lib/`) | 16.6.0 | https://github.com/KhronosGroup/glslang/releases |
 | Source checkout of a yuzu-family emulator (only `src/core/hle/service/mii/` is read, by `tools/lifter/gen_sdktest.py`, for the reference data of the self-test) | suyu | any yuzu-lineage open-source repository that still has `src/core/hle/service/mii/types/raw_data.cpp` |
 | A GPU with a Vulkan 1.3 driver (to run, not to build) | | your GPU vendor |
-| Media Foundation (movies) | part of Windows | |
+| Media Foundation (movies) with the Microsoft Store codecs **VP9 Video Extensions** and **Web Media Extensions 2.x** (the movies' Vorbis sound; without it the opening movie stays black; Windows N editions also need the Media Feature Pack) | part of Windows + the two Store packages | Microsoft Store. Check with PowerShell: `Get-AppxPackage *WebMediaExtensions*, *VP9VideoExtensions* \| Select Name, Version`. The log line `no Vorbis decoder on this PC` names the missing one; `SSBU_SKIP_MOVIES=1` skips every movie meanwhile |
+| libopus as a DLL (the music and the game's other Opus sounds; **without it they are silent**, the rest runs) | 1.6.1, built from source as below | the source release from https://opus-codec.org/downloads/ (check it against Xiph's `SHA256SUMS`), or MSYS2's `mingw-w64-ucrt-x86_64-opus` |
 
 Unpack SDL3, Vulkan-Headers, glslang and the emulator checkout anywhere and give the folders with `--sdl3`,
 `--vulkan-headers`, `--glslang`, `--suyu`, or put them under `deps/SDL3`, `deps/Vulkan-Headers`, `deps/glslang`,
 `deps/suyu` (ignored by git), or set `SDL3_ROOT`, `VULKAN_HEADERS`, `GLSLANG_ROOT`, `SUYU_ROOT`. clang: `--llvm <folder
 with bin\clang.exe>` or `LLVM_ROOT`, default `C:\llvm-9.0.0`. The Vulkan SDK is not needed to build.
+
+libopus: give the DLL or its folder with `--opus`, or put it under `deps/opus` (`opus.dll` or `libopus-0.dll`), or set
+`OPUS_DLL`; step `link` copies it beside the exe. Built from the source release with CMake (the "C++ CMake tools for
+Windows" component of the Build Tools, or cmake.org) and the MSVC tools:
+
+```
+cmake -S opus-1.6.1 -B opus-build -DBUILD_SHARED_LIBS=ON -DOPUS_BUILD_TESTING=OFF -DOPUS_BUILD_PROGRAMS=OFF
+cmake --build opus-build --config Release
+python scripts/setup.py ... --opus opus-build
+```
+
+MSYS2's `libopus-0.dll` (`C:\msys64\ucrt64\bin`, `mingw64`, `clang64`) needs nothing: the runtime loads it from there.
+Without any of these the deps step and the link step say so, and the log of a run says
+`nn::codec: libopus NOT FOUND: Opus streams will be silent`. At run time `SSBU_OPUS_DLL=<file>` names another DLL.
 
 ## What you dump from your own console
 
@@ -70,7 +85,7 @@ format is documented in `tools/lifter/sdklift.py` and `tools/audit/lift_select.p
 | `sdk` | lifts the system-library functions the runtime uses (`sdklift.py`) |
 | `compile` | compiles the lifted main with clang -O1 into `ssbu_game_eh_o1.dll` (functions over 20,000 statements stay unoptimised, 180 s per file) |
 | `nro` | lifts and compiles the script modules into `build/work/nro_bin_eh_o2/` (`--modules a,b` for a subset) |
-| `link` | builds the glslang shim DLL and links the host runtime into `build/work/ssbu_native.exe`, copies `SDL3.dll` |
+| `link` | builds the glslang shim DLL and links the host runtime into `build/work/ssbu_native.exe`, copies `SDL3.dll` (and libopus, when found) |
 | `check` | `SSBU_SDK_SELFTEST`, `SSBU_PAD_SELFTEST`, and the differential lifter test against the Unicorn emulator |
 
 `--status` shows what is done, `--redo <step>` and `--from <step>` repeat steps, `--only <step>` runs one, `--jobs N` sets
@@ -134,6 +149,16 @@ Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
 - `missing input: ...main.npdm`: the ExeFS dump lacks `main.npdm`; dump the whole ExeFS.
 - `sdk is not the expected build`: not 13.0.4 with the update applied.
 - `the list of SDK functions to lift was not found`: `tools/lifter/sdklift_roots.txt` is missing from your clone.
+- No music (the menus and fights are silent apart from some effects), and the run's log says `nn::codec: libopus NOT
+  FOUND`: there is no libopus beside the exe; see libopus under "What you need", then run `--redo link`.
+- Black window at the start, and the log says `movie: track 1 (audio/vorbis): no Media Foundation decoder path to PCM` or
+  `no Vorbis decoder on this PC`: the opening movie has no sound decoder, and the game's movie player never shows the
+  picture without it. Install or update Web Media Extensions (2.x) from the Microsoft Store; meanwhile
+  `--env SSBU_SKIP_MOVIES=1` skips every movie.
+- DLC not found: the add-on list is `build\config\dlc.txt` (written by `tools/audit/dlc_list.py`, whose default output is
+  that file; it reads the file names of your own DLC dumps).
+- A crash: the console report is also written to `<exe>_crash.txt` and a minidump to `<exe>_crash_last.dmp` beside the
+  exe; attach the `.txt` (and the log) to an issue.
 - A compiler job that fails after a power loss or while the PC is under load: run the same command again; only what
   changed is rebuilt. Closing a running game first matters: a running exe holds its DLLs open and the link fails.
 - Output with non-ASCII characters from Windows tools is shown with `?`; the logs in `build/logs` are the originals.
