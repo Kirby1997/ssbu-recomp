@@ -75,6 +75,20 @@ static void settings_GetMiiAuthorId(Ctx *c) {
  * the configured value). The port has no console setting, so, like the language, it comes from Windows: the user's
  * geographic location (GetUserDefaultGeoName, ISO 3166 code) mapped to the sales region below; SSBU_REGION=<0..5> overrides.
  * A country that is not in the table stops with a message instead of a guessed region. The mapping is the port's decision. */
+#ifndef _WIN32
+/* Linux: the "geographic location" is the territory of the locale, $LC_ALL / $LC_MESSAGES / $LANG ("en_GB.UTF-8" -> "GB"); "C", "POSIX" and
+ * a bare language have none, so they give "??" (no region: the caller stops and asks for SSBU_REGION, as on Windows). */
+static void host_geo_iso(char iso[4]) {
+    static const char *const vars[] = {"LC_ALL", "LC_MESSAGES", "LANG"};
+    for (int i = 0; i < 3; i++) {
+        const char *v = getenv(vars[i]);
+        if (!v || !v[0]) continue;
+        const char *u = strchr(v, '_');
+        if (u && u[1] >= 'A' && u[1] <= 'Z' && u[2] >= 'A' && u[2] <= 'Z') { iso[0] = u[1]; iso[1] = u[2]; iso[2] = 0; return; }
+        break;                                                              /* the first variable that is set decides, as in setlocale */
+    }
+}
+#endif
 static int host_region_code(char *iso_out) {
     static const char *const map[] = {
         "0JP",
@@ -85,9 +99,14 @@ static int host_region_code(char *iso_out) {
         "2IT", "2FR", "2DE", "2ES", "2GB", "2IE", "2PT", "2NL", "2BE", "2LU", "2AT", "2CH", "2SE", "2NO", "2DK", "2FI", "2PL", "2CZ", "2SK",
         "2HU", "2GR", "2RO", "2BG", "2HR", "2SI", "2EE", "2LV", "2LT", "2MT", "2CY", "2IS", "2RU", "2ZA", NULL };
     const char *ov = getenv("SSBU_REGION");
+#ifdef _WIN32
     WCHAR w[8] = {0};
     char iso[4] = "??";
     if (GetUserDefaultGeoName(w, 8) >= 3) { iso[0] = (char)w[0]; iso[1] = (char)w[1]; iso[2] = 0; }
+#else
+    char iso[4] = "??";
+    host_geo_iso(iso);
+#endif
     if (iso_out) memcpy(iso_out, iso, 3);
     if (ov && ov[0] >= '0' && ov[0] <= '5' && !ov[1]) return ov[0] - '0';
     for (int i = 0; map[i]; i++) if (map[i][1] == iso[0] && map[i][2] == iso[1]) return map[i][0] - '0';
@@ -97,7 +116,11 @@ static void settings_GetRegionCode(Ctx *c) {
     char iso[4];
     int r = host_region_code(iso);
     if (r < 0) {
+#ifdef _WIN32
         printf("nn::settings::system::GetRegionCode: Windows location \"%s\" has no region in the port's table: set SSBU_REGION=0..5 (Japan, Americas, Europe, Australia, HK/TW/KR, China)\n", iso);
+#else
+        printf("nn::settings::system::GetRegionCode: locale territory \"%s\" (from $LC_ALL/$LC_MESSAGES/$LANG, e.g. en_GB.UTF-8) has no region in the port's table: set SSBU_REGION=0..5 (Japan, Americas, Europe, Australia, HK/TW/KR, China)\n", iso);
+#endif
         guest_trap("nn::settings::system::GetRegionCode: no region for this Windows location (set SSBU_REGION)", c->x[30] - 4);
     }
     trace_printf("nn::settings::system::GetRegionCode -> %d (Windows location %s)\n", r, iso);

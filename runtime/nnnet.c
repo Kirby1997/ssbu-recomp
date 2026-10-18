@@ -29,13 +29,106 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#endif
 #include "plat.h"
+#ifdef _WIN32
 #include <wincrypt.h>
+#endif
 #include "sdklift.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#else
+/* Linux: BSD sockets. nnnet_c4a.inc is written against Winsock names; they are mapped here so the service code is shared:
+ * SOCKET = int fd, closesocket = close, ioctlsocket(FIONBIO) = fcntl(O_NONBLOCK), WSAPoll = poll, WSAGetLastError = errno and the WSAE*
+ * codes ARE the Linux errno values (the guest's errno numbers, [sdk] table 0x9f0bb5, are Linux's: so_wsa_errno is the identity apart from
+ * EPIPE / ECONNABORTED on send), send / sendto get MSG_NOSIGNAL, no WSAStartup, getrandom for the resolver's random id.
+ * SSBU_NET=0 (first boot / offline): socket() fails with ENETUNREACH, as on a console without a connection that has no loopback either. */
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/random.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket(s) close(s)
+#define WSAGetLastError() (errno)
+#define InetPtonA(f, s, a) inet_pton((f), (s), (a))
+#define WSAEINTR EINTR
+#define WSAEBADF EBADF
+#define WSAENOTSOCK ENOTSOCK
+#define WSAEACCES EACCES
+#define WSAEFAULT EFAULT
+#define WSAEINVAL EINVAL
+#define WSAEMFILE EMFILE
+#define WSAEWOULDBLOCK EWOULDBLOCK
+#define WSAEINPROGRESS EINPROGRESS
+#define WSAEALREADY EALREADY
+#define WSAEDESTADDRREQ EDESTADDRREQ
+#define WSAEMSGSIZE EMSGSIZE
+#define WSAEPROTOTYPE EPROTOTYPE
+#define WSAENOPROTOOPT ENOPROTOOPT
+#define WSAEPROTONOSUPPORT EPROTONOSUPPORT
+#define WSAESOCKTNOSUPPORT ESOCKTNOSUPPORT
+#define WSAEOPNOTSUPP EOPNOTSUPP
+#define WSAEPFNOSUPPORT EPFNOSUPPORT
+#define WSAEAFNOSUPPORT EAFNOSUPPORT
+#define WSAEADDRINUSE EADDRINUSE
+#define WSAEADDRNOTAVAIL EADDRNOTAVAIL
+#define WSAENETDOWN ENETDOWN
+#define WSAENETUNREACH ENETUNREACH
+#define WSAENETRESET ENETRESET
+#define WSAECONNABORTED ECONNABORTED
+#define WSAECONNRESET ECONNRESET
+#define WSAENOBUFS ENOBUFS
+#define WSAEISCONN EISCONN
+#define WSAENOTCONN ENOTCONN
+#define WSAESHUTDOWN ESHUTDOWN
+#define WSAETIMEDOUT ETIMEDOUT
+#define WSAECONNREFUSED ECONNREFUSED
+#define WSAEHOSTDOWN EHOSTDOWN
+#define WSAEHOSTUNREACH EHOSTUNREACH
+typedef struct pollfd WSAPOLLFD;
+#define WSAPoll(f, n, t) poll((f), (nfds_t)(n), (t))
+#undef POLLRDBAND
+#define POLLRDBAND POLLPRI                               /* Linux reports out-of-band data as POLLPRI */
+/* the code reads addresses as Winsock does: sin_addr.S_un.S_addr / struct in_addr; same layout as the system's */
+struct so_in_addr { union { uint32_t S_addr; } S_un; };
+struct so_sockaddr_in { sa_family_t sin_family; in_port_t sin_port; struct so_in_addr sin_addr; char sin_zero[8]; };
+#define in_addr so_in_addr
+#define sockaddr_in so_sockaddr_in
+static inline int ioctlsocket(int s, long cmd, unsigned long *argp) {
+    int fl = fcntl(s, F_GETFL, 0);
+    if (cmd != FIONBIO || fl < 0) { errno = EINVAL; return -1; }
+    return fcntl(s, F_SETFL, *argp ? fl | O_NONBLOCK : fl & ~O_NONBLOCK);
+}
+static inline int so_h_socket(int domain, int type, int protocol) {
+    const char *e = getenv("SSBU_NET");
+    if (e && e[0] == '0' && !e[1]) { errno = ENETUNREACH; return -1; }
+    return socket(domain, type | SOCK_CLOEXEC, protocol);
+}
+static inline int so_h_accept(int s, struct sockaddr *a, int *l) { socklen_t sl = (socklen_t)*l; int r = accept4(s, a, &sl, SOCK_CLOEXEC); *l = (int)sl; return r; }
+static inline int so_h_getsockname(int s, struct sockaddr *a, int *l) { socklen_t sl = (socklen_t)*l; int r = getsockname(s, a, &sl); *l = (int)sl; return r; }
+static inline int so_h_getpeername(int s, struct sockaddr *a, int *l) { socklen_t sl = (socklen_t)*l; int r = getpeername(s, a, &sl); *l = (int)sl; return r; }
+static inline ssize_t so_h_recvfrom(int s, void *b, size_t n, int f, struct sockaddr *a, int *l) { socklen_t sl = (socklen_t)*l; ssize_t r = recvfrom(s, b, n, f, a, &sl); *l = (int)sl; return r; }
+#define socket(d, t, p) so_h_socket((d), (t), (p))
+#define accept(s, a, l) so_h_accept((s), (a), (l))
+#define getsockname(s, a, l) so_h_getsockname((s), (a), (l))
+#define getpeername(s, a, l) so_h_getpeername((s), (a), (l))
+#define recvfrom(s, b, n, f, a, l) so_h_recvfrom((s), (b), (n), (f), (a), (l))
+#define send(s, b, n, f) send((s), (b), (n), (f) | MSG_NOSIGNAL)
+#define sendto(s, b, n, f, a, l) sendto((s), (b), (n), (f) | MSG_NOSIGNAL, (a), (l))
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])

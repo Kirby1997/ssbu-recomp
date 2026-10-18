@@ -235,6 +235,11 @@ static int so_wsa_errno(int e, int sending) {
     case WSAECONNREFUSED: return 111;
     case WSAEHOSTDOWN: return 112;
     case WSAEHOSTUNREACH: return 113;
+#ifndef _WIN32
+    case EPIPE: return 32;
+    case EPERM: return 1;
+    case ENOMEM: return 12;
+#endif
     default: return 5;                                    /* EIO */
     }
 }
@@ -277,7 +282,7 @@ static int so_dup(int fd) {                               /* bsd DuplicateSocket
     so_put(o);
     return nfd;
 }
-static void so_nonblock(SoObj *o, int on) { u_long v = on ? 1 : 0; ioctlsocket(o->s, FIONBIO, &v); }
+static void so_nonblock(SoObj *o, int on) { u_long v = on ? 1 : 0; ioctlsocket(o->s, FIONBIO, &v); }   /* Linux: nnnet.c maps it to fcntl O_NONBLOCK */
 static int so_is_loopback(uint32_t be_addr) { return (be_addr & 0xff) == 127; }      /* first byte in memory */
 static int so_addr_in(uint64_t p, struct sockaddr_in *out) {                          /* guest BSD sockaddr_in -> host; 0 when not AF_INET */
     memset(out, 0, sizeof *out);
@@ -302,7 +307,9 @@ static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t
     if (g_so_init || !pool || (unsigned)(conc - 1) >= 14 || size <= alloc || (pool & 0xfff) || (size & 0xfff) || (alloc & 0xfff) || alloc <= 0xfff)
         guest_trap("nn::socket::Initialize: [sdk 0x36f89c] abort (already initialised or bad arguments)", c->x[30] - 4);
     if (size < 0xa0000) { RET(0x21bu); return; }
+#ifdef _WIN32
     if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+#endif
     g_so_init = 1;
     RET(0);
 }
@@ -546,6 +553,90 @@ static void socket_Poll(Ctx *c) {                         /* (pollfd *, nfds, ti
     free(h); free(objs);
     if (e) so_fail(c, e); else RETI(ready);
 }
+#ifndef _WIN32
+static int so_lx_optname(int level, int name) {            /* BSD SOL_SOCKET numbers (the guest's) -> Linux; TCP level 6 / name 1 is the same; -1 unknown */
+    if (level != 0xffff) return name;
+    switch (name) {
+    case 0x1: return SO_DEBUG;
+    case 0x2: return SO_ACCEPTCONN;
+    case 0x4: return SO_REUSEADDR;
+    case 0x8: return SO_KEEPALIVE;
+    case 0x10: return SO_DONTROUTE;
+    case 0x20: return SO_BROADCAST;
+    case 0x80: return SO_LINGER;
+    case 0x100: return SO_OOBINLINE;
+    case 0x200: return SO_REUSEPORT;
+    case 0x1001: return SO_SNDBUF;
+    case 0x1002: return SO_RCVBUF;
+    case 0x1005: return SO_SNDTIMEO;
+    case 0x1006: return SO_RCVTIMEO;
+    case 0x1007: return SO_ERROR;
+    case 0x1008: return SO_TYPE;
+    default: return -1;
+    }
+}
+static void socket_GetSockOpt(Ctx *c) {                   /* (fd, level, name, void *, socklen_t *) */
+    uint64_t val = A3, lenp = A4;
+    int level = (int)A1, name = (int)A2;
+    so_need_init(c, "nn::socket::GetSockOpt");
+    if (!val || !lenp || !M32(lenp)) { so_fail(c, 22); return; }
+    SoObj *o = so_get((int)A0, NULL);
+    if (!o) { so_fail(c, 9); return; }
+    int e = 0;
+    uint32_t cap = M32(lenp);
+    if (level == 0xffff || (level == 6 && name == 1)) {
+        char tmp[64];
+        socklen_t tl = sizeof tmp;
+        int ln = so_lx_optname(level, name);
+        if (name == 0x800 && level == 0xffff) { memset(tmp, 0, 4); tl = 4; }          /* SO_NOSIGPIPE: there are no signals (sends carry MSG_NOSIGNAL) */
+        else if (ln < 0) e = 92;
+        else if (getsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, ln, tmp, &tl) != 0) e = so_wsa_errno(errno, 0);
+        if (!e) {
+            uint8_t out[16] = {0};
+            uint32_t ol = 4;
+            if (level == 0xffff && name == 0x1007) { int v = so_wsa_errno(*(int *)tmp, 0); memcpy(out, &v, 4); }
+            else if (level == 0xffff && name == 0x80) { struct linger *l = (struct linger *)tmp; int v[2] = {l->l_onoff, l->l_linger}; memcpy(out, v, 8); ol = 8; }
+            else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { struct timeval *t = (struct timeval *)tmp; int64_t tv[2] = {t->tv_sec, t->tv_usec}; memcpy(out, tv, 16); ol = 16; }
+            else { int v = tl >= 4 ? *(int *)tmp : (tl >= 1 ? tmp[0] != 0 : 0); memcpy(out, &v, 4); }
+            if (ol > cap) ol = cap;
+            memcpy((void *)(uintptr_t)val, out, ol);
+            M32(lenp) = ol;
+        }
+    }                                                     /* other levels: [suyu] GetSockOptImpl answers success without data */
+    so_put(o);
+    if (e) so_fail(c, e); else RETI(0);
+}
+static void socket_SetSockOpt(Ctx *c) {                   /* (fd, level, name, const void *, len) */
+    uint64_t val = A3;
+    uint32_t len = (uint32_t)A4;
+    int level = (int)A1, name = (int)A2;
+    so_need_init(c, "nn::socket::SetSockOpt");
+    if (!val) { so_fail(c, 22); return; }
+    SoObj *o = so_get((int)A0, NULL);
+    if (!o) { so_fail(c, 9); return; }
+    int e = 0, r = 0, ln = so_lx_optname(level, name);
+    if (level == 0xffff && name == 0x80) {
+        if (len < 8) e = 22;
+        else { struct linger l; l.l_onoff = M32(val) != 0; l.l_linger = (int)M32(val + 4); r = setsockopt(o->s, SOL_SOCKET, SO_LINGER, &l, sizeof l); }
+    } else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) {
+        struct timeval tv;
+        if (len < 4) e = 22;
+        else {
+            if (len >= 16) { tv.tv_sec = (time_t)M64(val); tv.tv_usec = (suseconds_t)M64(val + 8); }
+            else { uint32_t ms = M32(val); tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000; }
+            r = setsockopt(o->s, SOL_SOCKET, ln, &tv, sizeof tv);
+        }
+    } else if (level == 0xffff && name == 0x800) r = 0;   /* SO_NOSIGPIPE */
+    else if (level == 0xffff || (level == 6 && name == 1)) {
+        if (len < 4) e = 22;
+        else if (ln < 0) e = 92;
+        else { int v = (int)M32(val); r = setsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, ln, &v, sizeof v); }
+    }                                                     /* other levels: [suyu] SetSockOptImpl accepts and ignores */
+    if (!e && r != 0) e = so_wsa_errno(errno, 0);
+    so_put(o);
+    if (e) so_fail(c, e); else RETI(0);
+}
+#else
 static void socket_GetSockOpt(Ctx *c) {                   /* (fd, level, name, void *, socklen_t *) */
     uint64_t val = A3, lenp = A4;
     int level = (int)A1, name = (int)A2;
@@ -599,6 +690,7 @@ static void socket_SetSockOpt(Ctx *c) {                   /* (fd, level, name, c
     so_put(o);
     if (e) so_fail(c, e); else RETI(0);
 }
+#endif
 
 /* ---------------------------------------------------------------- resolver */
 static int so_resolver_enabled(void) { return g_so_init; }
@@ -614,6 +706,22 @@ static void socket_GAIStrError2(Ctx *c) {
     if (!so_resolver_enabled()) { RET(P("Error string is not available")); return; }
     RET(P(e < sizeof g_gai_text / sizeof g_gai_text[0] ? g_gai_text[e] : "Unknown error"));
 }
+#ifndef _WIN32
+static int so_gai_from_host(int w) {                      /* getaddrinfo's EAI_* -> the module's codes */
+    switch (w) {
+    case 0: return 0;
+    case EAI_AGAIN: return 2;
+    case EAI_BADFLAGS: return 3;
+    case EAI_FAIL: return 4;
+    case EAI_FAMILY: return 5;
+    case EAI_MEMORY: return 6;
+    case EAI_NONAME: return 8;
+    case EAI_SERVICE: return 9;
+    case EAI_SOCKTYPE: return 10;
+    default: return 15;                                   /* [suyu] GetAddrInfoError::OTHER */
+    }
+}
+#else
 static int so_gai_from_host(int w) {
     switch (w) {
     case 0: return 0;
@@ -628,6 +736,7 @@ static int so_gai_from_host(int w) {
     default: return 15;                                   /* [suyu] GetAddrInfoError::OTHER */
     }
 }
+#endif
 static int so_is_numeric_host(const char *s) { struct in_addr a; return s && InetPtonA(AF_INET, s, &a) == 1; }
 /* (node, service, hints, out). nn_layout: nn::socket::AddrInfo instead of struct addrinfo */
 static void so_getaddrinfo(Ctx *c, int nn_layout) {
@@ -710,8 +819,12 @@ static void so_ResolverGetOption(Ctx *c) {                /* (ResolverOption *ou
     }
     if (key == 0x2711) {                                  /* [sdk 0x382d50] CreateRandomId */
         uint32_t id = 0;
+#ifdef _WIN32
         HCRYPTPROV prov = 0;
         if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 4, (BYTE *)&id); CryptReleaseContext(prov, 0); }
+#else
+        if (getrandom(&id, 4, 0) != 4) id = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)&id;
+#endif
         M32(opt + 0x10) = id; M64(opt + 8) = 4;
         RETI(0); return;
     }

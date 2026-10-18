@@ -61,6 +61,56 @@
 #include <string.h>
 #include "plat.h"
 #include "sdklift.h"
+#ifndef _WIN32
+#include <wchar.h>
+/* Win32 names used below, over UTF-8 / UTF-32 (wchar_t is 4 bytes here: guest text is converted at the guest boundary, copy_w / kbd_store) */
+#define CP_UTF8 65001
+#define MB_OK 0
+#define MB_YESNO 4
+#define MB_ICONQUESTION 0x20
+#define MB_ICONWARNING 0x30
+#define MB_TOPMOST 0x40000
+#define IDOK 1
+#define IDYES 6
+#define IDNO 7
+static int MultiByteToWideChar(unsigned cp, unsigned long fl, const char *s, int n, wchar_t *dst, int cap) {   /* UTF-8 -> UTF-32; n == -1 only; returns the count with the NUL */
+    const uint8_t *p = (const uint8_t *)s; int o = 0;
+    (void)cp; (void)fl; (void)n;
+    while (*p) {
+        uint32_t ch = *p, extra = ch >= 0xf0 ? 3 : ch >= 0xe0 ? 2 : ch >= 0xc0 ? 1 : 0;
+        if (extra) ch &= 0x3f >> extra;
+        p++;
+        for (uint32_t i = 0; i < extra && (*p & 0xc0) == 0x80; i++) ch = (ch << 6) | (*p++ & 0x3f);
+        if (o + 1 < cap) dst[o] = (wchar_t)ch;
+        o++;
+    }
+    if (cap > 0) dst[o < cap ? o : cap - 1] = 0;
+    return o + 1;
+}
+static int WideCharToMultiByte(unsigned cp, unsigned long fl, const wchar_t *s, int n, char *dst, int cap, const char *def, int *used) {   /* UTF-32 -> UTF-8; n == -1 only */
+    int o = 0;
+    (void)cp; (void)fl; (void)n; (void)def; (void)used;
+    for (; *s; s++) {
+        uint32_t ch = (uint32_t)*s; uint8_t b[4]; int l;
+        if (ch < 0x80) { b[0] = (uint8_t)ch; l = 1; }
+        else if (ch < 0x800) { b[0] = (uint8_t)(0xc0 | ch >> 6); b[1] = (uint8_t)(0x80 | (ch & 0x3f)); l = 2; }
+        else if (ch < 0x10000) { b[0] = (uint8_t)(0xe0 | ch >> 12); b[1] = (uint8_t)(0x80 | (ch >> 6 & 0x3f)); b[2] = (uint8_t)(0x80 | (ch & 0x3f)); l = 3; }
+        else { b[0] = (uint8_t)(0xf0 | ch >> 18); b[1] = (uint8_t)(0x80 | (ch >> 12 & 0x3f)); b[2] = (uint8_t)(0x80 | (ch >> 6 & 0x3f)); b[3] = (uint8_t)(0x80 | (ch & 0x3f)); l = 4; }
+        if (o + l >= cap) { if (cap > 0) dst[o] = 0; return 0; }
+        memcpy(dst + o, b, (size_t)l); o += l;
+    }
+    if (cap > 0) dst[o] = 0;
+    return o + 1;
+}
+/* MessageBoxW: stderr (SDL_ShowMessageBox needs the window agent's video; TODO Phase 8). A question is answered "no". */
+static int MessageBoxW(void *owner, const wchar_t *text, const wchar_t *caption, unsigned type) {
+    char t[4096], cap[256];
+    (void)owner;
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, t, sizeof t, NULL, NULL); WideCharToMultiByte(CP_UTF8, 0, caption, -1, cap, sizeof cap, NULL, NULL);
+    fprintf(stderr, "[%s] %s\n", cap, t);
+    return (type & MB_YESNO) == MB_YESNO ? IDNO : IDOK;
+}
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -189,6 +239,7 @@ typedef struct {
 
 #define IDC_EDIT 1001
 #define IDC_INFO 1002
+#ifdef _WIN32
 static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     KbdDialog *k = (KbdDialog *)GetWindowLongPtrW(dlg, GWLP_USERDATA);
     switch (msg) {
@@ -250,11 +301,33 @@ static int kbd_run_dialog(KbdDialog *k) {
     if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
     return (int)r;
 }
+#else
+static int kbd_run_dialog(KbdDialog *k) {                  /* TODO(Phase 8): SDL text input (display.c owns the event pump) + overlay / Steam on-screen keyboard */
+    static int told;
+    (void)k;
+    if (!told) { told = 1; printf("nn::swkbd: no on-screen keyboard on Linux yet (TODO Phase 8); answered as cancelled. SSBU_SWKBD=text:<utf-8> answers a fixed text\n"); }
+    return 0;
+}
+#endif
+#ifdef _WIN32
 static void copy_w(wchar_t *dst, uint64_t src, int max) {
     int i = 0;
     for (; i < max; i++) { uint16_t ch = rd16(src + (uint64_t)i * 2); if (!ch) break; dst[i] = ch; }
     dst[i] = 0;
 }
+#else
+/* Linux: wchar_t is UTF-32; the guest's text is UTF-16 (char16_t): surrogate pairs are combined here and split again in kbd_store. */
+static void copy_w(wchar_t *dst, uint64_t src, int max) {
+    int i = 0, n = 0;
+    for (; i < max; i++) {
+        uint32_t ch = rd16(src + (uint64_t)i * 2);
+        if (!ch) break;
+        if (ch >= 0xd800 && ch < 0xdc00 && i + 1 < max) { uint32_t lo = rd16(src + (uint64_t)(i + 1) * 2); if (lo >= 0xdc00 && lo < 0xe000) { ch = 0x10000 + ((ch - 0xd800) << 10) + (lo - 0xdc00); i++; } }
+        dst[n++] = (wchar_t)ch;
+    }
+    dst[n] = 0;
+}
+#endif
 /* How this call is answered: 0 dialog, 1 cancel, 2 fixed text. */
 static int kbd_mode(wchar_t *fixed) {
     const char *v = getenv("SSBU_SWKBD");
@@ -277,12 +350,27 @@ static uint64_t kbd_store(uint64_t string, const wchar_t *text, int utf8) {
         memcpy((void *)(uintptr_t)ptr, tmp, (size_t)n);
         return (uint64_t)n;
     }
+#ifdef _WIN32
     uint64_t chars = wcslen(text);
     if ((chars + 1) * 2 > cap) chars = cap / 2 ? cap / 2 - 1 : 0;
     if (cap < 2) return 0;
     for (uint64_t i = 0; i < chars; i++) wr16(ptr + i * 2, (uint16_t)text[i]);
     wr16(ptr + chars * 2, 0);
     return (chars + 1) * 2;
+#else
+    uint64_t units = 0;                                    /* UTF-32 -> UTF-16 code units, whole characters only */
+    if (cap < 2) return 0;
+    for (const wchar_t *p = text; *p; p++) {
+        uint32_t ch = (uint32_t)*p;
+        uint64_t need = ch >= 0x10000 ? 2 : 1;
+        if ((units + need + 1) * 2 > cap) break;
+        if (need == 2) { ch -= 0x10000; wr16(ptr + units * 2, (uint16_t)(0xd800 + (ch >> 10))); wr16(ptr + units * 2 + 2, (uint16_t)(0xdc00 + (ch & 0x3ff))); }
+        else wr16(ptr + units * 2, (uint16_t)ch);
+        units += need;
+    }
+    wr16(ptr + units * 2, 0);
+    return (units + 1) * 2;
+#endif
 }
 static void swkbd_ShowKeyboard(Ctx *c) {
     uint64_t string = A0, arg = A1;
@@ -445,6 +533,7 @@ static ImportFn h(const char *name) {
     return f;
 }
 static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (size_t i = from; i < to; i++) if (p[i] != v) return 0; return 1; }
+#ifdef _WIN32
 static volatile int g_kbd_test_initial_seen;
 static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     (void)arg;
@@ -465,6 +554,7 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     }
     return 0;
 }
+#endif
 int nnapplet_selftest(Ctx *c) {
     int bad = 0, ok;
     uint8_t *buf = malloc(0x8000), *buf2 = malloc(0x8000);
@@ -530,6 +620,7 @@ int nnapplet_selftest(Ctx *c) {
     _putenv("SSBU_SWKBD=cancel");
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     ok = ok && c->x[0] == SWKBD_RESULT_CANCELED;
+#ifdef _WIN32
     /* the real dialog: a helper thread types into it and presses OK, then a second run is cancelled */
     _putenv("SSBU_SWKBD=dialog");
     HANDLE helper = CreateThread(NULL, 0, kbd_test_driver, NULL, 0, NULL);
@@ -542,6 +633,14 @@ int nnapplet_selftest(Ctx *c) {
     CloseHandle(helper);
     printf("  swkbd: Win32 dialog shows the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel: %s\n", dialog_ok ? "ok" : "FAILED");
     bad += !dialog_ok;
+#else
+    /* no dialog on Linux yet: the default / "dialog" mode answers cancelled (and says so once) */
+    _putenv("SSBU_SWKBD=dialog");
+    c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
+    int dialog_ok = c->x[0] == SWKBD_RESULT_CANCELED;
+    printf("  swkbd: no dialog on Linux (TODO Phase 8): SSBU_SWKBD=dialog answers cancelled 0x29f: %s\n", dialog_ok ? "ok" : "FAILED");
+    bad += !dialog_ok;
+#endif
     _putenv("SSBU_SWKBD=");
     printf("  swkbd: sizes work 0x%llx string 0x%llx; SetInitialText in the work buffer; scripted answer \"Kirby\" (UTF-16) and cancel (0x29f): %s\n",
            (unsigned long long)work_size, (unsigned long long)string_size, ok ? "ok" : "FAILED");
