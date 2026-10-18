@@ -2443,6 +2443,9 @@ swap: ;
     g_isem = (g_isem + 1) % 8;
     if (!g_sem[g_isem][0]) { VkSemaphoreCreateInfo smi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKC(vkCreateSemaphore(V.device, &smi, NULL, &g_sem[g_isem][0])); VKC(vkCreateSemaphore(V.device, &smi, NULL, &g_sem[g_isem][1])); }
     VkSemaphore acq = g_sem[g_isem][0], rend = g_sem[g_isem][1];
+#ifndef _WIN32
+    if (swapchain_stale()) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* nvn_vk.c: minimised / occluded, or a Wayland window resized */
+#endif
     int ok = V.swapchain || swapchain_create();
     InterlockedIncrement64(&g_wd_try);
     if (ok) {

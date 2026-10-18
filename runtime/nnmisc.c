@@ -259,10 +259,11 @@ static int g_oe_opmode_notify, g_oe_perfmode_notify, g_oe_resume_notify, g_oe_fo
 static HWND g_oe_window;
 #else
 static void *g_oe_window;
-/* TODO(Phase 5): the SDL window does not exist yet. Report "focused, not minimised" (ours = our window has the input, minimised =
- * SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED, ours = SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS). The freeze watcher
- * (oe_watch) is not started on Linux until this reports real state. */
-static void oe_window_state(int *ours, int *minimised) { *ours = 1; *minimised = 0; }
+/* The SDL window's state (display.c). The freeze watcher (oe_watch) is still not started on Linux. */
+static void oe_window_state(int *ours, int *minimised) {     /* display.c (display_sdl.h): ours = SDL_WINDOW_INPUT_FOCUS, minimised = SDL_WINDOW_MINIMIZED; 1, 0 before the window exists */
+    void display_window_state(int *focused, int *minimised);
+    display_window_state(ours, minimised);
+}
 #endif
 static CRITICAL_SECTION g_oe_lock;
 static void oe_event_setup(void) {

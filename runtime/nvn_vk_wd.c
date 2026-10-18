@@ -19,9 +19,8 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/resource.h>
-/* TODO(Phase 5): the SDL window does not exist yet; "minimised" = SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED. Until then: never minimised
- * (the watchdog then reports a stall exactly as on Windows with a visible window; it cannot misfire on a minimised window it cannot see). */
-static int wd_iconic(void) { return 0; }
+/* "Minimised" = the SDL window is minimised or occluded (display.c): no presents then, so no stall report. */
+static int wd_iconic(void) { int focused, minimised; display_window_state(&focused, &minimised); return minimised; }      /* display.c: SDL_WINDOW_MINIMIZED */
 #endif
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */

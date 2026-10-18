@@ -7,6 +7,14 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
+#ifndef _WIN32
+#include <errno.h>
+#include <time.h>
+#include <sys/prctl.h>
+#include <SDL3/SDL.h>
+#include "plat_crash.h"
+#include "display_sdl.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -18,7 +26,11 @@
 void os_init_event(uint64_t key, int autoclear);      /* os_threads.c */
 void os_signal_event(uint64_t key);
 
+#ifdef _WIN32
 static HWND g_hwnd;
+#else
+static SDL_Window *g_hwnd;                            /* the SDL window (Windows name kept: nvn_gl_start / nvn_front_hwnd hand it on as void *) */
+#endif
 static volatile LONG g_ready;
 static volatile LONG64 g_frames;
 void nvn_gl_start(void *hwnd);                        /* nvn_gl.c */
@@ -68,6 +80,7 @@ static void speed_init(void) {
 }
 
 int oe_exit_request(void);                            /* nnmisc.c */
+#ifdef _WIN32
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
@@ -125,26 +138,132 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
     return 0;
 }
+#else
+/* Linux (Phase 5): an SDL3 window. This thread calls SDL_Init(VIDEO), so it is SDL's main thread: it creates the window and
+ * runs the process's only event pump (display_sdl.h). Window mode: SSBU_WINDOW=windowed|borderless|fullscreen, else
+ * graphics.ini; under gamescope (the Steam Frame) "windowed" is taken as fullscreen. SSBU_SHOW=0 (test runs): SDL's offscreen
+ * driver (Vulkan on VK_EXT_headless_surface; no keyboard) - a hidden Wayland window never gets its buffers back, so presents
+ * would time out; default shown (the Windows exe-name rule does not apply). SSBU_TITLE names the window. The title is set here
+ * only: other threads post it (SetWindowTextA below). Close / SIGINT / SIGTERM (SDL_EVENT_QUIT) = WM_CLOSE. "Minimised" =
+ * SDL_WINDOW_MINIMIZED or SDL_WINDOW_OCCLUDED (a suspended Wayland toplevel: nothing is shown, presents are skipped). */
+static char g_title[96];
+static volatile LONG g_focused = 1, g_minimised, g_pix_w, g_pix_h, g_title_seq;
+static char g_title_next[160];
+static SRWLOCK g_title_lock = SRWLOCK_INIT;
+static void title_post(const char *t) {
+    AcquireSRWLockExclusive(&g_title_lock);
+    snprintf(g_title_next, sizeof g_title_next, "%s", t);
+    ReleaseSRWLockExclusive(&g_title_lock);
+    InterlockedIncrement(&g_title_seq);
+}
+#define SetWindowTextA(w, t) title_post(t)
+static void window_close(void) {                     /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
+    printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+    if (!oe_exit_request()) report_and_exit(0);
+}
+static void window_flags(void) {
+    SDL_WindowFlags f = SDL_GetWindowFlags(g_hwnd);
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(g_hwnd, &w, &h);
+    InterlockedExchange(&g_focused, (f & SDL_WINDOW_INPUT_FOCUS) != 0);
+    InterlockedExchange(&g_minimised, (f & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED)) != 0);
+    InterlockedExchange(&g_pix_w, w); InterlockedExchange(&g_pix_h, h);
+}
+SDL_Window *display_sdl_window(void) { return g_ready ? g_hwnd : NULL; }
+void display_window_state(int *focused, int *minimised) { *focused = g_focused; *minimised = g_minimised; }
+void display_window_pixels(int *w, int *h) { *w = g_pix_w; *h = g_pix_h; }
+static int under_gamescope(void) {
+    const char *wl = getenv("WAYLAND_DISPLAY"), *de = getenv("XDG_CURRENT_DESKTOP");
+    return getenv("GAMESCOPE_WAYLAND_DISPLAY") || (wl && strstr(wl, "gamescope")) || (de && !_stricmp(de, "gamescope"));
+}
+static DWORD WINAPI window_thread(LPVOID arg) {
+    (void)arg;
+    crash_thread_init();
+    const GfxOptions *go = gfx_options();
+    const char *wm = getenv("SSBU_WINDOW"), *from = "graphics.ini", *show = getenv("SSBU_SHOW");
+    int mode = go->window_mode, cw = go->width, ch = go->height, visible = show ? atoi(show) != 0 : 1;
+    if (wm && wm[0]) { mode = !_stricmp(wm, "fullscreen") ? 2 : !_stricmp(wm, "borderless") ? 1 : 0; from = "SSBU_WINDOW"; }
+    else if (!mode && under_gamescope()) { mode = 2; from = "gamescope: fullscreen"; }
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");          /* a close is reported once (WINDOW_CLOSE_REQUESTED); QUIT is SIGINT / SIGTERM */
+    if (!visible) SDL_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER, "offscreen", SDL_HINT_OVERRIDE);
+    if (under_gamescope()) SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "0");       /* no decorations to draw there (libdecor plugins only print warnings) */
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) { printf("display: SDL_Init(VIDEO) failed: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+    SDL_WindowFlags fl = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (mode == 2) fl |= SDL_WINDOW_FULLSCREEN;                    /* desktop-mode fullscreen (no mode switch) */
+    else if (mode == 1) { const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay()); fl |= SDL_WINDOW_BORDERLESS; if (dm) { cw = dm->w; ch = dm->h; } }
+    else fl |= SDL_WINDOW_RESIZABLE;
+    snprintf(g_title, sizeof g_title, "%s", getenv("SSBU_TITLE") ? getenv("SSBU_TITLE") : "SSBU native (study build)");
+    g_hwnd = SDL_CreateWindow(g_title, cw, ch, fl);
+    if (!g_hwnd) { printf("display: SDL_CreateWindow failed: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+    if (mode == 1) SDL_SetWindowPosition(g_hwnd, 0, 0);
+    window_flags();
+    printf("display: window %s (%s), %dx%d pixels, SDL video driver %s%s\n", mode == 2 ? "fullscreen" : mode ? "borderless" : "windowed", from, (int)g_pix_w, (int)g_pix_h,
+           SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", visible ? "" : " (SSBU_SHOW=0: not shown)");
+    InterlockedExchange(&g_ready, 1);
+    LONG title_done = 0;
+    for (;;) {
+        SDL_Event ev;
+        if (SDL_WaitEventTimeout(&ev, 10)) do {
+            if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) window_close();
+            else if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) window_flags();
+        } while (SDL_PollEvent(&ev));
+        if (g_title_seq != title_done) {
+            char t[160];
+            title_done = g_title_seq;
+            AcquireSRWLockExclusive(&g_title_lock);
+            memcpy(t, g_title_next, sizeof t);
+            ReleaseSRWLockExclusive(&g_title_lock);
+            SDL_SetWindowTitle(g_hwnd, t);
+        }
+    }
+    return 0;
+}
+/* The pacing waits (Linux): QPC ticks are CLOCK_MONOTONIC ns here (plat.h), so `target` is an absolute CLOCK_MONOTONIC time.
+ * clock_nanosleep(TIMER_ABSTIME) until SSBU_PACE_SPIN_US (default 200) before it, then a yield spin; the calling thread's
+ * timer slack is set to 1 ns at its first wait (default 50 us). *now = the time it returned at. */
+static void pace_wait_until(LONGLONG target, LARGE_INTEGER *now) {
+    static LONGLONG margin = -1;
+    static _Thread_local int slack_set;
+    if (margin < 0) { const char *e = getenv("SSBU_PACE_SPIN_US"); LONGLONG m = (e ? atoll(e) : 200) * 1000; margin = m < 0 ? 0 : m; }
+    if (!slack_set) { prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL); slack_set = 1; }
+    QueryPerformanceCounter(now);
+    LONGLONG wake = target - margin;
+    if (wake > now->QuadPart) {
+        struct timespec ts = {(time_t)(wake / 1000000000LL), (long)(wake % 1000000000LL)};
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+    }
+    for (QueryPerformanceCounter(now); now->QuadPart < target; QueryPerformanceCounter(now)) YieldProcessor();
+}
+#endif
 
 /* Signals the guest's vsync event 60 times per second. */
 static DWORD WINAPI vsync_thread(LPVOID arg) {
     (void)arg;
+#ifndef _WIN32
+    crash_thread_init();
+#endif
     LARGE_INTEGER next;
     QueryPerformanceCounter(&next);
     if (!old_pacing()) {
         LARGE_INTEGER t0 = next, now;
         LONG64 n = 0;
+#ifdef _WIN32
         HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+#endif
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         for (;;) {
             LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / 60;       /* no accumulated rounding */
             QueryPerformanceCounter(&now);
             LONGLONG left = target - now.QuadPart;
             if (left > 0) {
+#ifdef _WIN32
                 LARGE_INTEGER due;
                 due.QuadPart = -((left - g_freq.QuadPart / 2000) * 10000000 / g_freq.QuadPart);
                 if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
                 for (QueryPerformanceCounter(&now); now.QuadPart < target; QueryPerformanceCounter(&now)) YieldProcessor();
+#else
+                pace_wait_until(target, &now);
+#endif
             }
             LONG64 passed = (now.QuadPart - t0.QuadPart) * 60 / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
             if (passed < n + 1) passed = n + 1;
@@ -169,6 +288,10 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
     }
 }
 static void vsync_test_key(void) {
+#ifndef _WIN32
+    static int said;          /* Linux: no key injection (SSBU_AUTOKEY is a Windows test aid: keybd_event into the foreground window) */
+    if (!said) { said = 1; if (getenv("SSBU_AUTOKEY")) printf("display: SSBU_AUTOKEY is not supported on this host: ignored%c", 10); }
+#else
     {
         /* Test aid: SSBU_AUTOKEY=<letter>,<first second>,<every n seconds> presses a key now and then, so a run without a person can get
          * past "press any button". Only while this window is the foreground window, so the key never reaches another program. */
@@ -182,6 +305,7 @@ static void vsync_test_key(void) {
         if (key && down && tick - down >= 8) { keybd_event((BYTE)key, 0, KEYEVENTF_KEYUP, 0); down = 0; }
         else if (key && !down && tick >= first * 60 && (tick - first * 60) % (every * 60) == 0 && ((tick % 600 == 0 ? (void)printf("display: test key wanted, window foreground: %d%c", GetForegroundWindow() == g_hwnd, 10) : (void)0), 1) && (GetForegroundWindow() == g_hwnd || (SetForegroundWindow(g_hwnd), GetForegroundWindow() == g_hwnd))) { keybd_event((BYTE)key, 0, 0, 0); down = tick; printf("display: test key %c pressed at frame tick %d%c", key, tick, 10); }
     }
+#endif
 }
 
 void hitch_init(void); void hitch_pacing(int on);      /* hitch.c: SSBU_HITCH */
@@ -193,7 +317,9 @@ void display_init(void) {
      * 64 times per second: the movie player's two feed threads delivered one sample per tick and its pre-roll loop
      * [game 0x71036f27b4, 125 x 10 ms, holding the player's mutex] ran out every time (1.3 s, main thread blocked).
      * SSBU_TIMER_PERIOD=<ms> (default 1; 0 = leave the system default). */
+#ifdef _WIN32
     { const char *e = getenv("SSBU_TIMER_PERIOD"); int ms = e ? atoi(e) : 1; if (ms > 0) { MMRESULT r = timeBeginPeriod((UINT)ms); printf("display: system timer period %d ms requested (%s)%c", ms, r == TIMERR_NOERROR ? "ok" : "refused", 10); } }
+#endif                                                  /* Linux: timed waits already end at the time asked for (hrtimers, 50 us slack) */
     hitch_init();
     CreateThread(NULL, 0, window_thread, NULL, 0, NULL);
     while (!g_ready) Sleep(1);
@@ -340,6 +466,7 @@ void display_pace(void) {
     LONGLONG left = next.QuadPart - now.QuadPart, frame_ticks = g_freq.QuadPart * (g_interval ? g_interval : 1) / 60;
     if (!g_interval) next = now;
     else if (left > 0) {
+#ifdef _WIN32
         static HANDLE timer;
         LARGE_INTEGER after, due;
         hitch_pacing(1);
@@ -347,6 +474,11 @@ void display_pace(void) {
         due.QuadPart = -((left - g_freq.QuadPart / 2000) * 10000000 / g_freq.QuadPart);          /* relative, 100 ns units */
         if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
         for (QueryPerformanceCounter(&after); after.QuadPart < next.QuadPart; QueryPerformanceCounter(&after)) YieldProcessor();
+#else
+        LARGE_INTEGER after;
+        hitch_pacing(1);
+        pace_wait_until(next.QuadPart, &after);
+#endif
         hitch_pacing(0);
         nvn_pf_pace(after.QuadPart - now.QuadPart);
     } else if (-left > frame_ticks) next.QuadPart = now.QuadPart - frame_ticks;

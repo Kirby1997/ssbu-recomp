@@ -18,7 +18,10 @@
  *   SSBU_VK_MISSING=warn      development only: an operation that is not implemented is reported once, counted and
  *                             skipped instead of stopping the game (the picture is then NOT the game's)
  *
- * Vulkan declarations: vk_min.h (see there why it is not the Khronos header). The loader is vulkan-1.dll. */
+ * Vulkan declarations: vk_min.h (see there why it is not the Khronos header). The loader is vulkan-1.dll.
+ * Linux (Phase 5): the loader is libvulkan.so.1, the window an SDL_Window (display.c, display_sdl.h): instance extensions
+ * from SDL_Vulkan_GetInstanceExtensions, surface from SDL_Vulkan_CreateSurface, size from the window when the surface
+ * has none (Wayland: currentExtent 0xFFFFFFFF). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +34,15 @@
 #include <vulkan/vulkan.h>
 #include "nvn_front.h"
 #include "gfx_options.h"
+#ifndef _WIN32
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include "display_sdl.h"
+typedef void *HWND;                                       /* the SDL_Window * of display.c (nvn_front_hwnd) */
+#define VK_LOADER_NAME "libvulkan.so.1"
+#else
+#define VK_LOADER_NAME "vulkan-1.dll"
+#endif
 #define P(a) ((void *)(uintptr_t)(a))                     /* guest addresses are host addresses (as in nvn_gl.c) */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);     /* nvn_vk_draw.c (included at the end) */
 static void vkd_init(void);
@@ -48,6 +60,11 @@ int display_wait_refresh(void);
 void display_before_present(void);
 
 /* ---------------------------------------------------------------- the loader's functions */
+#ifdef _WIN32
+#define VKF_SURFACE(X) X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *))
+#else
+#define VKF_SURFACE(X)                                    /* SDL_Vulkan_CreateSurface */
+#endif
 #define VKF(X) \
     X(VkResult, vkEnumerateInstanceLayerProperties, (uint32_t *, VkLayerProperties *)) \
     X(VkResult, vkEnumerateInstanceExtensionProperties, (const char *, uint32_t *, VkExtensionProperties *)) \
@@ -58,7 +75,7 @@ void display_before_present(void);
     X(void, vkGetPhysicalDeviceProperties, (VkPhysicalDevice, VkPhysicalDeviceProperties *)) \
     X(void, vkGetPhysicalDeviceQueueFamilyProperties, (VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties *)) \
     X(VkResult, vkEnumerateDeviceExtensionProperties, (VkPhysicalDevice, const char *, uint32_t *, VkExtensionProperties *)) \
-    X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *)) \
+    VKF_SURFACE(X) \
     X(void, vkDestroySurfaceKHR, (VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *)) \
     X(VkResult, vkGetPhysicalDeviceSurfaceSupportKHR, (VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *)) \
     X(VkResult, vkGetPhysicalDeviceSurfaceCapabilitiesKHR, (VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *)) \
@@ -118,6 +135,9 @@ static struct {
     VkSemaphore acquired, rendered;
     VkFence fence;
     int fence_pending, alive, validate;
+#ifndef _WIN32
+    int window_sized;                                     /* the surface had no extent: the swapchain has the window's size */
+#endif
 } V;
 static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
@@ -188,10 +208,17 @@ static void swapchain_destroy(void) {
 /* Returns 0 when there is nothing to present to (a minimised window has a zero-sized surface). */
 static int swapchain_create(void) {
     VkSurfaceCapabilitiesKHR caps;
+#ifndef _WIN32
+    { int focused, minimised; display_window_state(&focused, &minimised); if (minimised) return 0; }     /* see swapchain_check_size */
+#endif
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
     VkExtent2D ext = caps.currentExtent;
+#ifdef _WIN32
     if (ext.width == 0xffffffffu) { RECT rc; GetClientRect(V.hwnd, &rc); ext.width = (uint32_t)rc.right; ext.height = (uint32_t)rc.bottom; }
+#else
+    if (ext.width == 0xffffffffu) { int w, h; display_window_pixels(&w, &h); ext.width = (uint32_t)(w > 0 ? w : 0); ext.height = (uint32_t)(h > 0 ? h : 0); }
+#endif
     if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
     if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
     if (caps.maxImageExtent.width && ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
@@ -219,13 +246,30 @@ static int swapchain_create(void) {
     r = vkGetSwapchainImagesKHR(V.device, V.swapchain, &V.image_count, V.images);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkGetSwapchainImagesKHR", r);
     V.extent = ext;
+#ifndef _WIN32
+    V.window_sized = caps.currentExtent.width == 0xffffffffu;
+#endif
     return 1;
 }
+#ifndef _WIN32
+/* Called before an acquire. A minimised / occluded window (display.c) has no swapchain, as a minimised Win32 window has no
+ * surface area: an occluded Wayland surface never gets its buffers back and every acquire would wait its full time-out.
+ * Wayland: the surface takes its size from the swapchain, so a resized window gives no OUT_OF_DATE: the swapchain is dropped
+ * when the window's pixel size is no longer its extent. The caller's swapchain_create makes it again (or returns 0). */
+static int swapchain_stale(void) {                     /* 1: drop the swapchain before the next acquire (also nvn_vk_draw.c's present) */
+    int w, h, focused, minimised;
+    if (!V.swapchain) return 0;
+    display_window_state(&focused, &minimised);
+    display_window_pixels(&w, &h);
+    return minimised || (V.window_sized && w > 0 && h > 0 && ((uint32_t)w != V.extent.width || (uint32_t)h != V.extent.height));
+}
+static void swapchain_check_size(void) { if (swapchain_stale()) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); } }
+#endif
 
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
     void *p = (void *)GetProcAddress(V.loader, name);
-    if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
+    if (!p) { printf("nvn_vk: " VK_LOADER_NAME " does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;
 }
 
@@ -236,8 +280,13 @@ int nvn_vk_init(void *hwnd) {
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;
+#ifdef _WIN32
     V.loader = LoadLibraryA("vulkan-1.dll");
     if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+#else
+    V.loader = LoadLibraryA(VK_LOADER_NAME);             /* the library SDL loaded for the SDL_WINDOW_VULKAN window (same handle) */
+    if (!V.loader) { printf("nvn_vk: %s cannot be loaded (%s): no Vulkan loader on this system\n", VK_LOADER_NAME, plat_dlerror()); fflush(stdout); ExitProcess(5); }
+#endif
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
@@ -250,10 +299,22 @@ int nvn_vk_init(void *hwnd) {
     uint32_t niext = 128;
     r = vkEnumerateInstanceExtensionProperties(NULL, &niext, iext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
+#ifdef _WIN32
     const char *exts[4], *layers[1];
     uint32_t next = 0, nlayers = 0;
     exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
     if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); ExitProcess(5); }
+#else
+    Uint32 nsdl = 0;
+    const char *const *sdl_exts = SDL_Vulkan_GetInstanceExtensions(&nsdl);      /* VK_KHR_surface + the platform's (wayland / xcb / ...) */
+    if (!sdl_exts) { printf("nvn_vk: SDL_Vulkan_GetInstanceExtensions failed: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+    const char **exts = malloc(sizeof *exts * (nsdl + 1)), *layers[1];     /* + VK_EXT_debug_utils; kept for the process */
+    uint32_t next = 0, nlayers = 0;
+    for (Uint32 i = 0; i < nsdl; i++) {
+        if (!has_name(iext, niext, sdl_exts[i])) { printf("nvn_vk: the Vulkan loader has no %s (the window's surface needs it; SDL video driver %s)\n", sdl_exts[i], SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?"); fflush(stdout); ExitProcess(5); }
+        exts[next++] = sdl_exts[i];
+    }
+#endif
     { const char *e = getenv("SSBU_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
     if (V.validate) {
         static VkLayerProperties lp[64];
@@ -286,11 +347,15 @@ int nvn_vk_init(void *hwnd) {
         printf("nvn_vk: validation layer on (VK_LAYER_KHRONOS_validation); messages are printed as vk-validation:\n");
     }
 
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
     r = vkCreateWin32SurfaceKHR(V.instance, &si, NULL, &V.surface);
     if (r != VK_SUCCESS) vk_fatal("vkCreateWin32SurfaceKHR", r);
+#else
+    if (!hwnd || !SDL_Vulkan_CreateSurface((SDL_Window *)hwnd, V.instance, NULL, &V.surface)) { printf("nvn_vk: SDL_Vulkan_CreateSurface failed: %s\n", hwnd ? SDL_GetError() : "no window"); fflush(stdout); ExitProcess(5); }
+#endif
 
     /* device: discrete > integrated > virtual > other; needs one queue family with graphics + compute that can present to the window */
     VkPhysicalDevice gpus[16];
@@ -377,6 +442,9 @@ int nvn_vk_init(void *hwnd) {
     r = vkGetPhysicalDeviceSurfacePresentModesKHR(V.gpu, V.surface, &nmode, modes);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkGetPhysicalDeviceSurfacePresentModesKHR", r);
     for (uint32_t i = 0; i < nmode; i++) if (modes[i] >= 0 && modes[i] < 4) have[modes[i]] = 1;
+#ifndef _WIN32
+    printf("nvn_vk: present modes of the surface:%s%s%s%s\n", have[0] ? " immediate" : "", have[1] ? " mailbox" : "", have[2] ? " fifo" : "", have[3] ? " fifo_relaxed" : "");
+#endif
     static const char *const k_mode[4] = {"immediate", "mailbox", "fifo", "fifo_relaxed"};
     const char *want = getenv("SSBU_VK_PRESENT");
     V.mode = have[VK_PRESENT_MODE_MAILBOX_KHR] ? VK_PRESENT_MODE_MAILBOX_KHR : have[VK_PRESENT_MODE_IMMEDIATE_KHR] ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
@@ -435,6 +503,9 @@ static void wait_last_submit(void) {
 static void present_colour(const float rgba[4]) {
     if (!V.alive) return;
     wait_last_submit();
+#ifndef _WIN32
+    swapchain_check_size();
+#endif
     if (!V.swapchain && !swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
     uint32_t index = 0;
     VkResult r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, V.acquired, NULL, &index);

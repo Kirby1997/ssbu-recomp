@@ -144,7 +144,7 @@ void nvn_front_take_dead(void (*drop)(int kind, void *host));               /* d
 void nvn_front_count(int what, long long n);                                /* 0 draws, 1 skipped draws, 2 clears, 3 submits, 4 texture uploads, 5 textures created */
 int nvn_front_clip_modes(void);                                             /* origin mode | depth mode << 8 (1 | 1 << 8 = upper left, 0..1) */
 const char *nvn_front_op_name(unsigned op);
-void *nvn_front_hwnd(void);
+void *nvn_front_hwnd(void);                                                 /* the game window: HWND on Windows, SDL_Window * elsewhere (display.c, display_sdl.h) */
 void nvn_front_shot_step(int step);                                         /* scripted input: a key step begins (SSBU_SHOT_STEPS) */
 int nvn_front_take_step_shot(void);                                         /* present: step + 1 when a step screenshot is due, else 0 */
 #endif
