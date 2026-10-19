@@ -442,6 +442,7 @@ static int attach_dll(NroModule *m) {
         dll = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     }
     if (!dll) { const char *e = dlerror(); printf("nn::ro::LoadModule: dlopen %s: %s\n", path, e ? e : "?"); return 0; }
+    { extern void crash_modules_refresh(void) __attribute__((weak)); if (crash_modules_refresh) crash_modules_refresh(); }   /* plat_crash.c: crash report module list */
     NroBindFn bind;
     { void *s = dlsym(dll, "nro_bind"); memcpy(&bind, &s, sizeof bind); }
     if (!bind) { const char *e = dlerror(); printf("nn::ro::LoadModule: %s has no nro_bind: %s\n", path, e ? e : "?"); dlclose(dll); return 0; }

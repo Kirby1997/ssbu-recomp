@@ -858,7 +858,11 @@ int diag_report_path(char *out, size_t size, const char *suffix) {
     int k = dir && dir[0] ? snprintf(out, size, "%s/%s%s", dir, base ? base + 1 : exe, suffix) : snprintf(out, size, "%s%s", exe, suffix);
     return k > 0 && (size_t)k < size;
 }
-/* No minidumps on Linux: SSBU_MINIDUMP does nothing (a core dump is the equivalent: ulimit -c / coredumpctl). The freeze
+/* No minidumps on Linux: SSBU_MINIDUMP does nothing. The equivalent is a core dump: with SSBU_CORE=1 and core dumps on
+ * (RLIMIT_CORE != 0) a crash ends with the signal's default action instead of exit code 4 (plat_crash.h). SteamOS has them on
+ * (ulimit -c unlimited) and pipes the core to steamos-log-submitter, which hands it to systemd-coredump: "coredumpctl list
+ * ssbu" / "coredumpctl debug". Elsewhere: "ulimit -c unlimited" too (core file or systemd-coredump, as
+ * /proc/sys/kernel/core_pattern says). Without SSBU_CORE=1: exit code 4 as on Windows. The freeze
  * watchdog adds the 1 this returns for a dump written, so it never counts one. */
 int diag_minidump(void *ep, const char *why) { (void)ep; (void)why; return 0; }
 int diag_dump_helper(int argc, char **argv) {          /* boot.c: "--write-dump" (Windows: the minidump helper process) */
@@ -866,17 +870,61 @@ int diag_dump_helper(int argc, char **argv) {          /* boot.c: "--write-dump"
     fprintf(stderr, "--write-dump: there are no minidumps on Linux (use a core dump)\n");
     return 6;
 }
-/* plat_crash.c has printed the signal (or crash_report_here's code), the fault address and the host call stack (frame
- * pointers from the signal's ucontext); the guest side of the report is the same as the Windows filter's. */
-static void crash_report(const crash_info *ci) {
-    dump_guest_registers();
-    printf("guest call stack (innermost first):\n");
+const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
+typedef struct { uint64_t lp; void (*fn)(Ctx *, uint64_t); } NroResume;
+int nro_unwind_module(uint64_t pc, uint64_t *base, uint64_t *size, const NroResume **tab, int *count, const char **name);   /* nnro.c */
+static void crash_put_str(crash_out *o, uint64_t s) {         /* a string that may be gone: byte by byte, never faulting */
+    char ch;
+    for (int i = 0; i < 80 && crash_read(s + (uint64_t)i, &ch, 1) && ch; i++) crash_putn(o, &ch, 1);
+}
+static void crash_put_guest(crash_out *o, uint64_t g) {       /* "f_<addr>  (main+0x<offset>)" */
+    uint64_t base = 0, size;
+    const NroResume *tab;
+    int count;
+    const char *name = NULL;
+    if (g >= GUEST_BASE && g < GUEST_BASE + IMAGE_SIZE) { base = GUEST_BASE; name = "main"; }
+    else if (g >= 0x7500000000ULL && g < 0x7500cfb000ULL) { base = 0x7500000000ULL; name = "sdk"; }
+    else if (!nro_unwind_module(g, &base, &size, &tab, &count, &name)) name = NULL;
+    crash_put(o, "f_"); crash_put_hex(o, g, 0);
+    if (name) { crash_put(o, "  ("); crash_put_str(o, (uint64_t)(uintptr_t)name); crash_put(o, "+0x"); crash_put_hex(o, g - base, 0); crash_put(o, ")"); }
+}
+/* The guest side of the crash report, the same as the Windows filter's (guest thread, last guest function, guest registers,
+ * guest call stack), written by plat_crash.c's handler into the console report and <exe>_crash.txt. Async-signal-safe: no
+ * stdio, no locks, no malloc; the context is read with crash_read, guest_function_of searches tables built at start. */
+static void crash_guest_section(crash_out *o, const crash_info *ci) {
+    const char *tn = guest_thread_name_of(GetCurrentThreadId());
+    crash_put(o, "guest thread: ");
+    if (tn) crash_put_str(o, (uint64_t)(uintptr_t)tn); else crash_put(o, "not a guest thread, or the main thread");
+    crash_put(o, g_game_build == GAME_13_0_4 ? "; game 13.0.4\n" : g_game_build == GAME_13_0_5 ? "; game 13.0.5\n" : "; main.elf not read yet\n");
+    Ctx *c = t_cur_ctx_get();
+    uint64_t x[32], fn, imp, from;
+    if (c && crash_read((uint64_t)(uintptr_t)c->x, x, sizeof x) && crash_read((uint64_t)(uintptr_t)&c->fn, &fn, 8)) {
+        crash_put(o, "last guest function entered: "); crash_put_guest(o, fn); crash_put(o, "\n");
+        if (crash_read((uint64_t)(uintptr_t)&c->in_import, &imp, 8) && imp && crash_read((uint64_t)(uintptr_t)&c->import_from, &from, 8)) {
+            crash_put(o, "in host import: "); crash_put_str(o, imp); crash_put(o, " (called from 0x"); crash_put_hex(o, from, 0); crash_put(o, ")\n");
+        }
+        crash_put(o, "guest registers:\n");
+        for (int i = 0; i < 31; i++) {
+            crash_put(o, "  x"); crash_put_dec(o, i); crash_put(o, i < 10 ? "  " : " "); crash_put_hex(o, x[i], 16);
+            crash_put(o, i % 3 == 2 ? "\n" : "");
+        }
+        crash_put(o, "  sp  "); crash_put_hex(o, x[31], 16); crash_put(o, "\n");
+    }
+    uint64_t g0 = ci->sig ? guest_function_of(ci->pc) : 0;
+    if (g0) { crash_put(o, "the fault is in lifted guest code: "); crash_put_guest(o, g0); crash_put(o, "\n"); }
+    crash_put(o, "guest call stack (innermost first):\n");
     uint64_t last = 0;
     for (int i = 0, shown = 0; i < ci->npcs && shown < 40; i++) {
         uint64_t pc = ci->pcs[i] - (ci->sig && i == 0 ? 0 : 4);   /* a signal's pcs[0] is the faulting pc; the rest are return addresses: name the call */
         uint64_t g = guest_function_of(pc);
-        if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+        if (g && g != last) { crash_put(o, "  "); crash_put_guest(o, g); crash_put(o, "\n"); shown++; last = g; }
     }
+}
+/* After plat_crash.c has written the report (console and <exe>_crash.txt): the run's summaries, as the Windows filter's
+ * report_and_exit(4). Its ExitProcess returns to plat_crash.c, which ends the process (core dump or exit code 4). */
+static void crash_report(const crash_info *ci) {
+    (void)ci;
+    (void)dump_guest_registers;                      /* the Windows filter's console copy; here crash_guest_section */
     report_and_exit(4);
 }
 #endif
@@ -909,7 +957,10 @@ void runtime_init(const char *elf, const char *trace_path) {
     void *imp = VirtualAlloc((void *)IMPORT_BASE, (SIZE_T)dyn_sym_count * IMPORT_SLOT, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area\n"); exit(1); }
 #else
-    crash_install(crash_report, 4);                  /* SIGSEGV/BUS/ILL/FPE/TRAP; this thread's alternate stack (others: crash_thread_init) */
+    crash_install(crash_report, 4);                  /* SIGSEGV/BUS/ILL/FPE/TRAP/ABRT; this thread's alternate stack (others: crash_thread_init) */
+    crash_set_section(crash_guest_section);
+    {   char path[2 * MAX_PATH];                     /* the report also goes to <exe>_crash.txt (SSBU_REPORT_DIR: there), made at a crash */
+        if (diag_report_path(path, sizeof path, "_crash.txt")) crash_set_report_file(path); }
     vmem_init();                                     /* normally done first thing in main; idempotent */
     /* both inside the guest window vmem_init reserved (GUEST 0x71, IMPORT 0x73): carved out of it, zero-filled */
     void *mem = vmem_reserve(GUEST_BASE, IMAGE_SIZE, PROT_READ | PROT_WRITE);

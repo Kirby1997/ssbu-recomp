@@ -400,8 +400,13 @@ static hobj *thread_of(HANDLE x) {
     hobj *h = hget(x);
     return h && h->kind == K_THREAD ? h : NULL;
 }
+/* plat_crash.c, when it is linked (the game; not every test): weak, so the plat tests link without it */
+int crash_thread_init(void) __attribute__((weak));
+void crash_modules_refresh(void) __attribute__((weak));
+void crash_on_exit(int code) __attribute__((weak));
 static NOINL void *thread_start(void *p) {
     hobj *h = p;
+    if (crash_thread_init) crash_thread_init();  /* alternate signal stack: an overflow on this thread still gets a crash report */
     t_self = h;
     h->tid = (pid_t)GetCurrentThreadId();
     __atomic_store_n(&h->started, 1, __ATOMIC_RELEASE);
@@ -1161,6 +1166,7 @@ static NOINL void keep_dlerror(void) {
 HMODULE LoadLibraryA(LPCSTR path) {
     void *h = path ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : NULL;
     if (!h) { keep_dlerror(); SetLastError(ERROR_MOD_NOT_FOUND); }
+    else if (crash_modules_refresh) crash_modules_refresh();     /* the crash report's module list */
     return h;
 }
 HMODULE GetModuleHandleA(LPCSTR name) {
@@ -1176,9 +1182,14 @@ FARPROC GetProcAddress(HMODULE m, LPCSTR name) {
     memcpy(&f, &s, sizeof f);
     return f;
 }
-BOOL FreeLibrary(HMODULE m) { return m && dlclose(m) == 0; }
+BOOL FreeLibrary(HMODULE m) {
+    BOOL ok = m && dlclose(m) == 0;
+    if (ok && crash_modules_refresh) crash_modules_refresh();
+    return ok;
+}
 void ExitProcess(UINT code) {
     fflush(NULL);
+    if (crash_on_exit) crash_on_exit((int)code);    /* inside a crash report: back to plat_crash.c, which ends the process */
     _exit((int)code);
 }
 int __argc;
