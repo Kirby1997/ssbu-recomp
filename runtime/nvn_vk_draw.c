@@ -1604,6 +1604,7 @@ static struct { uintptr_t lo, hi; DWORD old; } g_cg[256];
 static volatile LONG64 g_cg_reads, g_cg_writes, g_cg_render;
 static uintptr_t g_cg_span_lo = ~(uintptr_t)0, g_cg_span_hi;
 static DWORD g_cg_render_tid;
+#ifdef _WIN32
 static LONG CALLBACK cg_veh(EXCEPTION_POINTERS *x) {
     if (x->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || x->ExceptionRecord->NumberParameters < 2 || x->ExceptionRecord->ExceptionInformation[0] > 1) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t a = (uintptr_t)x->ExceptionRecord->ExceptionInformation[1];
@@ -1630,12 +1631,17 @@ static LONG CALLBACK cg_veh(EXCEPTION_POINTERS *x) {
     ReleaseSRWLockExclusive(&g_cg_lock);
     return res;
 }
+#endif
 static int cb_keep_mode(void) {
     if (g_cb_keep < 0) {
         const char *e = getenv("SSBU_VK_CBKEEP");
         g_cb_keep = e ? atoi(e) : VK_CBKEEP_DEFAULT;
         if (getenv("SSBU_COMPUTE_CMP") && atoi(getenv("SSBU_COMPUTE_CMP"))) g_cb_keep = 0;      /* that comparison reads compute's output from guest memory after every batch */
+#ifdef _WIN32
         if (g_cb_keep == 2) { AddVectoredExceptionHandler(1, cg_veh); printf("nvn_vk: SSBU_VK_CBKEEP=2: accesses to kept compute ranges are trapped and logged (test)\n"); }
+#else      /* Linux: the trap needs a vectored handler (cg_veh); without one a guarded page would crash, so keep without the guard */
+        if (g_cb_keep == 2) { g_cb_keep = 1; printf("nvn_vk: SSBU_VK_CBKEEP=2 (access trap) is Windows only: 1 is used\n"); }
+#endif
         g_cg_render_tid = GetCurrentThreadId();
     }
     return g_cb_keep;
@@ -3247,7 +3253,11 @@ static void vk_present2(void *arg, int progress) {
         static LONG64 press;
         if (ck == -2) { const char *e = getenv("SSBU_VK_CAPKEY"); ck = e ? (atoi(e) > 1 ? atoi(e) : 0x78) : 0; if (ck) printf("nvn_vk_capture: key 0x%x saves 12 consecutive frames (SSBU_VK_CAPKEY)\n", ck); }
         if (ck) {
+#ifdef _WIN32
             int down = (GetAsyncKeyState(ck) & 0x8000) != 0;
+#else      /* Linux: no global key state here (the SDL keyboard is nnpad_sdl.c's); SSBU_VK_CAPKEY never sees a press */
+            int down = 0;
+#endif
             if (down && !was_down && !left) { left = 12; press++; printf("nvn_vk_capture: press %lld at presented frame %lld (%s): 12 frames follow\n", (long long)press, (long long)frame, g_in_fight ? "fight" : "no fight"); }
             was_down = down;
             if (left && vt) {

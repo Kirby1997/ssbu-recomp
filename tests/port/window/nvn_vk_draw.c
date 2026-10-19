@@ -4,5 +4,6 @@
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) { (void)di; (void)dext; (void)ndext; }
 static void vkd_init(void) {}
 static void vkd_shutdown(void) {}
+static void vkd_lost_report(void) {}
 static int wd_iconic(void) { int focused, minimised; display_window_state(&focused, &minimised); return minimised; }    /* = runtime/nvn_vk_wd.c (Linux) */
 int test_wd_iconic(void) { return wd_iconic(); }

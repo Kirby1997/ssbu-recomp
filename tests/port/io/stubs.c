@@ -24,3 +24,6 @@ void call_guest(Ctx *c, uint64_t addr) { (void)c; (void)addr; }
 int crash_thread_init(void) { return 0; }
 int fight_seq_ticks(void) { return 1; }
 void nvn_front_shot_step(int step) { (void)step; }
+/* display.c / the front end (after the upstream 938e66b merge): the L1 latency poll and the fight screenshot (test only) */
+void display_l1_poll(uint64_t buttons, long long fight_ticks, long long poll) { (void)buttons; (void)fight_ticks; (void)poll; }
+void nvn_front_shot_fight(int frame) { (void)frame; }

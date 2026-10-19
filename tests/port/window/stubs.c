@@ -46,3 +46,8 @@ void report_and_exit(int code) { printf("test: report_and_exit(%d) called by the
 const ImportDef *g_vi_defs;
 int g_vi_count;
 void register_imports(const ImportDef *defs, int count) { g_vi_defs = defs; g_vi_count = count; }
+/* after the upstream 938e66b merge: graphics.ini latency (normal), the kept present and the L1 report of the front end */
+int gfx_latency(void) { return 0; }
+void nvn_front_post_present_flush(void) { }
+unsigned long nvn_front_present_tid(void) { return 0; }
+void nvn_l1_report(FILE *out) { (void)out; }

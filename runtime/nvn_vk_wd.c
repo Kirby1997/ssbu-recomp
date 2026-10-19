@@ -22,12 +22,17 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/resource.h>
+void display_window_state(int *focused, int *minimised);      /* display.c */
 /* "Minimised" = the SDL window is minimised or occluded (display.c): no presents then, so no stall report. */
 static int wd_iconic(void) { int focused, minimised; display_window_state(&focused, &minimised); return minimised; }      /* display.c: SDL_WINDOW_MINIMIZED */
 #endif
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 int diag_report_path(char *out, size_t size, const char *suffix);     /* hostrt.c */
+#ifdef _WIN32
 int diag_minidump(EXCEPTION_POINTERS *ep, const char *why);
+#else
+int diag_minidump(void *ep, const char *why);      /* hostrt.c: no minidumps on Linux, returns 0 */
+#endif
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */
 static volatile LONG g_wd_quit;
 static HANDLE g_wd_thread;
@@ -238,6 +243,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         for (int f = 0; f < th[i].nfr; f++) { wd_addr(th[i].pc[f], ab, sizeof ab); wdp("      %2d  %s\n", f, ab); }
 #endif
     }
+#ifdef _WIN32      /* Linux: no call stacks of other threads yet (see the TODO above) */
     {   /* session 14: the game's thread again, 12 samples 50 ms apart (8 frames each): a thread that is in the SAME innermost
          * frames every time is stuck in one loop; one whose frames change below a common caller is running a longer piece
          * of work (the owner's 5 s report of 2026-10-13 was one sample of the game's menu script interpreter: not enough to tell) */
@@ -262,6 +268,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
             CloseHandle(h);
         }
     }
+#endif
     wdp("nvn_vk_watchdog: ======== end of the report%s%s ========\n\n", g_wd_fp ? "; also appended to " : "", g_wd_fp ? path : "");
     fflush(stdout);
     if (g_wd_fp) { fclose(g_wd_fp); g_wd_fp = NULL; }
@@ -275,6 +282,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
  * and the CPU time of the process during the gap. Gaps while the window is minimised are not written. */
 unsigned long nvn_front_present_tid(void);         /* nvn_gl.c */
 static void wd_stall_sample(char *out, size_t cap) {
+#ifdef _WIN32
     DWORD tids[2] = {(DWORD)nvn_front_present_tid(), g_render_tid};
     size_t at = 0;
     out[0] = 0;
@@ -294,14 +302,23 @@ static void wd_stall_sample(char *out, size_t cap) {
         for (int f = 0; f < nf && at + 420 < cap; f++) { wd_addr(pc[f], ab, sizeof ab); at += (size_t)snprintf(out + at, cap - at, " | %s", ab); }
         if (at + 2 < cap) { out[at++] = '\n'; out[at] = 0; }
     }
+#else      /* Linux: no call stacks of other threads yet: the stall line has no sample */
+    out[0] = 0; (void)cap;
+#endif
 }
 static void wd_stall_write(double ms, LONG64 frame, const char *sample, int where, int fight, DWORD faults, double cpu_ms, LONG64 holds) {
     static int lines;
+#ifdef _WIN32
     char path[MAX_PATH + 16];
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     SYSTEMTIME st; GetLocalTime(&st);
     if (lines >= 300 || n <= 4) return;
     strcpy(path + n - 4, "_stalls.txt");
+#else      /* Linux: <exe>_stalls.txt (no ".exe" to strip), or in SSBU_REPORT_DIR (hostrt.c) */
+    char path[2 * MAX_PATH];
+    SYSTEMTIME st; GetLocalTime(&st);
+    if (lines >= 300 || !diag_report_path(path, sizeof path, "_stalls.txt")) return;
+#endif
     { WIN32_FILE_ATTRIBUTE_DATA fa; if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 2u * 1024 * 1024)) return; }
     FILE *fp = fopen(path, "ab");
     if (!fp) return;
@@ -313,11 +330,19 @@ static void wd_stall_write(double ms, LONG64 frame, const char *sample, int wher
     fclose(fp);
 }
 static void wd_proc(DWORD *faults, double *cpu_ms) {
+#ifndef _WIN32      /* Linux: page faults (minor + major) and CPU time (user + system) of the process, from getrusage */
+    struct rusage ru;
+    *faults = 0; *cpu_ms = 0;
+    if (getrusage(RUSAGE_SELF, &ru)) return;
+    *faults = (DWORD)(ru.ru_minflt + ru.ru_majflt);
+    *cpu_ms = (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 + (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
+#else
     PROCESS_MEMORY_COUNTERS pmc; FILETIME c, e, k, u;
     memset(&pmc, 0, sizeof pmc); pmc.cb = sizeof pmc;
     GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
     *faults = pmc.PageFaultCount; *cpu_ms = 0;
     if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) *cpu_ms = (double)((((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 10000.0;
+#endif
 }
 static LONG64 g_wd_stalls, g_wd_stall_max;
 static DWORD WINAPI wd_main(void *arg) {

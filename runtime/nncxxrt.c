@@ -353,6 +353,14 @@ typedef struct { Ctx *c; uint64_t in_flight, caught; int uncaught; } EhState;
  * freed by the system when the thread or fiber ends. A context on the stack now shares the state of the fiber it runs
  * on, which is what a throw that crosses it needs. SSBU_EH_STATE=table restores the old table (bounded: it stops with a
  * report instead of spinning). */
+#ifndef _WIN32
+/* Linux, TEMPORARY (until WP-U3 gives plat.h fiber-local storage that follows plat_fiber): FlsAlloc fails, so eh_state
+ * takes the bounded table below (mode 2), as before the freeze fix: it stops with a report at 4,096 contexts. */
+#define FLS_OUT_OF_INDEXES ((DWORD)0xFFFFFFFF)
+static DWORD FlsAlloc(void (*cb)(void *)) { (void)cb; return FLS_OUT_OF_INDEXES; }
+static void *FlsGetValue(DWORD i) { (void)i; return NULL; }
+static BOOL FlsSetValue(DWORD i, void *v) { (void)i; (void)v; return FALSE; }
+#endif
 #define EH_STATES 4096
 static EhState g_eh_state[EH_STATES];
 static SRWLOCK g_eh_state_lock = SRWLOCK_INIT;

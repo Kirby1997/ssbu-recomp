@@ -21,3 +21,8 @@ ImportFn tst_import(const char *name) {
     fprintf(stderr, "no import %s\n", name);
     abort();
 }
+/* display.c / nvn_gl.c (after the upstream 938e66b merge): L1 tracing (off), performance cores (nothing), the present thread */
+int display_l1_trace(void) { return 0; }
+double display_l1_ms(void) { return 0; }
+void display_perf_thread(void) { }
+unsigned long nvn_front_present_tid(void) { return 0; }

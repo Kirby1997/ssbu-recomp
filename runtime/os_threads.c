@@ -16,7 +16,11 @@
 #include "plat_crash.h"
 #endif
 /* L1 round 3, TEST ONLY: guest sync calls during the SSBU_L1_TRACE window (display.c) */
+#ifdef _WIN32
 int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(unsigned long tid);
+#else      /* the definition below takes a DWORD, which is 32 bits on Linux (plat.h) */
+int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(DWORD tid);
+#endif
 #define L1O(what, key) do { if (display_l1_trace()) { const char *n_ = guest_thread_name_of(GetCurrentThreadId()); printf("l1-trace: %+8.2f %-26s lr %09llx %s %llx%c", display_l1_ms(), n_ ? n_ : "?", (unsigned long long)c->x[30], what, (unsigned long long)(key), 10); } } while (0)
 
 #define A0 (c->x[0])

@@ -10,7 +10,7 @@ HOST=${1:-steamos@frame}
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
 tar -cf - runtime/*.h runtime/plat_posix.c runtime/vmem.c runtime/fiber_aarch64.S \
-    runtime/nnaudio.c runtime/nnfontll.c runtime/nnhid.c runtime/nnpad_sdl.c \
+    runtime/nnaudio.c runtime/nnfontll.c runtime/nnhid.c runtime/nnpad_sdl.c runtime/r1_state.c \
     tests/port/stubs tests/port/io/Makefile tests/port/io/*.c |
     ssh -o BatchMode=yes "$HOST" 'mkdir -p ~/ssbu-port/io && cd ~/ssbu-port/io && rm -rf tests/port/io/build && tar -xf -'
 ssh -o BatchMode=yes "$HOST" "export FONT='${FONT:-}' FONT_CFF='${FONT_CFF:-}' FONT_TTC='${FONT_TTC:-}';"' cd ~/ssbu-port/io/tests/port/io && st=0

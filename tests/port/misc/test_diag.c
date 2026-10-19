@@ -21,6 +21,20 @@ static WdWait g_wd_wait[64];
 static volatile LONG64 g_wd_beat, g_wd_try;
 
 const char *guest_thread_name_of(DWORD tid) { (void)tid; return NULL; }
+/* after the upstream 938e66b merge: the hold counters (nvn_vk_m4.c), the window state (display.c), the present thread (the
+ * front end), the report path and the minidump (hostrt.c, Linux: next to the exe, no dumps) */
+enum { H_N = 4 };
+static LONG64 g_hold_n[H_N];
+void display_window_state(int *focused, int *minimised) { *focused = 1; *minimised = 0; }
+unsigned long nvn_front_present_tid(void) { return 0; }
+int diag_report_path(char *out, size_t size, const char *suffix) {
+    char exe[400];
+    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
+    int k = n ? snprintf(out, size, "%s%s", exe, suffix) : 0;
+    return k > 0 && (size_t)k < size;
+}
+int diag_minidump(void *ep, const char *why) { (void)ep; (void)why; return 0; }
+#include "nvn_vk_posix.h"          /* the nvn_vk TU's POSIX shims (the stall log's GetFileAttributesExA) */
 #include "nvn_vk_wd.c"
 
 static char g_freeze[512];

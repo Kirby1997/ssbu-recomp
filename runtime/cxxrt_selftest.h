@@ -683,7 +683,11 @@ static DWORD WINAPI st_main(LPVOID arg) {
     printf("sscanf / printf\n"); st_scanf();
     printf("gmtime, localeconv, random_device\n"); st_libc();
     printf("guard variables\n"); st_guard();
+#ifdef _WIN32
     printf("record of readable game-managed memory\n"); st_readable();      // PR #2 (jfb112697)
+#else      /* Linux: no per-thread record (every check asks vmem.c), so the record checks do not apply */
+    printf("record of readable game-managed memory: not on Linux\n");
+#endif
     printf("exception classes and vtables\n"); st_exceptions();
     printf("locale facets and stream vtables\n"); st_facets();
     printf("promise / future\n"); st_future();

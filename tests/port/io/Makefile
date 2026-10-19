@@ -13,7 +13,8 @@ GAME    := -Dfn_table='(*game_fn_table_p)' -Dfn_table_count='(*game_fn_table_cou
 CFLAGS  := -O1 -g -std=gnu11 -D_GNU_SOURCE -fno-pie -ffp-contract=off -fno-math-errno -fno-omit-frame-pointer -fno-strict-aliasing -pthread -I$(RT) -I$(REPO) -I. -I$(REPO)/tests/port/stubs -I$(SDL)/include -I$(FT) -Wno-everything
 LDFLAGS := -no-pie -pthread -rdynamic -ldl -lm
 SDLLIB  := -L$(SDL)/lib -lSDL3 -Wl,-rpath,$(SDL)/lib
-LIB     := $(BUILD)/plat_posix.o $(BUILD)/vmem.o $(BUILD)/fiber_aarch64.o $(BUILD)/stubs.o
+# r1_state.c: its Linux section (R1 off: the r1_* hooks nnhid.c / nnaudio.c call), as linked in the game
+LIB     := $(BUILD)/plat_posix.o $(BUILD)/vmem.o $(BUILD)/fiber_aarch64.o $(BUILD)/r1_state.o $(BUILD)/stubs.o
 TESTS   := test_audio test_font test_pad
 # TrueType (quadratic: the conic -> cubic raise), CFF (FreeType's own cubics) and a collection (face index 2)
 FONT     ?= $(firstword $(wildcard /usr/share/fonts/TTF/Hack-Regular.ttf /usr/share/fonts/TTF/DejaVuSans.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf))

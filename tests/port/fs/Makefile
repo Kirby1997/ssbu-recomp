@@ -14,7 +14,8 @@ SANFL   := $(if $(SAN),-fsanitize=address$(COMMA)undefined -fno-sanitize-recover
 CFLAGS  := -O1 -g -std=gnu11 -D_GNU_SOURCE -fno-pie -ffp-contract=off -fno-math-errno -fno-omit-frame-pointer -fno-strict-aliasing -pthread \
            -I$(RT) -I$(REPO) -I$(REPO)/tests/port/stubs -I. -Wno-everything $(SANFL)
 LDFLAGS := -no-pie -pthread -rdynamic -ldl $(SANFL)
-UNITS   := plat_posix hostpath nnfs nnfsdir nnpl gfx_options
+# r1_state: its Linux section (R1 off), for nnfs.c read_at's r1_wrote, as linked in the game
+UNITS   := plat_posix hostpath nnfs nnfsdir nnpl gfx_options r1_state
 OBJS    := $(addprefix $(BUILD)/,$(addsuffix .o,$(UNITS)) libc2_tu.o)
 
 all: run

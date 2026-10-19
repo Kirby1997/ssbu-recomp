@@ -82,8 +82,10 @@ static void vsync_test_key(void);
  *     its present and the next frame's (0 = replaced before it was shown). Histogram in the report and per 600 frames
  *     with SSBU_PACESTAT=1. This is the compositor model "the last picture presented before a vblank is what the next
  *     refresh shows" on MEASURED vblank times; it is not a camera. */
+#ifdef _WIN32
 typedef struct { HDC hDc; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; } KmtOpenAdapterFromHdc;
 typedef struct { UINT hAdapter; UINT hDevice; UINT VidPnSourceId; } KmtWaitVblank;
+#endif
 static SRWLOCK g_vb_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_vb_cv = CONDITION_VARIABLE_INIT;
 static volatile LONG64 g_vb_count, g_vb_qpc;           /* vblanks seen, time of the last one (under g_vb_lock for a consistent pair) */
@@ -117,6 +119,7 @@ static ULONG g_pc_ids[128];
 static int g_pc_n = -1, g_pc_on = 1;
 static uint8_t g_cpu_class[256], g_class_max;
 static volatile LONG64 g_pc_frames, g_pc_frames_slow;
+#ifdef _WIN32
 static void pcore_init(void) {
     ULONG len = 0;
     const char *e = getenv("SSBU_PCORES");
@@ -148,11 +151,18 @@ static void pcore_init(void) {
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
     }
 }
+#else
+/* Linux: no core choice yet (WP-U6: sched_setaffinity on the big cores of the Phase 0 topology); threads are left to the system */
+static void pcore_init(void) { g_pc_n = 0; }
+#endif
 /* the calling thread: performance cores only (once per thread is enough; cheap to repeat) */
 void display_perf_thread(void) {
     if (g_pc_n < 0) pcore_init();
+#ifdef _WIN32
     if (g_pc_on && g_pc_n > 0) SetThreadSelectedCpuSets(GetCurrentThread(), g_pc_ids, (ULONG)g_pc_n);
+#endif
 }
+#ifdef _WIN32      /* Linux: precise_wait_until is below pace_wait_until */
 static void precise_wait_until(LONGLONG target, HANDLE timer) {
     LARGE_INTEGER now, due;
     QueryPerformanceCounter(&now);
@@ -214,6 +224,16 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
         WakeAllConditionVariable(&g_vb_cv);
     }
 }
+#else
+/* Linux: no vblank source yet (WP-U6: present timing or the SDL display mode). The state "no vblank source" makes vsync = auto /
+ * display fall back to our own 60 Hz clock, as on a Windows PC without D3DKMT. */
+static DWORD WINAPI vblank_thread(LPVOID arg) {
+    (void)arg;
+    printf("display: no vblank source on this host yet: the refresh clock stays our own 60 Hz clock, on-screen times are not measured%c", 10);
+    InterlockedExchange(&g_vb_state, -1);
+    return 0;
+}
+#endif
 static void pace_options(void) {
     if (g_pace_want >= 0) return;
     const char *e = getenv("SSBU_PACE"), *h = getenv("SSBU_PACE_HOLD"), *p = getenv("SSBU_PACE_PHASE");
@@ -337,6 +357,7 @@ static void title_post(const char *t) {
 #define SetWindowTextA(w, t) title_post(t)
 static void window_close(void) {                     /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
     printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+    InterlockedExchange(&g_display_close, 1);      /* as WM_CLOSE: a hold of ours (the first-run shader preparation) ends at once */
     if (!oe_exit_request()) report_and_exit(0);
 }
 static void window_flags(void) {
@@ -412,6 +433,12 @@ static void pace_wait_until(LONGLONG target, LARGE_INTEGER *now) {
     }
     for (QueryPerformanceCounter(now); now->QuadPart < target; QueryPerformanceCounter(now)) YieldProcessor();
 }
+/* The upstream wait (clock ticks, the display lock, latency = low / lowest) on Linux: pace_wait_until; no timer object. */
+static void precise_wait_until(LONGLONG target, HANDLE timer) {
+    LARGE_INTEGER now;
+    (void)timer;
+    pace_wait_until(target, &now);
+}
 #endif
 
 /* Signals the guest's vsync event 60 times per second. */
@@ -427,6 +454,8 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         LONG64 n = 0;
 #ifdef _WIN32
         HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+#else
+        HANDLE timer = NULL;                              /* Linux: precise_wait_until needs no timer */
 #endif
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         int lock_tried = 0;
@@ -768,7 +797,9 @@ static void lat_release(void) {
             double d = per - (double)mx - g_lat_margin * (double)g_freq.QuadPart / 1000.0, dmax = per - 4.0 * (double)g_freq.QuadPart / 1000.0;
             if (d > dmax) d = dmax;
             if (d > (double)g_freq.QuadPart / 2000.0) {
+#ifdef _WIN32      /* Linux: precise_wait_until needs no timer */
                 if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002, TIMER_ALL_ACCESS);
+#endif
                 precise_wait_until(t + (LONG64)d, timer);
                 g_lat_d_sum += (LONG64)d; g_lat_d_n++; g_lat_last_d = (LONG64)d;
             }

@@ -208,8 +208,10 @@ static DWORD WINAPI profiler(LPVOID arg) {
 #endif
 }
 
+#ifdef _WIN32                /* prof15.c is Windows only (toolhelp, GetThreadContext, RtlLookupFunctionEntry) */
 #include "prof15.c"       /* SSBU_PROF15: sampling profiler of every busy thread (test only). Included here, like nvn_vk.c includes its parts, so that
                            * every link that has boot.c has it (build.py's source list is not changed): do NOT name prof15.c as a source of its own. */
+#endif
 
 static size_t main_stack_size_from_npdm(void) {
     const char *ov = getenv("SSBU_MAIN_STACK");
@@ -299,6 +301,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
 /* The first lines of every log: which binaries these are (link time stamps of the exe and of the DLLs beside it, the values
  * a minidump also shows) and when the process started, so that a log from another PC names its build. File names only: logs
  * get posted, and the folders name the Windows user. */
+#ifdef _WIN32
 static void print_build_identity(void) {
     char exe[MAX_PATH], name[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
@@ -320,6 +323,21 @@ static void print_build_identity(void) {
         printf("build: %-22s linked %s (stamp %08lx, image %lu bytes)\n", name + dl, when, (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)nt->OptionalHeader.SizeOfImage);
     }
 }
+#else
+/* Linux: the exe's file name, the start time and the process id (the module list with build ids is WP-U4, plat_crash). */
+static void print_build_identity(void) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return;
+    exe[n] = 0;
+    const char *slash = strrchr(exe, '/');
+    time_t now = time(NULL);
+    struct tm tm;
+    char when[32] = "?";
+    if (localtime_r(&now, &tm)) strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
+    printf("build: %s, started %s, process %ld\n", slash ? slash + 1 : exe, when, (long)getpid());
+}
+#endif
 
 /* SSBU_CRASH_TEST=<seconds>: a write to address 0 after that time, on a thread of its own: tries the whole crash path of a
  * PC (crash report, minidump) without waiting for a real crash. Test only. */
@@ -335,6 +353,7 @@ static DWORD WINAPI crash_test(LPVOID arg) {
  * taken from ..\state.json ("romfs", written by scripts/setup.py) when that folder has data.arc. A variable that is set is
  * left alone. Without this a direct start looked for ..\romfs, found no data.arc, and the game crashed reading the file it
  * could not open. (The add-on content list is found by nnmisc.c itself.) */
+#ifdef _WIN32
 static char g_state_romfs[MAX_PATH];                /* the folder ..\state.json names, if launch_defaults read one: check_romfs names it */
 static int g_state_romfs_lossy;                     /* ... and its name has characters the ANSI code page of this Windows cannot hold */
 static char *put_utf8(char *o, unsigned cp) {
@@ -455,6 +474,12 @@ static void check_romfs(void) {
     }
     romfs_fail(msg);
 }
+#else
+/* Linux: ..\state.json, the data.arc / .nrr check and the error box are WP-U5 (via hostpath.h). Until then a launch passes
+ * SSBU_ROMFS itself, as before the merge. */
+static void launch_defaults(void) { }
+static void check_romfs(void) { }
+#endif
 
 int main(int argc, char **argv) {
 #ifndef _WIN32
@@ -521,7 +546,9 @@ int main(int argc, char **argv) {
     if (!t) { fprintf(stderr, "cannot start the main guest thread\n"); return 1; }
 #endif
     if (getenv("SSBU_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
+#ifdef _WIN32
     { void prof15_start(void); prof15_start(); }         /* prof15.c: SSBU_PROF15, every busy thread (test only; nothing without the variable) */
+#endif
     DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
         for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);

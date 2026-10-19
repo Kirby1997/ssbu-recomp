@@ -727,6 +727,25 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #else
+/* Linux: where the reports of this process go (nvn_vk_wd.c: _freeze.txt, _stalls.txt): "<exe name><suffix>" next to the
+ * exe (no ".exe" to strip), or in SSBU_REPORT_DIR when that is set. */
+int diag_report_path(char *out, size_t size, const char *suffix) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+    const char *dir = getenv("SSBU_REPORT_DIR"), *base = strrchr(exe, '/');
+    int k = dir && dir[0] ? snprintf(out, size, "%s/%s%s", dir, base ? base + 1 : exe, suffix) : snprintf(out, size, "%s%s", exe, suffix);
+    return k > 0 && (size_t)k < size;
+}
+/* No minidumps on Linux: SSBU_MINIDUMP does nothing (a core dump is the equivalent: ulimit -c / coredumpctl). The freeze
+ * watchdog adds the 1 this returns for a dump written, so it never counts one. */
+int diag_minidump(void *ep, const char *why) { (void)ep; (void)why; return 0; }
+int diag_dump_helper(int argc, char **argv) {          /* boot.c: "--write-dump" (Windows: the minidump helper process) */
+    (void)argc; (void)argv;
+    fprintf(stderr, "--write-dump: there are no minidumps on Linux (use a core dump)\n");
+    return 6;
+}
 /* plat_crash.c has printed the signal (or crash_report_here's code), the fault address and the host call stack (frame
  * pointers from the signal's ucontext); the guest side of the report is the same as the Windows filter's. */
 static void crash_report(const crash_info *ci) {

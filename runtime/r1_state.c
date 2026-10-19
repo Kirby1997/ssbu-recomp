@@ -12,6 +12,32 @@
  * Check: at the end of the re-run the pages the first pass changed are compared with their first-pass end state
  * (SSBU_R1 report "verify"), next to the fighters' hash (SSBU_FIGHT_HASH) that the comparison script reads.
  * Nothing here runs without SSBU_R1. No game content in this file. */
+#ifndef _WIN32
+/* Linux / aarch64: R1 is not ported yet (Phase 8). Every caller treats "R1 off" as the normal path, so this section only gives
+ * the entry points with the prototypes the callers declare: r1_on / r1_ra_* / r1_poll return 0, the rest do nothing. The page-mark
+ * maps (runtime.h, used only in an R1_MARK build) stay empty (n = 0), so R1M marks nothing. The Windows body is in the #else. */
+#include <stdint.h>
+#include <stddef.h>
+#include "plat.h"
+#include "runtime.h"
+
+__declspec(dllexport) uint8_t *r1_m1, *r1_m2;
+__declspec(dllexport) uint64_t r1_lo1, r1_n1, r1_n2;
+
+int r1_on(void) { return 0; }
+int r1_ra_phase(void) { return 0; }
+int r1_ra_quiet(void) { return 0; }
+int r1_ra_present_mode(void) { return 0; }
+int r1_poll(int ticks) { (void)ticks; return 0; }
+void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) { (void)b; (void)lx; (void)ly; (void)rx; (void)ry; }
+void r1_init(void) { }
+void r1_stats_report(void) { }
+void r1_on_commit(void *p, size_t n) { (void)p; (void)n; }
+void r1_on_decommit(void *p, size_t n) { (void)p; (void)n; }
+void r1_wrote(uint64_t a, uint64_t n) { (void)a; (void)n; }
+void r1_nosim(uint64_t a, uint64_t n) { (void)a; (void)n; }
+void r1_register_heap(void) { }
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1682,3 +1708,4 @@ void r1_register_heap(void) {
     register_imports(defs, (int)(sizeof defs / sizeof defs[0]));
     LOG("r1: guest malloc / new served from a 32 GB reservation at %p (inside the snapshot)\n", (void *)g_ar);
 }
+#endif /* _WIN32 */
