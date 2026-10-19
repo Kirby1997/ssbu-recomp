@@ -17,6 +17,7 @@ static __attribute__((noreturn)) void needs_game(const char *what) { fprintf(std
 uint64_t hostfn_address(const char *name, ImportFn fn) { (void)name; return (uint64_t)(uintptr_t)fn; }
 const char *hostfn_current_name(void) { return "?"; }
 void import_set_address(const char *name, void *addr) { (void)name; (void)addr; }
+MainLayout g_main;                                   /* hostrt.c load_layout; cxxrt_selftest.h reads it (game DLL only). ga(): stubs.c */
 uint64_t import_address(int sym) { return IMPORT_BASE + (uint64_t)sym * IMPORT_SLOT; }
 uint64_t guest_function_of(uint64_t host_rip) { (void)host_rip; return 0; }
 /* the C++ runtime's fatal paths end here: the exit code is what the tests look at (SSBU_EH_STATE=table control) */

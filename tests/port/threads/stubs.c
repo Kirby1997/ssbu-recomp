@@ -12,6 +12,7 @@ void guest_trap(const char *what, uint64_t addr) { fprintf(stderr, "guest_trap: 
 void hitch_cur_ctx(Ctx *c) { (void)c; }
 long long nvn_front_frame_next(void) { return 0; }
 void trace_printf(const char *fmt, ...) { (void)fmt; }
+uint64_t ga(uint64_t a) { return a; }                /* hostrt.c GA(): 13.0.4 is the reference build, so the identity */
 static struct { const ImportDef *defs; int count; } g_tables[4096];
 static int g_ntables;
 static pthread_mutex_t g_tables_mu = PTHREAD_MUTEX_INITIALIZER;

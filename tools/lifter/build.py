@@ -27,7 +27,9 @@ HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nv
 if plat.LINUX:
     # Host sources that exist only for Windows (Media Foundation movies) are left out; sources added for Linux are listed in
     # LINUX_HOST_ADD. RECOMP_HOST_SKIP / RECOMP_HOST_ADD (comma lists) override both without editing this file.
-    LINUX_HOST_SKIP = ['nnmovie_mf.c']
+    # loose_host.c (the loose-file layer, opt-in SSBU_LOOSE_FILES): Win32 file API, not ported yet; nothing calls into it, so
+    # leaving it out is a game without the layer.
+    LINUX_HOST_SKIP = ['nnmovie_mf.c', 'loose_host.c']
     # plat_posix.c / vmem.c / fiber_aarch64.S / plat_crash.c: the Win32 subset of plat.h, the guest address space, the fiber switch, the crash handler, low-heap malloc policy (must stay in the exe: .preinit_array).
     # hostpath.c: the Win32 file calls of nnfs.c / nnfsdir.c over POSIX, case-insensitive paths, host_exe_dir (also used by nvn_vk_posix.h).
     LINUX_HOST_ADD = ['plat_posix.c', 'vmem.c', 'fiber_aarch64.S', 'plat_crash.c', 'plat_heap.c', 'hostpath.c']

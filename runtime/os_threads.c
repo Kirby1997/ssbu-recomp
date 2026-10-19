@@ -281,6 +281,7 @@ static __declspec(thread) void *t_thread_fiber;       /* host fiber of the threa
  * stack continued on the wrong thread until its thread function returned there - a TaskWorker "finished" and the game
  * waited for it forever (Linux build, frozen after 15 minutes of play, 2026-10-14). These accessors are not inlined
  * and the empty asm keeps the compiler from treating them as pure, so every use reads the running thread's own copy. */
+#ifdef _WIN32      /* Linux: the fiber block below reads these through PLAT_TLS_ACCESSORS (fiber.h), the same fix */
 static __attribute__((noinline)) uint64_t fiber_cur(void) { __asm__ volatile("" ::: "memory"); return t_fiber; }
 static __attribute__((noinline)) void fiber_set_cur(uint64_t f) { __asm__ volatile("" ::: "memory"); t_fiber = f; }
 static __attribute__((noinline)) void *thread_fiber(void) {
@@ -288,6 +289,7 @@ static __attribute__((noinline)) void *thread_fiber(void) {
     if (!t_thread_fiber) t_thread_fiber = ConvertThreadToFiber(NULL);
     return t_thread_fiber;
 }
+#endif
 static uint8_t g_main_thread[0x400];
 uint64_t os_main_thread_type(void) { return (uint64_t)(uintptr_t)g_main_thread; }   /* boot.c: stored at thread block +0x1f8, as [sdk 0x3349dc] does */
 uint64_t g_main_stack_base, g_main_stack_size;        /* set by boot.c */

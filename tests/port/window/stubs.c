@@ -42,6 +42,7 @@ void debug_mode_frame(long long frame) { (void)frame; }
 volatile LONG g_exit_requests, g_report_exit;
 int oe_exit_request(void) { InterlockedIncrement(&g_exit_requests); return 0; }      /* 0: "end now" -> report_and_exit(0) */
 void report_and_exit(int code) { printf("test: report_and_exit(%d) called by the close path\n", code); fflush(stdout); InterlockedExchange(&g_report_exit, 1); }
+uint64_t ga(uint64_t a) { return a; }                /* hostrt.c GA(): 13.0.4 is the reference build, so the identity */
 
 const ImportDef *g_vi_defs;
 int g_vi_count;

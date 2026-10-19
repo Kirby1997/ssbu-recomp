@@ -62,6 +62,7 @@ volatile LONG g_guest_frozen;
 void guest_freeze_wait(void) {}
 int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h) { (void)i; (void)c; (void)name; (void)h; return 0; }
 void trace_printf(const char *fmt, ...) { (void)fmt; }
+uint64_t ga(uint64_t a) { return a; }                /* hostrt.c GA(): 13.0.4 is the reference build, so the identity */
 static ImportDef g_imp[64]; static int g_imp_n;
 void register_imports(const ImportDef *defs, int count) {
     for (int k = 0; k < count; k++) {
