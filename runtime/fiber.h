@@ -45,19 +45,27 @@ struct plat_fiber {
     size_t stack_map_size;
     int is_thread;                     /* made by plat_fiber_convert_thread */
     void *tsan;                        /* ThreadSanitizer fiber, when built with -fsanitize=thread */
+    struct plat_fls *fls;              /* fiber-local storage values (plat_posix.c), NULL until the first FlsSetValue */
 };
 
 /* A fiber that will run fn(arg) on a stack of stack_size bytes (rounded up to pages, min 64 KiB) plus a 64 KiB
  * PROT_NONE guard below it. fn must never return (it switches away instead); returning is fatal. NULL on failure. */
 plat_fiber *plat_fiber_create(size_t stack_size, plat_fiber_fn fn, void *arg);
-/* A fiber object for the calling thread itself (no stack of its own): the target of the first save. */
+/* A fiber object for the calling thread itself (no stack of its own): the target of the first save. It starts without
+ * FLS values; ConvertThreadToFiber (plat.h) is the one that hands the thread's values over and makes it current. */
 plat_fiber *plat_fiber_convert_thread(void *arg);
 /* Saves the running context in `from`, resumes `to`. Returns when something switches back to `from` (possibly on
- * another thread). `to` must not be running anywhere. */
+ * another thread). `to` must not be running anywhere. It does not change the current fiber (GetCurrentFiber and so
+ * FLS): a caller that wants those right calls plat_fiber_set_current(to) first, on the switching thread; whoever later
+ * switches back to `from` sets it for its own thread the same way. */
 void plat_fiber_switch(plat_fiber *from, plat_fiber *to);
-/* Frees the stack and the object; f must not be running. */
+/* The fiber GetCurrentFiber / FlsGetValue / FlsSetValue see on the calling thread (NULL: the thread itself). */
+void plat_fiber_set_current(plat_fiber *f);
+/* Runs f's FLS callbacks, frees the stack and the object; f must not be running. */
 void plat_fiber_delete(plat_fiber *f);
 static inline void *plat_fiber_arg(const plat_fiber *f) { return f->arg; }
+/* Live FLS value sets (one per fiber or thread that has set a value and not ended): for tests and leak checks. */
+size_t plat_fls_sets(void);
 
 /* The raw assembly switch (no sanitizer bookkeeping) and the entry trampoline. */
 void plat_fiber_switch_raw(plat_fiber *from, plat_fiber *to);

@@ -921,8 +921,12 @@ int g_r1_keep_fibers;                                  /* R1 (r1_state.c, SSBU_R
 static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber && !g_r1_keep_fibers) { DeleteFiber(o->fiber); o->fiber = NULL; } }
 #else
 /* Linux: plat_fiber (fiber.h) directly. Each host thread gets its own fiber object on its first switch (the per-thread
- * "converted" slot t_thread_fiber; plat's ConvertThreadToFiber / SwitchToFiber bookkeeping is not used), the running
- * fiber is known from t_fiber, so every switch names both sides. A fiber suspended on thread A may be resumed by B:
+ * "converted" slot t_thread_fiber, made by ConvertThreadToFiber: the thread's FLS values move to it, and plat frees it
+ * when the thread ends), the running fiber is known from t_fiber, so every switch names both sides. Each switch also
+ * makes the target plat's current fiber (plat_fiber_set_current), so GetCurrentFiber and fiber-local storage
+ * (nncxxrt.c's exception state, fighter_host.c's FsFiber) follow the guest fiber as on Windows, also when another
+ * thread resumes it; FinalizeFiber runs the fiber's FLS callbacks (plat_fiber_delete). A fiber suspended on thread A
+ * may be resumed by B:
  * after a switch (and after call_guest, which can switch) TLS is reached only through the accessors, and the thread
  * block the guest sees (tpidr) is the one of the thread that resumed it (o->tp, set by the switcher). Guest mutexes
  * held across a switch are CRITICAL_SECTIONs, which may be left on another thread than the one that entered them
@@ -940,7 +944,7 @@ static void fiber_main(void *arg) {
         if (next) obj(next)->tp = c->tpidr;
         t_fiber_set(next);
         plat_fiber *to = next ? obj(next)->fiber : t_thread_fiber_get();   /* null: back to the thread running us now */
-        if (to != o->fiber) plat_fiber_switch(o->fiber, to);
+        if (to != o->fiber) { plat_fiber_set_current(to); plat_fiber_switch(o->fiber, to); }
     }
 }
 static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, stack, stackSize, flags) */
@@ -952,12 +956,17 @@ static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, s
 }
 static void fib_switch(Ctx *c) {
     plat_fiber *base = t_thread_fiber_get();
-    if (!base) { base = plat_fiber_convert_thread(NULL); t_thread_fiber_set(base); }
+    if (!base) {
+        base = ConvertThreadToFiber(NULL);
+        if (!base) base = GetCurrentFiber();          /* already a fiber (made by other host code): that one is the thread's own */
+        if (!base) guest_trap("nn::os::SwitchToFiber: cannot make the host thread a fiber", c->x[30] - 4);
+        t_thread_fiber_set(base);
+    }
     uint64_t next = A0, self = t_fiber_get();
     plat_fiber *from = self ? obj(self)->fiber : base, *to = next ? obj(next)->fiber : base;
     if (next) obj(next)->tp = c->tpidr;               /* the thread block (errno, ...) belongs to the host thread, not to the fiber */
     t_fiber_set(next);
-    if (to != from) plat_fiber_switch(from, to);
+    if (to != from) { plat_fiber_set_current(to); plat_fiber_switch(from, to); }
     if (self) c->tpidr = obj(self)->tp;               /* resumed, possibly by another thread */
     hitch_cur_ctx(c);
 }

@@ -1,4 +1,4 @@
-/* win32_posix.h - the few Win32 file / FLS calls of fighter_host.c, hook_host.c and newmodule_host.c, for a POSIX host.
+/* win32_posix.h - the few Win32 file calls of fighter_host.c, hook_host.c and newmodule_host.c, for a POSIX host.
  * #included by nnro.c (Linux only) right before those files; plat.h does not have these names (yet: "wanted in plat.h").
  *
  * Paths: those sources build Windows paths ("fighters_bin\\mario.dll", "%s\\*.dll"). Every call here takes such a path:
@@ -6,9 +6,8 @@
  * LoadLibraryA) a trailing ".dll" becomes ".so" - the fighter / mod libraries are <name>.so on Linux, like the modules
  * (build_nro.py: name + buildplat.SHARED_SUFFIX). fopen only gets the separator change.
  *
- * FLS: per fiber (GetCurrentFiber), or per thread for a thread that is not a fiber, in one small table under a mutex.
- * DIFF: no destructor callback (fighter_host.c passes NULL), and a fiber deleted and re-created at the same address
- * sees the old value (Win32: NULL). */
+ * FLS (FlsAlloc / FlsGetValue / FlsSetValue, fighter_host.c's per-fiber FsFiber) is plat.h's: per guest fiber, also when
+ * another thread resumes it (os_threads.c makes each guest fiber plat's current fiber). */
 #ifndef SSBU_FIGHTER_WIN32_POSIX_H
 #define SSBU_FIGHTER_WIN32_POSIX_H
 #include <dirent.h>
@@ -25,9 +24,6 @@
 #endif
 #ifndef INVALID_FILE_ATTRIBUTES
 #define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
-#endif
-#ifndef FLS_OUT_OF_INDEXES
-#define FLS_OUT_OF_INDEXES ((DWORD)0xffffffffu)
 #endif
 
 /* "a\\b.dll" -> "a/b.so" (lib = 1) or "a/b.dll" (lib = 0) */
@@ -109,42 +105,4 @@ static HMODULE fsx_LoadLibraryA(const char *path) { char p[MAX_PATH]; return Loa
 #define fopen fsx_fopen
 #define LoadLibraryA fsx_LoadLibraryA
 
-/* FLS: (index, fiber or thread) -> value */
-typedef struct { DWORD index; const void *owner; void *value; } FsxFls;
-static FsxFls *g_fsx_fls; static size_t g_fsx_fls_n, g_fsx_fls_cap;
-static pthread_mutex_t g_fsx_fls_mu = PTHREAD_MUTEX_INITIALIZER;
-static DWORD g_fsx_fls_next;
-static _Thread_local char t_fsx_thread_key;
-static PLAT_TLS_NOINLINE const void *fsx_owner(void) {         /* noinline: a fiber may move to another thread between calls */
-    const void *f = GetCurrentFiber();
-    __asm__ __volatile__("" ::: "memory");
-    return f ? f : (const void *)&t_fsx_thread_key;
-}
-static DWORD FlsAlloc(void *callback) { (void)callback; return __atomic_fetch_add(&g_fsx_fls_next, 1, __ATOMIC_SEQ_CST); }
-static void *FlsGetValue(DWORD index) {
-    const void *o = fsx_owner();
-    void *v = NULL;
-    pthread_mutex_lock(&g_fsx_fls_mu);
-    for (size_t i = 0; i < g_fsx_fls_n; i++) if (g_fsx_fls[i].owner == o && g_fsx_fls[i].index == index) { v = g_fsx_fls[i].value; break; }
-    pthread_mutex_unlock(&g_fsx_fls_mu);
-    return v;
-}
-static BOOL FlsSetValue(DWORD index, void *value) {
-    const void *o = fsx_owner();
-    BOOL ok = TRUE;
-    pthread_mutex_lock(&g_fsx_fls_mu);
-    size_t i = 0;
-    while (i < g_fsx_fls_n && !(g_fsx_fls[i].owner == o && g_fsx_fls[i].index == index)) i++;
-    if (i == g_fsx_fls_n) {
-        if (g_fsx_fls_n == g_fsx_fls_cap) {
-            size_t cap = g_fsx_fls_cap ? g_fsx_fls_cap * 2 : 64;
-            FsxFls *t = realloc(g_fsx_fls, cap * sizeof *t);
-            if (!t) ok = FALSE; else { g_fsx_fls = t; g_fsx_fls_cap = cap; }
-        }
-        if (ok) { g_fsx_fls[i].owner = o; g_fsx_fls[i].index = index; g_fsx_fls_n++; }
-    }
-    if (ok) g_fsx_fls[i].value = value;
-    pthread_mutex_unlock(&g_fsx_fls_mu);
-    return ok;
-}
 #endif /* SSBU_FIGHTER_WIN32_POSIX_H */

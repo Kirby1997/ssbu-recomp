@@ -1,3 +1,7 @@
 # Known, benign: nn::os::SetThreadName on a running thread replaces Obj.name (release store, the old copy is never
 # freed) while the thread or a diagnostic reads it with a plain load (address dependency orders the bytes on ARM).
 race:os_SetThreadName
+# Known, by design of the test: cxxrt_selftest.h's st_guard reads the guard byte with a plain load (it stands for the
+# compiler's inline fast path, an LDARB in the game) while __cxa_guard_release sets it after a full MemoryBarrier();
+# TSan does not model the fence with plain accesses.
+race:st_guard_thread

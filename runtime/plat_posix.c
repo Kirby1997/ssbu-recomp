@@ -307,6 +307,7 @@ typedef struct hobj {
 static pthread_mutex_t g_hmu = PTHREAD_MUTEX_INITIALIZER;   /* all waitable state */
 static hobj *g_named;                                        /* named mutexes (under g_hmu) */
 static _Thread_local hobj *t_self;
+static void fls_thread_end(void);
 static pthread_key_t g_self_key;
 static pthread_once_t g_self_once = PTHREAD_ONCE_INIT;
 
@@ -407,6 +408,7 @@ static NOINL void *thread_start(void *p) {
     futex_wake(&h->started, INT_MAX);
     while (!__atomic_load_n(&h->gate, __ATOMIC_ACQUIRE)) futex_wait(&h->gate, 0, NULL);   /* CREATE_SUSPENDED */
     DWORD code = h->fn(h->arg);
+    fls_thread_end();                            /* FLS callbacks before the handle is signalled, as Win32 */
     t_self = NULL;
     thread_finish(h, code);
     return NULL;
@@ -800,11 +802,148 @@ DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     return wait_objects(n, o, all, ms);
 }
 
+/* ------------------------------------------------------------------------------------------------ fiber-local storage
+ * One value set (struct plat_fls) per fiber (plat_fiber.fls) and per thread (t_fls_own, used while no fiber is current),
+ * made at the first non-NULL FlsSetValue. The set the calling thread sees is the current fiber's: t_fiber_cur, which
+ * SwitchToFiber / ConvertThreadToFiber / plat_fiber_set_current maintain, so the values travel with the fiber object
+ * when another thread resumes it. Only the running fiber's own thread reads or writes its values (no lock): the slots
+ * are atomics only because FlsFree and the end of a set (under g_fls_mu) take values out of them. Every set is also on
+ * g_fls_all (under g_fls_mu) for FlsFree. A thread that may own a set (or a converted fiber) at its end arms a pthread
+ * key whose destructor frees them (plat's own CreateThread threads do it before the handle is signalled). Callbacks
+ * run with no lock held. */
+static _Thread_local plat_fiber *t_fiber_cur;          /* GetCurrentFiber */
+PLAT_TLS_ACCESSORS(plat_fiber *, t_fiber_cur)
+struct plat_fls {
+    struct plat_fls *prev, *next;                      /* g_fls_all */
+    void *v[FLS_MAXIMUM_AVAILABLE];
+};
+static pthread_mutex_t g_fls_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct plat_fls g_fls_all = {&g_fls_all, &g_fls_all, {0}};   /* list head (under g_fls_mu) */
+static size_t g_fls_n;                                 /* sets on the list (atomic reads: plat_fls_sets) */
+static uint8_t g_fls_state[FLS_MAXIMUM_AVAILABLE];     /* 0 free, 1 allocated, 2 FlsFree running (written under g_fls_mu) */
+static PFLS_CALLBACK_FUNCTION g_fls_cb[FLS_MAXIMUM_AVAILABLE];   /* under g_fls_mu */
+static _Thread_local struct plat_fls *t_fls_own;      /* the thread's own values */
+static _Thread_local int t_fls_armed;                  /* the key below is set for this thread */
+static pthread_key_t g_fls_key;
+static pthread_once_t g_fls_once = PTHREAD_ONCE_INIT;
+
+static void fls_key_dtor(void *p) { (void)p; t_fls_armed = 0; fls_thread_end(); }
+static void fls_key_init(void) { if (pthread_key_create(&g_fls_key, fls_key_dtor)) plat_fatal("FLS: pthread_key_create failed"); }
+static NOINL void fls_arm(void) {                     /* the end of this thread frees the sets it has then */
+    if (t_fls_armed) return;
+    pthread_once(&g_fls_once, fls_key_init);
+    t_fls_armed = 1;
+    pthread_setspecific(g_fls_key, (void *)1);
+}
+/* Where the calling thread's current set lives: the current fiber's field, else the thread's own. No switch can come
+ * between this and the use of the result (the callers do not switch). */
+static NOINL struct plat_fls **fls_cur(void) {
+    plat_fiber *f = t_fiber_cur;
+    return f ? &f->fls : &t_fls_own;
+}
+/* Takes s off the list, calls the callbacks of its non-NULL values (after unlocking), frees it. */
+static void fls_set_free(struct plat_fls *s) {
+    if (!s) return;
+    PFLS_CALLBACK_FUNCTION cb[FLS_MAXIMUM_AVAILABLE];
+    void *val[FLS_MAXIMUM_AVAILABLE];
+    int n = 0;
+    pthread_mutex_lock(&g_fls_mu);
+    s->prev->next = s->next;
+    s->next->prev = s->prev;
+    __atomic_store_n(&g_fls_n, g_fls_n - 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < FLS_MAXIMUM_AVAILABLE; i++) {
+        void *v = __atomic_exchange_n(&s->v[i], NULL, __ATOMIC_RELAXED);
+        if (v && g_fls_state[i] && g_fls_cb[i]) { cb[n] = g_fls_cb[i]; val[n] = v; n++; }
+    }
+    pthread_mutex_unlock(&g_fls_mu);
+    free(s);
+    for (int k = 0; k < n; k++) cb[k](val[k]);
+}
+/* The end of a thread: a fiber made from this thread by ConvertThreadToFiber that is still current goes (its object
+ * and values; os_threads.c's per-thread fiber is one), then the current fiber's values and the thread's own. A callback
+ * that sets a value again makes a new set: it is freed in the next round (4 rounds, then it is left, as pthread keys). */
+static NOINL void fls_thread_end(void) {
+    plat_fiber *conv = t_fiber_cur;
+    if (conv && conv->is_thread) { t_fiber_cur = NULL; plat_fiber_delete(conv); }
+    for (int round = 0; round < 4; round++) {
+        plat_fiber *f = t_fiber_cur;
+        struct plat_fls *a = f ? f->fls : NULL, *b = t_fls_own;
+        if (f) f->fls = NULL;
+        t_fls_own = NULL;
+        if (!a && !b) return;
+        fls_set_free(a);
+        fls_set_free(b);
+    }
+}
+/* Index 0 is never handed out: a zeroed DWORD is not a valid index. */
+DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION callback) {
+    pthread_mutex_lock(&g_fls_mu);
+    for (DWORD i = 1; i < FLS_MAXIMUM_AVAILABLE; i++) {
+        if (g_fls_state[i]) continue;
+        g_fls_cb[i] = callback;
+        __atomic_store_n(&g_fls_state[i], 1, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_fls_mu);
+        return i;
+    }
+    pthread_mutex_unlock(&g_fls_mu);
+    SetLastError(ERROR_NO_MORE_ITEMS);
+    return FLS_OUT_OF_INDEXES;
+}
+/* Every set's value in the slot is taken out and given to the callback (lock released around each call, then the scan
+ * starts over: sets may have gone meanwhile). The index is handed out again only after that. */
+BOOL FlsFree(DWORD i) {
+    pthread_mutex_lock(&g_fls_mu);
+    if (i >= FLS_MAXIMUM_AVAILABLE || g_fls_state[i] != 1) { pthread_mutex_unlock(&g_fls_mu); SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    PFLS_CALLBACK_FUNCTION cb = g_fls_cb[i];
+    __atomic_store_n(&g_fls_state[i], 2, __ATOMIC_RELAXED);   /* Get / Set fail from here on */
+    for (;;) {
+        void *v = NULL;
+        for (struct plat_fls *s = g_fls_all.next; s != &g_fls_all && !v; s = s->next) v = __atomic_exchange_n(&s->v[i], NULL, __ATOMIC_RELAXED);
+        if (!v) break;
+        if (!cb) continue;
+        pthread_mutex_unlock(&g_fls_mu);
+        cb(v);
+        pthread_mutex_lock(&g_fls_mu);
+    }
+    g_fls_cb[i] = NULL;
+    __atomic_store_n(&g_fls_state[i], 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_fls_mu);
+    return TRUE;
+}
+NOINL PVOID FlsGetValue(DWORD i) {
+    if (i >= FLS_MAXIMUM_AVAILABLE || __atomic_load_n(&g_fls_state[i], __ATOMIC_RELAXED) != 1) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    struct plat_fls *s = *fls_cur();
+    return s ? __atomic_load_n(&s->v[i], __ATOMIC_RELAXED) : NULL;
+}
+NOINL BOOL FlsSetValue(DWORD i, PVOID value) {
+    if (i >= FLS_MAXIMUM_AVAILABLE || __atomic_load_n(&g_fls_state[i], __ATOMIC_RELAXED) != 1) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    struct plat_fls **ref = fls_cur(), *s = *ref;
+    if (!s) {
+        if (!value) return TRUE;
+        s = calloc(1, sizeof *s);
+        if (!s) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+        pthread_mutex_lock(&g_fls_mu);
+        s->prev = &g_fls_all;
+        s->next = g_fls_all.next;
+        g_fls_all.next->prev = s;
+        g_fls_all.next = s;
+        __atomic_store_n(&g_fls_n, g_fls_n + 1, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&g_fls_mu);
+        *ref = s;
+        fls_arm();
+    }
+    __atomic_store_n(&s->v[i], value, __ATOMIC_RELAXED);
+    return TRUE;
+}
+size_t plat_fls_sets(void) { return __atomic_load_n(&g_fls_n, __ATOMIC_RELAXED); }
+/* A fiber that brings values to a thread that has not armed its key yet arms it: that thread may end while running it. */
+NOINL void plat_fiber_set_current(plat_fiber *f) {
+    t_fiber_cur = f;
+    if (f && f->fls && !t_fls_armed) fls_arm();
+}
+
 /* ------------------------------------------------------------------------------------------------ fibers */
 #if defined(__aarch64__)
-static _Thread_local plat_fiber *t_fiber_cur;
-PLAT_TLS_ACCESSORS(plat_fiber *, t_fiber_cur)
-
 static uint64_t read_fpcr(void) { uint64_t v; __asm__ __volatile__("mrs %0, fpcr" : "=r"(v)); return v; }
 #define FIBER_GUARD 0x10000u
 plat_fiber *plat_fiber_create(size_t stack_size, plat_fiber_fn fn, void *arg) {
@@ -849,6 +988,9 @@ NOINL void plat_fiber_switch(plat_fiber *from, plat_fiber *to) {
 }
 void plat_fiber_delete(plat_fiber *f) {
     if (!f) return;
+    struct plat_fls *v = f->fls;
+    f->fls = NULL;
+    fls_set_free(v);                             /* DeleteFiber runs the fiber's FLS callbacks */
     if (f->stack_map) munmap(f->stack_map, f->stack_map_size);
 #ifdef PLAT_TSAN
     if (!f->is_thread && f->tsan) __tsan_destroy_fiber(f->tsan);
@@ -862,13 +1004,17 @@ LPVOID ConvertThreadToFiber(LPVOID arg) {
     if (t_fiber_cur_get()) { SetLastError(ERROR_ALREADY_FIBER); return NULL; }
     plat_fiber *f = plat_fiber_convert_thread(arg);
     if (!f) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    t_fiber_cur_set(f);
+    f->fls = t_fls_own;                          /* the thread's FLS values become the fiber's (Win32) */
+    t_fls_own = NULL;
+    plat_fiber_set_current(f);
+    fls_arm();                                   /* the end of the thread frees f if it is still current then */
     return f;
 }
 BOOL ConvertFiberToThread(void) {
     plat_fiber *f = t_fiber_cur_get();
     if (!f) { SetLastError(ERROR_ALREADY_THREAD); return FALSE; }
-    t_fiber_cur_set(NULL);
+    plat_fiber_set_current(NULL);
+    if (!t_fls_own) { t_fls_own = f->fls; f->fls = NULL; }   /* the fiber's FLS values stay with the thread */
     if (f->is_thread) plat_fiber_delete(f);      /* a created fiber's object stays (we are on its stack) */
     return TRUE;
 }
@@ -884,7 +1030,7 @@ NOINL void SwitchToFiber(LPVOID to) {
     plat_fiber *cur = t_fiber_cur_get();
     if (!cur) plat_fatal("SwitchToFiber(%p) from a thread that is not a fiber (ConvertThreadToFiber first)", to);
     if (cur == (plat_fiber *)to) return;
-    t_fiber_cur_set(to);                         /* the thread that later resumes `cur` sets it back for itself */
+    plat_fiber_set_current(to);                  /* the thread that later resumes `cur` sets it back for itself */
     plat_fiber_switch(cur, to);
     /* possibly another thread now: no TLS access here */
 }

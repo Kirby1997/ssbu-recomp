@@ -1,0 +1,7 @@
+# Known leaks outside WP-U3's scope (same on Windows): os_threads.c gives every guest thread and every guest fiber that
+# runs a Ctx (new_ctx) that is never freed.
+leak:new_ctx
+# cxxrt_selftest.h (run by test_cxxrt as in the game): each section's Ctx (st_ctx, inlined into the sections at -O2, so
+# matched by file) and the guard threads' Ctx are never freed, and st_guard does not close its thread handles. Self-test
+# code, not the runtime; test_cxxrt's own EH-per-fiber and soak sections stay checked.
+leak:cxxrt_selftest.h

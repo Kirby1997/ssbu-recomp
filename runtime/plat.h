@@ -165,6 +165,7 @@ typedef struct _MEMORY_BASIC_INFORMATION {
 #define ERROR_MOD_NOT_FOUND 126
 #define ERROR_PROC_NOT_FOUND 127
 #define ERROR_ALREADY_EXISTS 183
+#define ERROR_NO_MORE_ITEMS 259
 #define ERROR_NOT_OWNER 288
 #define ERROR_TOO_MANY_POSTS 298
 #define ERROR_INVALID_ADDRESS 487
@@ -435,6 +436,28 @@ void DeleteFiber(LPVOID fiber);                       /* DIFF: deleting the runn
 PVOID GetCurrentFiber(void);
 PVOID GetFiberData(void);
 BOOL IsThreadAFiber(void);
+
+/* ---------------------------------------------------------------------------------------------- fiber-local storage
+ * Win32 FLS. Each fiber has its own values, and so has each thread for the code it runs while no fiber is current on
+ * it. The values belong to the fiber object, so a fiber resumed by another thread brings them along. "Current" is what
+ * GetCurrentFiber returns: SwitchToFiber / ConvertThreadToFiber maintain it, and code that switches with
+ * plat_fiber_switch directly sets it with plat_fiber_set_current (fiber.h; os_threads.c's guest fibers do).
+ * ConvertThreadToFiber hands the thread's values to the new fiber; ConvertFiberToThread hands them back (and frees that
+ * fiber object); the end of a thread frees a converted fiber that is still current then, as Win32 does.
+ * Callbacks (only for non-NULL values, on the thread that causes them, never with an FLS lock held):
+ *   - DeleteFiber / plat_fiber_delete: every value of that fiber;
+ *   - the end of a thread: the values current then (the running fiber's), and the thread's own values; a callback that
+ *     sets a value again is called again, up to 4 rounds (as pthread keys);
+ *   - FlsFree: that slot's value in every fiber and thread.
+ * Get / Set take no lock (the values of the running fiber are its own). DIFF: 128 slots (FLS_MAXIMUM_AVAILABLE of the
+ * older SDKs; Windows 10 has 4080); a callback cannot read the other values of the fiber or thread being freed. */
+#define FLS_OUT_OF_INDEXES ((DWORD)0xFFFFFFFF)
+#define FLS_MAXIMUM_AVAILABLE 128
+typedef VOID (WINAPI *PFLS_CALLBACK_FUNCTION)(PVOID value);
+DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION callback);     /* FLS_OUT_OF_INDEXES + ERROR_NO_MORE_ITEMS when all are taken */
+BOOL FlsFree(DWORD index);
+PVOID FlsGetValue(DWORD index);                       /* NULL + ERROR_INVALID_PARAMETER for an index not allocated */
+BOOL FlsSetValue(DWORD index, PVOID value);
 
 /* ---------------------------------------------------------------------------------------------- virtual memory
  * Implemented in vmem.c over the guest window reserved by vmem_init() and a region table: see vmem.h. */
