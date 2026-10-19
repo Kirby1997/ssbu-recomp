@@ -275,6 +275,19 @@ static volatile LONG g_tls_used[64];
 static void tls_run_destructors(Ctx *c);
 static __declspec(thread) uint64_t t_fiber;           /* guest FiberType* currently running, 0 if none */
 static __declspec(thread) void *t_thread_fiber;       /* host fiber of the thread itself */
+/* A fiber can be resumed by another host thread than the one it left. The compiler computes the address of a thread
+ * variable once per function and keeps it across calls, so after a SwitchToFiber or a guest call (which can switch)
+ * the old thread's variables would be read and written: fiber_main then switched to the OLD thread's own fiber, whose
+ * stack continued on the wrong thread until its thread function returned there - a TaskWorker "finished" and the game
+ * waited for it forever (Linux build, frozen after 15 minutes of play, 2026-10-14). These accessors are not inlined
+ * and the empty asm keeps the compiler from treating them as pure, so every use reads the running thread's own copy. */
+static __attribute__((noinline)) uint64_t fiber_cur(void) { __asm__ volatile("" ::: "memory"); return t_fiber; }
+static __attribute__((noinline)) void fiber_set_cur(uint64_t f) { __asm__ volatile("" ::: "memory"); t_fiber = f; }
+static __attribute__((noinline)) void *thread_fiber(void) {
+    __asm__ volatile("" ::: "memory");
+    if (!t_thread_fiber) t_thread_fiber = ConvertThreadToFiber(NULL);
+    return t_thread_fiber;
+}
 static uint8_t g_main_thread[0x400];
 uint64_t os_main_thread_type(void) { return (uint64_t)(uintptr_t)g_main_thread; }   /* boot.c: stored at thread block +0x1f8, as [sdk 0x3349dc] does */
 uint64_t g_main_stack_base, g_main_stack_size;        /* set by boot.c */
@@ -586,7 +599,7 @@ static void os_YieldThread(Ctx *c) { (void)c; SwitchToThread(); }
 static void movie_preroll_diag(Ctx *c) {
     static int on = -1, n;
     if (on < 0) on = getenv("SSBU_MOVIE_LOG") != NULL;
-    if (!on || c->import_from != 0x71036f2814ULL || (n++ % 25)) return;
+    if (!on || c->import_from != GA(0x71036f2814ULL) || (n++ % 25)) return;
     uint64_t p = c->x[21], vr = rd64(p + 0x58) ? rd64(rd64(p + 0x58)) : 0, ar = rd64(p + 0x68) ? rd64(rd64(p + 0x68)) : 0;
     printf("movie: pre-roll sleep %d (loop count %u of %u): video frames queued %lld", n, (unsigned)c->x[24], (unsigned)c->x[25], vr ? (long long)rd64(vr + 0xb0) : -1LL);
     if (ar) printf("; audio: filled %lld, accumulate %u, pool %d buffers of %d bytes (flush at %d), free %lld, pending outputs %lld, +0x40 %d", (long long)rd64(ar + 0x110), rd8(ar + 0x50), (int)rd32(ar + 0x44), (int)rd32(ar + 0x48), (int)rd32(ar + 0x4c),
@@ -876,9 +889,9 @@ static void CALLBACK fiber_main(void *arg) {
         call_guest(c, o->fn);                         /* returns the fiber to switch to next, or null */
         uint64_t next = c->x[0];
         if (next) obj(next)->tp = c->tpidr;
-        t_fiber = next;
+        fiber_set_cur(next);
         if (g_r1_keep_fibers) { o->run_tid = 0; if (g_r1_fls_idx != 0xFFFFFFFF) o->fls = FlsGetValue(g_r1_fls_idx); if (next) obj(next)->run_tid = GetCurrentThreadId(); }
-        SwitchToFiber(next ? obj(next)->fiber : t_thread_fiber);
+        SwitchToFiber(next ? obj(next)->fiber : thread_fiber());
     }
 }
 static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, stack, stackSize, flags) */
@@ -888,12 +901,17 @@ static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, s
     RET(0);
 }
 static void fib_switch(Ctx *c) {
-    if (!t_thread_fiber) t_thread_fiber = ConvertThreadToFiber(NULL);
-    uint64_t next = A0, self = t_fiber;
+    void *own = thread_fiber();
+    uint64_t next = A0, self = fiber_cur();
+    DWORD tid = GetCurrentThreadId();
     if (next) obj(next)->tp = c->tpidr;               /* the thread block (errno, ...) belongs to the host thread, not to the fiber */
-    t_fiber = next;
+    fiber_set_cur(next);
     if (g_r1_keep_fibers) { if (self) { obj(self)->run_tid = 0; if (g_r1_fls_idx != 0xFFFFFFFF) obj(self)->fls = FlsGetValue(g_r1_fls_idx); } if (next) obj(next)->run_tid = GetCurrentThreadId(); }
-    SwitchToFiber(next ? obj(next)->fiber : t_thread_fiber);
+    SwitchToFiber(next ? obj(next)->fiber : own);
+    if (!self && GetCurrentThreadId() != tid) {        /* a thread's own context must come back on its own thread (see fiber_cur) */
+        static volatile LONG said;
+        if (!InterlockedExchange(&said, 1)) { printf("nn::os: BUG: a thread's own context resumed on another host thread (%lu, left on %lu)\n", (unsigned long)GetCurrentThreadId(), (unsigned long)tid); fflush(stdout); }
+    }
     if (self) c->tpidr = obj(self)->tp;               /* resumed, possibly by another thread */
     hitch_cur_ctx(c);
 }
@@ -915,7 +933,7 @@ void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh) {
     if (fresh) { o->fiber = CreateFiberEx(1 << 20, (SIZE_T)256 << 20, 0, fiber_main, o); o->fctx = NULL; }
     else { o->fiber = fiber; o->fctx = fctx; }
 }
-static void fib_current(Ctx *c) { RET(t_fiber); }
+static void fib_current(Ctx *c) { RET(fiber_cur()); }
 int g_r1_keep_fibers;                                  /* R1 (r1_state.c, SSBU_R1 only): a finalized fiber's host fiber is kept, so a
                                                         * restore that brings the guest fiber back finds it (resumed, it starts over) */
 static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber && !g_r1_keep_fibers) { DeleteFiber(o->fiber); o->fiber = NULL; } }

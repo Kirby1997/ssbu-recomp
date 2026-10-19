@@ -35,6 +35,8 @@ static const char *const k_default_ini =
 ";   windowed:   a normal window with the client size below.\r\n"
 ";   borderless: no frame, covers the monitor the window is on (the desktop keeps its resolution).\r\n"
 ";   fullscreen: as borderless, and always on top. (Exclusive fullscreen with a mode change is not implemented.)\r\n"
+";   F11 switches between the window and a borderless window over the monitor at any time. The picture keeps its 16:9\r\n"
+";   shape: the window resizes in 16:9, and other shapes (maximized, another monitor) get black bars.\r\n"
 "window = windowed\r\n"
 "width = 1280\r\n"
 "height = 720\r\n"
@@ -105,6 +107,12 @@ static const char *const k_default_ini =
 ";   background: the game starts at once and the same work runs behind it (first-seen things can make a frame late until it is done).\r\n"
 ";   off:        nothing is prepared ahead; shaders are built when the game first needs them.\r\n"
 "shader_prepare = first_run\r\n"
+"\r\n"
+"; shader_load = start | loading      (Vulkan, on a PC where the preparation above is done)\r\n"
+";   start:   every shader of the game is loaded into memory at the start, behind a 'LOADING SHADERS NN %' screen (a few\r\n"
+";            seconds, more on a CPU with few cores): the loading screens before a fight do no shader work. Uses more memory.\r\n"
+";   loading: as before: the shaders of a fighter or stage are loaded at its loading screen (less memory).\r\n"
+"shader_load = start\r\n"
 "\r\n"
 "; profile = custom | low\r\n"
 ";   custom: every key of this file as written. low: the set measured for a weak or integrated GPU (2026-10-12, Intel\r\n"
@@ -210,6 +218,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "runahead")) g_gfx_runahead = !_stricmp(val, "on") || !_stricmp(val, "1");      /* track R1 round 5 (r1_state.c) */
         else if (!_stricmp(key, "latency")) g_gfx_latency = !_stricmp(val, "lowest") ? 2 : !_stricmp(val, "low") ? 1 : 0;      /* track L1 (display.c latency_mode) */
         else if (!_stricmp(key, "shader_prepare")) o->shader_prepare = !_stricmp(val, "background") ? 1 : !_stricmp(val, "off") ? 2 : 0;
+        else if (!_stricmp(key, "shader_load")) o->shader_load = !_stricmp(val, "loading");
         else unknown++;
     }
     if (f) fclose(f);

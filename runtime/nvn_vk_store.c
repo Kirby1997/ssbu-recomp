@@ -34,8 +34,8 @@ static size_t vks_base_len;
 #endif
 
 #define VKS_DCTX_SIZE 0x271f0u
-#define VKS_ZSTD_DECOMPRESS 0x71039a4040ULL
-#define VKS_ZSTD_FREE 0x71039a3e70ULL
+#define VKS_ZSTD_DECOMPRESS GA(0x71039a4040ULL)
+#define VKS_ZSTD_FREE GA(0x71039a3e70ULL)
 #define VKS_SLICE (64ull << 20)
 #define VKS_ROOM 0x40000ull
 

@@ -4,6 +4,26 @@ The repository holds only this project's own tools and runtime. Nothing that com
 software is in it, with one stated exception: a list of function names (see "The SDK function list"). Everything else of that kind (the lifted C code, the lifted system-library code, the generated headers and
 tables, the script-module libraries) is **generated on your PC from your own dump**, into `build/` (ignored by git).
 
+## The short way: one click
+
+Nothing has to be installed first.
+
+1. Download this repository (Code, Download ZIP) and unpack it, or `git clone` it.
+2. Double-click **`Install SSBU.bat`**. If Python 3.10 or newer is not on the PC, it offers to install it (the official
+   python.org installer, checked against its published SHA-256, for your user only). If the Microsoft C++ Build Tools are
+   missing, the window offers to install them through winget (Windows asks for administrator rights), and the LLVM 9
+   installer does the same once. The installer window opens: choose your own files (the base game as `.nsp`,
+   `.xci` or `.nsz`, the 13.0.4 or 13.0.5 update as `.nsp` or `.nsz`, your `prod.keys`, and your firmware dump for the system
+   fonts, which the game needs) or a dump folder you already have, and press **Install**. It shows each step, a progress bar and the log. The installer makes the dump,
+   downloads the missing tools from their official pages (each archive is checked against the SHA-256 written in
+   `scripts/install.py` before it is used), then builds. The first build takes 30 minutes to a few hours; if it stops,
+   double-click it again and it goes on from there.
+3. Double-click **`Play SSBU.bat`** (your saves go to `build\saves`).
+
+The rest of this page is the same build done by hand, step by step.
+
+## By hand
+
 ```
 git clone https://github.com/Denkishi/ssbu-recomp
 cd ssbu-recomp
@@ -50,20 +70,30 @@ Without any of these the deps step and the link step say so, and the log of a ru
 
 ## What you dump from your own console
 
-The port handles **Super Smash Bros. Ultimate 13.0.4** (base game with the 13.0.4 update applied) and nothing else; step
-`convert` refuses another build. From your own copy of the game, with the homebrew dumping tools you prefer (for example
-nxdumptool, running on a console you own), produce a folder:
+The port handles **Super Smash Bros. Ultimate 13.0.4 and 13.0.5** (base game with the 13.0.4 or 13.0.5 update applied) and
+nothing else; step `convert` tells them apart and refuses another build ([docs/VERSIONS.md](docs/VERSIONS.md)). From
+your own copy of the game, with the homebrew dumping tools you prefer (for example nxdumptool, running on a console you
+own), produce a folder:
 
 ```
 <dump>/exefs/      the whole ExeFS: main, sdk, rtld, subsdk0, main.npdm   (with the update applied)
 <dump>/romfs/      the RomFS with the update applied (it contains data.arc)
-<dump>/sysdata/fonts and <dump>/sysdata/zoneinfo      optional: the system shared fonts (.ttf) and the tz database files
+<dump>/sysdata/fonts      required: the system shared fonts (.ttf); the game stops at start (code 7) without them
+<dump>/sysdata/zoneinfo   optional: the tz database files
 ```
 
-If you only have `.nsp` packages and your own keys, `tools/extract/romfs_extract.py <base.nsp> <update.nsp> <out>`
-(RomFS with the update applied), `tools/extract/nca_exefs.py` (ExeFS from an NCA) and `tools/extract/fw_fonts.py`
-(system fonts from a firmware dump) do the same; they read the keys from `~/.switch/prod.keys` and need
-`pip install pycryptodome`. This repository contains no keys and no link to any.
+If you only have packages (`.nsp`, or a cartridge image `.xci` of the base game) and your own keys, one command makes the
+folder:
+
+```
+python tools/extract/dump_folder.py <base.nsp|base.xci> <update.nsp> <dump> [--firmware <firmware dump folder>]
+```
+
+It writes `exefs\` (from the update) and `romfs\` (base with the update applied), and with `--firmware` the system fonts.
+The pieces are also tools of their own: `tools/extract/romfs_extract.py <base> <update> <out>` (RomFS with the update
+applied; `.nsp` or `.xci`), `tools/extract/nca_exefs.py` (ExeFS from an NCA) and `tools/extract/fw_fonts.py` (system
+fonts from a firmware dump). They read the keys from `~/.switch/prod.keys` and need `pip install pycryptodome`. This
+repository contains no keys and no link to any.
 
 ## The SDK function list
 
@@ -78,7 +108,7 @@ format is documented in `tools/lifter/sdklift.py` and `tools/audit/lift_select.p
 |---|---|
 | `deps` | checks every tool above and the dump; runs a test compile and link |
 | `stage` | lays the sources out in `build/work` (the tools expect their old single-folder layout) |
-| `convert` | `main` and `sdk` (NSO) to `build/binaries/13.0.4/*.elf`; checks the build and the segment hashes |
+| `convert` | `main` and `sdk` (NSO) to `build/binaries/<13.0.4 or 13.0.5>/*.elf`; checks the build and the segment hashes |
 | `modules` | extracts the game's script modules (NRO) from `data.arc`, writes their address map and registry |
 | `tables` | generates every header and table the runtime needs (imports, SDK data, self-test vectors, exception-table tests) |
 | `lift` | lifts the main executable (`recomp_eh.py`) |
@@ -147,7 +177,7 @@ Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
   `vswhere.exe` at `%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\` and calls the batch file by its absolute path;
   a harmless "vswhere" notice from `vcvars64.bat` in `build/logs/link.log` can be ignored when the DLL is produced.
 - `missing input: ...main.npdm`: the ExeFS dump lacks `main.npdm`; dump the whole ExeFS.
-- `sdk is not the expected build`: not 13.0.4 with the update applied.
+- `main is not a build this port knows` / `sdk is not a build this port knows`: not 13.0.4 or 13.0.5 with the update applied.
 - `the list of SDK functions to lift was not found`: `tools/lifter/sdklift_roots.txt` is missing from your clone.
 - No music (the menus and fights are silent apart from some effects), and the run's log says `nn::codec: libopus NOT
   FOUND`: there is no libopus beside the exe; see libopus under "What you need", then run `--redo link`.

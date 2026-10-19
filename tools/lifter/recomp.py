@@ -14,14 +14,10 @@ import sys
 import collections
 
 # Relative to the current directory, as before (was the Windows-only literal r'..\binaries\13.0.4\main.elf').
-# RECOMP_ELF overrides it.
-ELF = os.environ.get('RECOMP_ELF') or os.path.join('..', 'binaries', '13.0.4', 'main.elf')
+# RECOMP_ELF overrides it; RECOMP_BIN (scripts/setup.py) names the folder that holds main.elf.
+ELF = os.environ.get('RECOMP_ELF') or (os.path.join(os.environ['RECOMP_BIN'], 'main.elf') if os.environ.get('RECOMP_BIN') else os.path.join('..', 'binaries', '13.0.4', 'main.elf'))
 BASE = 0x7100000000
 FILE_OFF = 0x1000
-TEXT_SIZE = 0x39c7e90
-RELA, RELASZ = 0x39c8070, 0x7ad0d8
-JMPREL, PLTRELSZ = 0x4175148, 0xc600
-SYMTAB, STRTAB = 0x4197610, 0x41c11f0
 
 # The image is read at import, as before. Without it (unit tests of the instruction decoder, tests/arm_host) the module
 # still imports: IMG is None, and everything that needs the binary fails with a clear message (word(), Env, cmd_*).
@@ -35,6 +31,31 @@ def need_img():
     if IMG is None:
         raise FileNotFoundError('recomp.py: game binary not found: %s (run from the directory the lifter expects, '
                                 'or set RECOMP_ELF)' % os.path.abspath(ELF))
+
+
+def _layout(img):
+    """main's layout, read from the converted dump itself (tools/extract/nso2elf.py): the size of the code (the first
+    PT_LOAD) and the relocation and symbol tables of the dynamic section that MOD0 points to. Read rather than written
+    down, so each game build gives its own. 13.0.4: code 0x39c7e90, RELA 0x39c8070 / 0x7ad0d8, JMPREL 0x4175148 / 0xc600,
+    SYMTAB 0x4197610, STRTAB 0x41c11f0 (the constants this replaces); 13.0.5: code 0x39c8440 and every table one page
+    (0x1000) later with the same size (docs/VERSIONS.md)."""
+    phoff, = struct.unpack_from('<Q', img, 0x20)
+    phnum, = struct.unpack_from('<H', img, 0x38)
+    text = next(struct.unpack_from('<Q', img, phoff + i * 56 + 32)[0] for i in range(phnum) if struct.unpack_from('<I', img, phoff + i * 56)[0] == 1)
+    mod0 = struct.unpack_from('<I', img, FILE_OFF + 4)[0]
+    assert img[FILE_OFF + mod0:FILE_OFF + mod0 + 4] == b'MOD0', 'main.elf: no MOD0 header'
+    dyn, tags = mod0 + struct.unpack_from('<i', img, FILE_OFF + mod0 + 4)[0], {}
+    while True:
+        tag, val = struct.unpack_from('<qQ', img, FILE_OFF + dyn)
+        dyn += 16
+        if tag == 0:
+            break
+        tags.setdefault(tag, val)
+    return text, tags[7], tags[8], tags[23], tags[2], tags[6], tags[5]
+
+
+# Without the image (decoder unit tests) the layout is all 0, as in tools/nro/recomp_nro.py; need_img() guards every use.
+TEXT_SIZE, RELA, RELASZ, JMPREL, PLTRELSZ, SYMTAB, STRTAB = _layout(IMG) if IMG is not None else (0,) * 7
 
 
 # Instruction patch list (N3, plan\phases\N3_new_kind.md): DEFAULT OFF. A patch replaces one instruction word of the

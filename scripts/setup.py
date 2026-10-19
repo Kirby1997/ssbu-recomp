@@ -7,7 +7,7 @@
 <folder> holds what you dumped from YOUR console (see BUILDING.md):
     <folder>/exefs/    the title's ExeFS files: main  sdk  (rtld, subsdk0, main.npdm are not used), update applied
     <folder>/romfs/    the title's RomFS (data.arc ...), update applied
-    optional: <folder>/sysdata/fonts (the system's shared fonts), <folder>/sysdata/zoneinfo
+    <folder>/sysdata/fonts (the system's shared fonts: the game stops at start without them); optional: <folder>/sysdata/zoneinfo
 
 Nothing of the game is stored in the repository: every step below derives its files from the dump, into <repo>/build
 (ignored by git). Steps run in this order and are resumable (a finished step is skipped; --redo <step> repeats it,
@@ -48,7 +48,11 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STEPS = ['deps', 'stage', 'convert', 'modules', 'tables', 'lift', 'sdk', 'compile', 'nro', 'link', 'check']
-GAME_TEXT_SIZE, SDK_TEXT_SIZE = 0x39c7e90, 0x540950          # 13.0.4: the lifter's constants (recomp.py, sdklift.py)
+# The game builds this port handles, told apart by the size of main's code (the first segment of the converted dump).
+# 13.0.4 is the reference build: the game addresses written in the runtime are 13.0.4 addresses, and GA() (runtime/hostrt.c)
+# gives their 13.0.5 counterparts (docs/VERSIONS.md says how they were found). sdk is the same module in both builds.
+GAME_BUILDS = {0x39c7e90: '13.0.4', 0x39c8440: '13.0.5'}
+SDK_TEXT_SIZE = 0x540950
 EXE = 'ssbu_native.exe'                 # windows; Ctx.exe has the name for the selected target
 DEFAULT_DEVICE_DIR = '~/ssbu-port/build/deps_probe'      # where the cross `deps` probe is run on the device
 
@@ -91,7 +95,6 @@ class Ctx:
         self.target_flags = []                   # linux: --target/--sysroot/-march ... (set by deps)
         self.build = pre or os.path.join(REPO, os.path.join('build', 'linux-arm64') if self.linux else 'build')
         self.work = os.path.join(self.build, 'work')
-        self.bin = os.path.join(self.build, 'binaries', '13.0.4')
         self.logs = os.path.join(self.build, 'logs')
         self.state_file = os.path.join(self.build, 'state.json')
         if os.path.exists(self.state_file):
@@ -102,6 +105,10 @@ class Ctx:
         self.jobs = a.jobs or min(24, os.cpu_count() or 8)
         self.tools = dict(self.state.get('tools', {})) if self.linux else {}      # located tools, filled by deps (linux: remembered, so --only <step> works)
 
+    @property
+    def bin(self):                               # the converted dump of the build found by the convert step
+        return os.path.join(self.build, 'binaries', self.state.get('game_version', '13.0.4'))
+
     def save(self):
         os.makedirs(self.build, exist_ok=True)
         with open(self.state_file, 'w') as f:
@@ -111,6 +118,7 @@ class Ctx:
         env = {k: v for k, v in os.environ.items() if not k.startswith(('RECOMP_', 'SSBU_'))}
         env['PYTHONIOENCODING'] = 'utf-8'
         env['PYTHONUNBUFFERED'] = '1'
+        env['RECOMP_BIN'] = self.bin             # where the tools find main.elf and sdk.elf
         t = self.tools
         if 'clang' in t:
             env['RECOMP_CLANG'] = t['clang']
@@ -431,7 +439,7 @@ def step_deps(cx):
         cx.state['dump']['sysdata'] = os.path.abspath(sysdata)
         say('  dump: exefs, romfs, sysdata (fonts%s)' % (', zoneinfo' if os.path.isdir(os.path.join(sysdata, 'zoneinfo')) else ''))
     else:
-        say('  dump: exefs, romfs   (no sysdata%sfonts: the game runs but its text uses no system font)' % os.sep)
+        say('  dump: exefs, romfs   (no sysdata%sfonts: WARNING, the game stops at start without the system fonts; tools/extract/fw_fonts.py, BUILDING.md)' % os.sep)
     if a.sdk_roots:
         if not os.path.isfile(a.sdk_roots):
             raise Fail('--sdk-roots file not found')
@@ -476,16 +484,31 @@ def step_stage(cx):
 
 def step_convert(cx):
     d = cx.state['dump']
-    os.makedirs(cx.bin, exist_ok=True)
     conv = os.path.join(REPO, 'tools', 'extract', 'nso2elf.py')
-    for name, want in (('main', GAME_TEXT_SIZE), ('sdk', SDK_TEXT_SIZE)):
-        out = cx.run('convert', [sys.executable, conv, os.path.join(d['exefs'], name), os.path.join(cx.bin, name + '.elf')], cwd=REPO, log='convert_' + name)
+    tmp = os.path.join(cx.build, 'binaries', 'converting')
+    os.makedirs(tmp, exist_ok=True)
+    version = None
+    for name in ('main', 'sdk'):
+        out = cx.run('convert', [sys.executable, conv, os.path.join(d['exefs'], name), os.path.join(tmp, name + '.elf')], cwd=REPO, log='convert_' + name)
         seg0 = next((l for l in out.splitlines() if l.startswith('seg 0')), '')
         got = int(seg0.split('size ')[1].split()[0], 16) if 'size ' in seg0 else 0
-        if 'MISMATCH' in out or got != want:
-            raise Fail('%s is not the expected build (code size %#x, expected %#x for 13.0.4, or a segment hash mismatch): '
-                       'this port only handles Super Smash Bros. Ultimate 13.0.4 (update applied)' % (name, got, want))
+        known = GAME_BUILDS.get(got) if name == 'main' else got == SDK_TEXT_SIZE
+        if 'MISMATCH' in out or not known:
+            raise Fail('%s is not a build this port knows (code size %#x, or a segment hash mismatch): it handles Super Smash Bros. '
+                       'Ultimate %s (update applied)' % (name, got, ' and '.join(sorted(GAME_BUILDS.values()))))
+        if name == 'main':
+            version = known
         say('  %s -> %s.elf   code %.1f MB, segment hashes ok' % (name, name, got / 1048576.0))
+    if cx.state.get('game_version', version) != version:      # another build than the one the later steps were made from
+        for s in STEPS[STEPS.index('convert') + 1:]:
+            cx.state.setdefault('done', {}).pop(s, None)
+        say('  the dump is %s, the build folder held %s: every later step runs again' % (version, cx.state['game_version']))
+    cx.state['game_version'] = version
+    os.makedirs(cx.bin, exist_ok=True)
+    for name in os.listdir(tmp):
+        os.replace(os.path.join(tmp, name), os.path.join(cx.bin, name))
+    os.rmdir(tmp)
+    say('  game build %s -> %s' % (version, os.path.relpath(cx.bin, cx.build)))
     for name in os.listdir(d['exefs']):                 # main.npdm (main thread stack size) and the other ExeFS files sit beside the ELFs
         if os.path.isfile(os.path.join(d['exefs'], name)):
             shutil.copy2(os.path.join(d['exefs'], name), os.path.join(cx.bin, name))
@@ -660,9 +683,9 @@ def how_to_run(cx):
     say('Start the game (from a shell; the window opens at once, the first run compiles shaders and is slow):')
     say('  python scripts/run.py %s--userdata <a folder for your saves> [--seconds 0]' % ('--build %s ' % os.path.relpath(cx.build, REPO) if cx.linux else ''))
     if cx.linux:
-        say('or by hand:   cd %s && ./%s ../binaries/13.0.4/main.elf 0' % (os.path.relpath(cx.work), cx.exe))
+        say('or by hand:   cd %s && ./%s ../binaries/%s/main.elf 0' % (os.path.relpath(cx.work), cx.exe, cx.state.get('game_version', '13.0.4')))
     else:
-        say('or by hand:   cd build\\work   and run   %s ..\\binaries\\13.0.4\\main.elf 0' % EXE)
+        say('or by hand:   cd build\\work   and run   %s ..\\binaries\\%s\\main.elf 0' % (EXE, cx.state.get('game_version', '13.0.4')))
     say('with the environment variables SSBU_ROMFS=%s  SSBU_USERDATA=<saves>  (options: BUILDING.md)' % d.get('romfs', '<romfs>'))
 
 
