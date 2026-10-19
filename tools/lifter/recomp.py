@@ -19,8 +19,10 @@ ELF = os.environ.get('RECOMP_ELF') or (os.path.join(os.environ['RECOMP_BIN'], 'm
 BASE = 0x7100000000
 FILE_OFF = 0x1000
 
-# The image is read at import, as before. Without it (unit tests of the instruction decoder, tests/arm_host) the module
-# still imports: IMG is None, and everything that needs the binary fails with a clear message (word(), Env, cmd_*).
+# The image is read at import, as before, and without it the import stops, as before: the layout below is read from it,
+# and an all-0 layout would let importers (gen_imports.py, eh_census*.py, gen_eh_tests.py, tests/blrefs.py) loop over
+# empty tables and write empty output without an error. RECOMP_NO_IMAGE=1 (unit tests of the instruction decoder,
+# tests/arm_host) imports without it: IMG is None, and everything that needs the binary fails with a clear message.
 if os.path.exists(ELF):
     IMG = open(ELF, 'rb').read()
 else:
@@ -31,6 +33,10 @@ def need_img():
     if IMG is None:
         raise FileNotFoundError('recomp.py: game binary not found: %s (run from the directory the lifter expects, '
                                 'or set RECOMP_ELF)' % os.path.abspath(ELF))
+
+
+if IMG is None and os.environ.get('RECOMP_NO_IMAGE') != '1':
+    need_img()
 
 
 def _layout(img):
@@ -54,7 +60,7 @@ def _layout(img):
     return text, tags[7], tags[8], tags[23], tags[2], tags[6], tags[5]
 
 
-# Without the image (decoder unit tests) the layout is all 0, as in tools/nro/recomp_nro.py; need_img() guards every use.
+# Without the image (RECOMP_NO_IMAGE=1: decoder unit tests) the layout is all 0, as in tools/nro/recomp_nro.py; need_img() guards every use.
 TEXT_SIZE, RELA, RELASZ, JMPREL, PLTRELSZ, SYMTAB, STRTAB = _layout(IMG) if IMG is not None else (0,) * 7
 
 

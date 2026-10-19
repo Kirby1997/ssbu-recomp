@@ -17,6 +17,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 os.environ['RECOMP_ELF'] = os.path.join(HERE, 'no-game-binary-here.elf')   # never read a game binary
+os.environ['RECOMP_NO_IMAGE'] = '1'                                         # recomp.py imports without one
 os.environ.pop('RECOMP_PATCHES', None)
 os.environ.pop('RECOMP_NRO', None)
 sys.path[:0] = [os.path.join(ROOT, 'tools', 'lifter'), os.path.join(ROOT, 'tools', 'nro')]
