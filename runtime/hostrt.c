@@ -900,27 +900,47 @@ static void diag_modules(FILE *f) {
 /* The crash report also goes to <exe name>_crash.txt next to the exe (appended; SSBU_REPORT_DIR: there), as on Windows.
  * Register numbers of mcontext_t.gregs on x86-64 (sys/ucontext.h names them only with _GNU_SOURCE). */
 enum { G_R8, G_R9, G_R10, G_R11, G_R12, G_R13, G_R14, G_R15, G_RDI, G_RSI, G_RBP, G_RBX, G_RDX, G_RAX, G_RCX, G_RSP, G_RIP, G_EFL, G_CSGSFS, G_ERR };
+#if defined(__x86_64__)
+#define CRASH_PC(u) ((uintptr_t)(u)->uc_mcontext.gregs[G_RIP])
+#define CRASH_SP(u) ((uintptr_t)(u)->uc_mcontext.gregs[G_RSP])
+#elif defined(__aarch64__)
+#define CRASH_PC(u) ((uintptr_t)(u)->uc_mcontext.pc)
+#define CRASH_SP(u) ((uintptr_t)(u)->uc_mcontext.sp)
+#else
+#error "crash handler: add this architecture's mcontext pc / sp"
+#endif
 static void crash_file_report(int sig, siginfo_t *si, ucontext_t *u) {
     char path[2 * MAX_PATH];
     if (!diag_report_path(path, sizeof path, "_crash.txt")) return;
     FILE *f = fopen(path, "ab");
     if (!f) return;
-    const greg_t *g = u->uc_mcontext.gregs;
     SYSTEMTIME st; GetLocalTime(&st);
     DWORD tid = GetCurrentThreadId();
     const char *tn = guest_thread_name_of(tid);
     char sym[400];
-    plat_symbolize((uintptr_t)g[G_RIP], sym, sizeof sym);
+    plat_symbolize(CRASH_PC(u), sym, sizeof sym);
     fprintf(f, "=== %04d-%02d-%02d %02d:%02d:%02d  HOST SIGNAL %d (%s) at %p (%s)\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-            sig, strsignal(sig), (void *)g[G_RIP], sym);
-    if (sig == SIGSEGV || sig == SIGBUS) fprintf(f, "  %s address %p\n", (g[G_ERR] & 2) ? "writing" : "reading", si->si_addr);
+            sig, strsignal(sig), (void *)CRASH_PC(u), sym);
+#if defined(__x86_64__)
+    if (sig == SIGSEGV || sig == SIGBUS) fprintf(f, "  %s address %p\n", (u->uc_mcontext.gregs[G_ERR] & 2) ? "writing" : "reading", si->si_addr);
+#else
+    if (sig == SIGSEGV || sig == SIGBUS) fprintf(f, "  accessing address %p\n", si->si_addr);
+#endif
     fprintf(f, "thread %lu (%s), on logical processor %lu\n", (unsigned long)tid, tn ? tn : "not a guest thread, or the main thread", (unsigned long)GetCurrentProcessorNumber());
+#if defined(__x86_64__)
+    {   const greg_t *g = u->uc_mcontext.gregs;
     fprintf(f, "host registers: rax %016llx rbx %016llx rcx %016llx rdx %016llx\n                rsi %016llx rdi %016llx rbp %016llx rsp %016llx\n"
                "                r8  %016llx r9  %016llx r10 %016llx r11 %016llx\n                r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n",
             g[G_RAX], g[G_RBX], g[G_RCX], g[G_RDX], g[G_RSI], g[G_RDI], g[G_RBP], g[G_RSP],
             g[G_R8], g[G_R9], g[G_R10], g[G_R11], g[G_R12], g[G_R13], g[G_R14], g[G_R15]);
+    }
+#elif defined(__aarch64__)
+    fprintf(f, "host registers:\n");
+    for (int i = 0; i < 31; i++) fprintf(f, "  x%-2d %016llx%s", i, (unsigned long long)u->uc_mcontext.regs[i], i % 4 == 3 ? "\n" : "");
+    fprintf(f, "  sp  %016llx  pc %016llx  pstate %016llx\n", (unsigned long long)u->uc_mcontext.sp, (unsigned long long)u->uc_mcontext.pc, (unsigned long long)u->uc_mcontext.pstate);
+#endif
     MEMORY_BASIC_INFORMATION mbi;       /* a stack overflow leaves rsp on a guard page: reading it would fault again */
-    uintptr_t rsp = (uintptr_t)g[G_RSP];
+    uintptr_t rsp = CRASH_SP(u);
     if (VirtualQuery((void *)(rsp - 0x40), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
         fprintf(f, "host stack from rsp-0x40:\n");
         const uint64_t *s = (const uint64_t *)(rsp - 0x40);
@@ -949,7 +969,7 @@ static void crash_file_report(int sig, siginfo_t *si, ucontext_t *u) {
 }
 static void crash_signal(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = uc;
-    uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[16 /* REG_RIP */], rsp = (uintptr_t)u->uc_mcontext.gregs[15 /* REG_RSP */], bad = (uintptr_t)si->si_addr;
+    uintptr_t rip = CRASH_PC(u), rsp = CRASH_SP(u), bad = (uintptr_t)si->si_addr;
     printf("\nHOST SIGNAL %d (%s) at address %p\n", sig, sig == SIGSEGV ? "segmentation fault" : sig == SIGBUS ? "bus error" : sig == SIGILL ? "illegal instruction" : sig == SIGFPE ? "arithmetic" : "?", si->si_addr);
     {   char sym[400];
         plat_symbolize(rip, sym, sizeof sym);

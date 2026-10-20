@@ -123,7 +123,13 @@ BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user);
 BOOL GetProcessTimes(HANDLE p, FILETIME *create, FILETIME *exit_, FILETIME *kernel, FILETIME *user);
 void Sleep(DWORD ms);
 #define SwitchToThread() (sched_yield(), 1)
+#if defined(__x86_64__) || defined(__i386__)
 #define YieldProcessor() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define YieldProcessor() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define YieldProcessor() __asm__ __volatile__("" ::: "memory")
+#endif
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define TIMERR_NOERROR 0
 #define timeBeginPeriod(ms) ((MMRESULT)TIMERR_NOERROR)
@@ -561,6 +567,7 @@ HANDLE FindFirstFileW(LPCWSTR pattern, WIN32_FIND_DATAW *fd);
 BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd);
 /* stack walking for the diagnostics: PCs of the calling thread, innermost first (_Unwind_Backtrace) */
 int plat_backtrace(uintptr_t *pcs, int max);
+int plat_current_stack_bounds(uintptr_t *lo, uintptr_t *hi);   /* the running fiber's or thread's stack (TEB StackLimit..StackBase) */
 
 /* OpenGL renderer: extension entry points from the current context (SDL) */
 void *wglGetProcAddress(const char *name);
