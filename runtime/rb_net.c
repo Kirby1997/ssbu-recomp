@@ -22,9 +22,6 @@
 #include <stdint.h>
 #include <math.h>
 #include "rb.h"
-#ifndef _WIN32
-#include <sys/stat.h>
-#endif
 #include "rb_input.c"
 #include "rb_wire.c"
 #include "rb_timesync.c"
@@ -135,9 +132,8 @@ static long long g_hs_tx, g_hs_rx;
 #define RBH_BLK 0xa48                                   /* match block + 0 .. + 0x580 + 2 * 0x260 + 8 */
 static uint8_t g_hs_mine_blk[RBH_BLK], g_hs_peer_blk[RBH_BLK]; static int g_hs_mine_ok, g_hs_peer_got, g_hs_blk_done; static uint8_t g_hs_peer_have[RBH_BLK / 768 + 1];
 static uint32_t exe_stamp(void) {
-#ifndef _WIN32      /* an ELF file has no link time stamp: the exe's modification time stands in */
-    struct stat st;
-    return stat("/proc/self/exe", &st) ? 0 : (uint32_t)st.st_mtime;
+#ifndef _WIN32      /* an ELF file has no link time stamp: its build id stands in (plat_posix.c) */
+    return plat_exe_stamp();
 #else
     const uint8_t *b = (const uint8_t *)GetModuleHandleA(NULL); if (!b) return 0;
     const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);

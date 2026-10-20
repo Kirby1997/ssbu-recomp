@@ -568,6 +568,7 @@ BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd);
 /* stack walking for the diagnostics: PCs of the calling thread, innermost first (_Unwind_Backtrace) */
 int plat_backtrace(uintptr_t *pcs, int max);
 int plat_current_stack_bounds(uintptr_t *lo, uintptr_t *hi);   /* the running fiber's or thread's stack (TEB StackLimit..StackBase) */
+uint32_t plat_exe_stamp(void);       /* rb_net.c: the PE header's link time stamp on Windows; here 4 bytes of the exe's ELF build id */
 
 /* OpenGL renderer: extension entry points from the current context (SDL) */
 void *wglGetProcAddress(const char *name);

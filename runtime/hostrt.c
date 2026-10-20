@@ -936,7 +936,7 @@ static void crash_file_report(int sig, siginfo_t *si, ucontext_t *u) {
     }
 #elif defined(__aarch64__)
     fprintf(f, "host registers:\n");
-    for (int i = 0; i < 31; i++) fprintf(f, "  x%-2d %016llx%s", i, (unsigned long long)u->uc_mcontext.regs[i], i % 4 == 3 ? "\n" : "");
+    for (int i = 0; i < 31; i++) fprintf(f, "  x%-2d %016llx%s", i, (unsigned long long)u->uc_mcontext.regs[i], i % 4 == 3 || i == 30 ? "\n" : "");
     fprintf(f, "  sp  %016llx  pc %016llx  pstate %016llx\n", (unsigned long long)u->uc_mcontext.sp, (unsigned long long)u->uc_mcontext.pc, (unsigned long long)u->uc_mcontext.pstate);
 #endif
     MEMORY_BASIC_INFORMATION mbi;       /* a stack overflow leaves rsp on a guard page: reading it would fault again */

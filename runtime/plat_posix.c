@@ -498,6 +498,37 @@ int plat_current_stack_bounds(uintptr_t *lo, uintptr_t *hi) {
     return 1;
 }
 LPVOID GetFiberData(void) { return t_fiber ? t_fiber->param : NULL; }
+/* rb_net.c's handshake note "the other game's exe is another build": Windows reads the PE link time stamp. An ELF file has
+ * none; the GNU build id (a hash of the linked contents, the same in every copy of one build) stands in, its first 4 bytes;
+ * without one (linked without --build-id) the exe's modification time. dl_iterate_phdr reports the exe first. */
+static int exe_build_id(struct dl_phdr_info *in, size_t size, void *out) {
+    (void)size;
+    for (int k = 0; k < in->dlpi_phnum; k++) {
+        const ElfW(Phdr) *ph = &in->dlpi_phdr[k];
+        if (ph->p_type != PT_NOTE) continue;
+        size_t al = ph->p_align == 8 ? 8 : 4;
+        const uint8_t *p = (const uint8_t *)(in->dlpi_addr + ph->p_vaddr), *e = p + ph->p_memsz;
+        while (p + 12 <= e) {
+            uint32_t nsz, dsz, type; memcpy(&nsz, p, 4); memcpy(&dsz, p + 4, 4); memcpy(&type, p + 8, 4);
+            const uint8_t *name = p + 12, *desc = name + ((nsz + al - 1) & ~(al - 1));
+            if (desc + dsz > e) break;
+            if (type == NT_GNU_BUILD_ID && nsz == 4 && !memcmp(name, "GNU", 4) && dsz >= 4) { memcpy(out, desc, 4); return 1; }
+            p = desc + ((dsz + al - 1) & ~(al - 1));
+        }
+    }
+    return 1;                                           /* the exe only */
+}
+uint32_t plat_exe_stamp(void) {
+    static uint32_t s;
+    uint32_t v = __atomic_load_n(&s, __ATOMIC_RELAXED);
+    if (!v) {                                           /* the same value from every thread: a race only computes it twice */
+        struct stat st;
+        dl_iterate_phdr(exe_build_id, &v);
+        if (!v && !stat("/proc/self/exe", &st)) v = (uint32_t)st.st_mtime;
+        __atomic_store_n(&s, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
 
 /* ================================================================ virtual memory
  * Windows keeps a state for every page (free / reserved / committed, protection); VirtualQuery reports runs of pages
@@ -906,7 +937,15 @@ const char *plat_path(const char *in, char *out, size_t n) {
     return out;
 }
 #define P(in, buf) plat_path((in), (buf), sizeof (buf))
-FILE *plat_fopen(const char *path, const char *mode) { char b[PATH_MAX]; return fopen(P(path, b), mode); }
+/* Opening a file: as plat_path, and Windows' null device NUL (any case; nnhid.c's pad self-test sets SSBU_REC=NUL) is
+ * /dev/null rather than a file named NUL in the current directory. Only where files are opened: removing, renaming or
+ * making a directory "NUL" is left alone. 1 = mapped to /dev/null. */
+static int plat_open_path(const char *in, char *out, size_t n) {
+    if (!strcasecmp(in, "NUL")) { snprintf(out, n, "/dev/null"); return 1; }
+    plat_path(in, out, n);
+    return 0;
+}
+FILE *plat_fopen(const char *path, const char *mode) { char b[PATH_MAX]; plat_open_path(path, b, sizeof b); return fopen(b, mode); }
 int plat_remove(const char *path) { char b[PATH_MAX]; return remove(P(path, b)); }
 int plat_rename(const char *a, const char *b) { char x[PATH_MAX], y[PATH_MAX]; return rename(P(a, x), P(b, y)); }
 char *_fullpath(char *out, const char *path, size_t n) {
@@ -934,7 +973,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *
     case TRUNCATE_EXISTING: of |= O_TRUNC; break;
     default: break;
     }
-    int fd = open(P(path, b), of | O_CLOEXEC, 0666);
+    if (plat_open_path(path, b, sizeof b)) of &= ~O_EXCL;     /* NUL: the device exists, CREATE_NEW opens it as on Windows */
+    int fd = open(b, of | O_CLOEXEC, 0666);
     if (fd < 0 && errno == EISDIR && !(access & GENERIC_WRITE)) fd = open(b, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) { fail_errno(); return INVALID_HANDLE_VALUE; }
     if (flags & FILE_FLAG_SEQUENTIAL_SCAN) posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
