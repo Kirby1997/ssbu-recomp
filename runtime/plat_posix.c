@@ -481,6 +481,22 @@ int plat_current_fiber_stack(uintptr_t *lo, uintptr_t *hi) {      /* crash repor
     *lo = (uintptr_t)f->stack; *hi = (uintptr_t)f->stack + f->stack_size;
     return 1;
 }
+/* nnunwind.c catch_here / the cross-stack check: the bounds of the stack this code runs on now (the TEB's DeallocationStack ..
+ * StackBase on Windows): the running fiber's stack, else the thread's own (pthread_getattr_np, once per thread). */
+int plat_current_stack_bounds(uintptr_t *lo, uintptr_t *hi) {
+    if (plat_current_fiber_stack(lo, hi)) return 1;
+    static __thread uintptr_t t_lo, t_hi;
+    if (!t_hi) {
+        pthread_attr_t a; void *base; size_t sz;
+        if (pthread_getattr_np(pthread_self(), &a)) return 0;
+        int bad = pthread_attr_getstack(&a, &base, &sz);
+        pthread_attr_destroy(&a);
+        if (bad) return 0;
+        t_lo = (uintptr_t)base; t_hi = t_lo + sz;
+    }
+    *lo = t_lo; *hi = t_hi;
+    return 1;
+}
 LPVOID GetFiberData(void) { return t_fiber ? t_fiber->param : NULL; }
 
 /* ================================================================ virtual memory
