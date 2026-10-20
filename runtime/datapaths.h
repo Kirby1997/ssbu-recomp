@@ -77,8 +77,9 @@ typedef struct {
 } dp_result;
 
 /* ---- for runtime/boot.c */
-int dp_take_args(int *argc, char **argv);         /* removes --data/--fonts/--dlc/--userdata <v> (or =v) and --check-data; -1 = a value is missing */
+int dp_take_args(int *argc, char **argv);         /* removes --data/--fonts/--dlc/--userdata <v> (or =v), --check-data and --pick-data; -1 = a value is missing */
 int dp_check_only(void);                          /* --check-data was given: print the result and exit */
+int dp_pick_requested(void);                      /* --pick-data, or SSBU_PICK_DATA set and not "0": open the picker even when the data are usable */
 int dp_check(const char *expect, dp_result *r);   /* resolve DP_DATA, then dp_validate; returns r->status == DP_OK */
 void dp_apply(const dp_result *r);                /* exports SSBU_ROMFS / SSBU_FONTS (when found), SSBU_USERDATA (always, folder created), SSBU_TZDIR (dump's zoneinfo, if unset) */
 void dp_report(FILE *out, const dp_result *r);    /* --check-data: the result, every source and the message */
@@ -91,11 +92,15 @@ const char *dp_nso_build(const char *nso, unsigned *text_size);   /* the same fr
 int dp_validate(const char *dir, const char *expect, dp_result *r);   /* expect "13.0.4", "13.0.5" or NULL (either); returns status == DP_OK */
 int dp_save_choice(const char *dir);              /* config "data" = the absolute folder (it is not validated here); 0 or -errno */
 int dp_current_choice(char *out, size_t n, dp_source *src);           /* = dp_resolve(DP_DATA, ...) */
-/* Set by U5b. Called by boot.c when the data are not usable and the run is attended; `r` says why. Return 1 when the
- * player chose a folder and it was saved (boot.c then calls dp_picked and checks again: the saved choice now wins over
- * --data / SSBU_DATA / SSBU_ROMFS), 0 to give up (boot.c prints r->message, exits 9). */
+/* Set by U5b (datapicker_sdl.c). Called by boot.c when the run is attended and the data are not usable, or are usable but
+ * dp_pick_requested(); `r` says why. Return 1 when the player chose a folder and it was saved (boot.c then calls dp_picked
+ * and checks again: the saved choice now wins over --data / SSBU_DATA / SSBU_ROMFS); 0 to give up (unusable data: boot.c
+ * prints r->message and exits 9) or, with usable data, to start with them; -1 when the player quit (exit 9 with unusable
+ * data, 0 with usable ones). */
 extern int (*dp_picker_hook)(const dp_result *r);
 void dp_picked(const dp_result *r);               /* after the hook returned 1: drop the overrides that would hide the saved choice */
+int dp_validate_picked(const char *dir, const char *expect, const dp_result *was, dp_result *r);   /* dp_validate as boot.c's check after dp_picked(was) will see it */
+int dp_fonts_check(const char *dir, char *missing, size_t n);         /* the 7 system fonts are in `dir` (not empty); 0: *missing = the first one absent */
 
 /* ---- lower level */
 int dp_resolve(dp_kind k, char *out, size_t n, dp_source *src);       /* 1 = found (out set), 0 = none */

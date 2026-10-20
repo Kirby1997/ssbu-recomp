@@ -9,11 +9,13 @@
 #   --dlc <file or folder>   dlc.txt (tools/audit/dlc_list.py), or the folder of your DLC dumps (their names carry the ids) (SSBU_DLC_LIST)
 #   --userdata <folder>      saves (default ~/.local/share/ssbu-recomp/userdata)                                         (SSBU_USERDATA)
 #   --check-data             only check the game data, print where everything is, exit (0 = usable, 9 = not)
+#   --pick-data              open the game's data picker even when the data are usable, to choose another dump (SSBU_PICK_DATA=1)
 #   [main.elf [seconds]]     default: the build's own main.elf (state.json game_version), no time limit
 # then the choice saved in ~/.config/ssbu-recomp/config (`data=<folder>` ...), then the build folder's own layout
 # (build/linux-arm64/state.json "romfs" written by scripts/setup.py, ../romfs, ../sysdata/fonts). SSBU_* variables already in the
-# environment (Steam launch options, a shell) are passed through. Exit code 9: the game data are missing or unusable (the reason
-# is printed); other codes are the game's own (BUILDING.md).
+# environment (Steam launch options, a shell) are passed through. Missing or unusable data open the game's own picker (controller,
+# keyboard or mouse); the folder chosen there is saved. Exit code 9: the game data are missing or unusable and nothing was chosen
+# (no display, a scripted run, or Quit; the reason is printed); other codes are the game's own (BUILDING.md).
 #
 # --build: the build folder holding work/ssbu_native (default: <repo>/build/linux-arm64, or the folder of this script when
 #          ssbu_native sits beside it, or $SSBU_BUILD).
@@ -79,7 +81,7 @@ else
     code=${PIPESTATUS[0]}
 fi
 if [ "$code" = 9 ]; then
-    echo "play-linux: the game data are missing or unusable (above). Give your dump folder with --data <folder>," >&2
+    echo "play-linux: the game data are missing or unusable (above). Choose your dump in the game's picker, or give it with --data <folder>," >&2
     echo "            or check what is found with: $0 --check-data" >&2
 fi
 exit "$code"

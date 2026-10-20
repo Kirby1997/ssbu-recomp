@@ -24,7 +24,7 @@
 int (*dp_picker_hook)(const dp_result *r);
 
 static char g_cli[DP_KINDS][DP_PATH];
-static int g_check_only;
+static int g_check_only, g_pick;
 static char g_base[DP_PATH];
 
 #define AOC_APP 0x01006A800016E000ULL           /* the application the add-on contents belong to (nnmisc.c AOC_APP_ID) */
@@ -115,14 +115,19 @@ void dp_set_cli(dp_kind k, const char *value) {
     snprintf(g_cli[k], sizeof g_cli[k], "%s", value ? value : "");
 }
 int dp_check_only(void) { return g_check_only; }
+int dp_pick_requested(void) {
+    const char *e = getenv("SSBU_PICK_DATA");
+    return g_pick || (e && e[0] && strcmp(e, "0"));
+}
 int dp_take_args(int *argc, char **argv) {
     int out = 1, bad = 0;
-    g_check_only = 0;
+    g_check_only = g_pick = 0;
     for (int i = 1; i < *argc; i++) {
         const char *a = argv[i];
         int k = -1;
         size_t l = 0;
         if (!strcmp(a, "--check-data")) { g_check_only = 1; continue; }
+        if (!strcmp(a, "--pick-data")) { g_pick = 1; continue; }
         for (int j = 0; j < DP_KINDS && k < 0; j++) {
             l = strlen(g_cli_names[j]);
             if (!strncmp(a, g_cli_names[j], l) && (a[l] == 0 || a[l] == '=')) k = j;
@@ -515,6 +520,24 @@ static int fail(dp_result *r, dp_status s, const char *missing, const char *fmt,
     va_end(ap);
     return 0;
 }
+/* The one place that decides whether a folder holds the system fonts (dp_validate, dp_fonts_check, the picker's tags): all 7
+ * files, none empty, names matched case-insensitively. *missing = the first one absent (its name). */
+static int fonts_complete(const char *dir, const char **missing) {
+    char p[DP_PATH];
+    off_t size = 0;
+    for (size_t i = 0; i < sizeof g_fonts / sizeof g_fonts[0]; i++)
+        if (!find(p, sizeof p, dir, g_fonts[i], 0) || (stat_kind(p, 0, &size), size == 0)) { *missing = g_fonts[i]; return 0; }
+    *missing = NULL;
+    return 1;
+}
+int dp_fonts_check(const char *dir, char *missing, size_t n) {
+    char d[DP_PATH];
+    const char *m = g_fonts[0];
+    int ok = 0;
+    if (dir && dir[0]) { host_path_resolve(dir, d, sizeof d); ok = fonts_complete(d, &m); }
+    if (missing && n) snprintf(missing, n, "%s", ok ? "" : m);
+    return ok;
+}
 int dp_validate(const char *dir, const char *expect, dp_result *r) {
     char d[DP_PATH], root[DP_PATH], p[DP_PATH], e[DP_PATH];
     off_t size = 0;
@@ -570,13 +593,13 @@ int dp_validate(const char *dir, const char *expect, dp_result *r) {
                     "%s  (or dump_folder.py --firmware), or start with --fonts <folder> / SSBU_FONTS=<folder>.", p, p);
     }
     absolute(r->fonts, sizeof r->fonts);
-    for (size_t i = 0; i < sizeof g_fonts / sizeof g_fonts[0]; i++)
-        if (!find(p, sizeof p, r->fonts, g_fonts[i], 0) || (stat_kind(p, 0, &size), size == 0)) {
-            join(e, sizeof e, r->fonts, g_fonts[i]);
-            return fail(r, DP_MISSING_FONTS, e, "The system font %s is missing from %s (or empty).\n\nThe game needs all 7 shared fonts of "
-                        "the console. Extract them again from your own firmware dump: python3 tools/extract/fw_fonts.py <firmware folder> %s",
-                        g_fonts[i], r->fonts, r->fonts);
-        }
+    const char *font;
+    if (!fonts_complete(r->fonts, &font)) {
+        join(e, sizeof e, r->fonts, font);
+        return fail(r, DP_MISSING_FONTS, e, "The system font %s is missing from %s (or empty).\n\nThe game needs all 7 shared fonts of "
+                    "the console. Extract them again from your own firmware dump: python3 tools/extract/fw_fonts.py <firmware folder> %s",
+                    font, r->fonts, r->fonts);
+    }
     r->status = DP_OK;
     snprintf(r->message, sizeof r->message, "game data: %s (build %s), fonts %s", r->romfs,
              r->warnings & DP_WARN_NO_EXEFS ? "not checked: no exefs/main" : r->found, r->fonts);
@@ -631,16 +654,35 @@ void dp_apply(const dp_result *r) {
  * --data / SSBU_DATA / SSBU_ROMFS, and over what dp_apply exported for the folder that failed (SSBU_ROMFS, SSBU_FONTS found
  * beside it or in the build, SSBU_TZDIR). Fonts the player named himself (--fonts, SSBU_FONTS) are kept unless they were the
  * problem. Without this the next dp_check finds the old folder again and the picker is asked 16 times in vain. */
+static int fonts_dropped(const dp_result *r) {         /* dp_picked drops SSBU_FONTS (2: --fonts too) for this result */
+    if (!r) return 0;
+    if (r->status == DP_MISSING_FONTS) return 2;
+    return r->fonts_source == DP_SRC_DUMP || r->fonts_source == DP_SRC_LAYOUT || r->fonts_source == DP_SRC_CONFIG;
+}
 void dp_picked(const dp_result *r) {
+    int f = fonts_dropped(r);
     dp_set_cli(DP_DATA, NULL);
     unsetenv("SSBU_DATA");
     unsetenv("SSBU_ROMFS");
-    if (r && (r->status == DP_MISSING_FONTS || r->fonts_source == DP_SRC_DUMP || r->fonts_source == DP_SRC_LAYOUT || r->fonts_source == DP_SRC_CONFIG)) {
-        if (r->status == DP_MISSING_FONTS) dp_set_cli(DP_FONTS, NULL);
-        unsetenv("SSBU_FONTS");
-    }
+    if (f == 2) dp_set_cli(DP_FONTS, NULL);
+    if (f) unsetenv("SSBU_FONTS");
     const char *tz = getenv("SSBU_TZDIR");
     if (g_tz_ours[0] && tz && !strcmp(tz, g_tz_ours)) unsetenv("SSBU_TZDIR");
     g_tz_ours[0] = 0;
+}
+/* The picker checks a folder the way boot.c will after dp_picked(was): without the fonts overrides dp_picked drops (the
+ * data overrides do not matter, `dir` is named). Nothing is changed for the caller: --fonts and SSBU_FONTS are restored. */
+int dp_validate_picked(const char *dir, const char *expect, const dp_result *was, dp_result *r) {
+    static char cli[DP_PATH], env[DP_PATH];
+    const char *e = getenv("SSBU_FONTS");
+    int f = fonts_dropped(was), had = e != NULL, ok;
+    snprintf(cli, sizeof cli, "%s", g_cli[DP_FONTS]);
+    snprintf(env, sizeof env, "%s", e ? e : "");
+    if (f == 2) g_cli[DP_FONTS][0] = 0;
+    if (f) unsetenv("SSBU_FONTS");
+    ok = dp_validate(dir, expect, r);
+    snprintf(g_cli[DP_FONTS], sizeof g_cli[DP_FONTS], "%s", cli);
+    if (f && had) setenv("SSBU_FONTS", env, 1);
+    return ok;
 }
 #endif /* !_WIN32 */

@@ -482,8 +482,9 @@ static void check_romfs(void) {
  * launch_defaults exports what it found (SSBU_ROMFS, SSBU_FONTS, SSBU_USERDATA, SSBU_TZDIR: nnfs.c, nnpl.c and nntime.c read
  * them); --check-data prints the result and exits (0, or 9). check_romfs refuses a start that cannot work (no data.arc, no
  * .nrr, a dump of the other game build, no system fonts): the reason on the console and exit code 9 (DP_EXIT_DATA), or, when
- * the run is attended and the picker of WP-U5b is linked (dp_picker_hook), the player chooses a folder and it is checked
- * again. There is no message box: a Linux start without a picker is a console or Steam launch whose log has the reason. */
+ * the run is attended and the picker of WP-U5b is linked (dp_picker_hook, datapicker_sdl.c), the player chooses a folder and
+ * it is checked again. --pick-data / SSBU_PICK_DATA=1 open the picker with usable data too (to change the saved choice).
+ * There is no message box: a Linux start without a picker is a console or Steam launch whose log has the reason. */
 static dp_result g_dp;
 static void launch_defaults(void) {
     dp_check(dp_elf_build(g_elf), &g_dp);
@@ -496,8 +497,15 @@ static void launch_defaults(void) {
 static void check_romfs(void) {
     static const char *const no_data[] = {"SSBU_SDK_SELFTEST", "SSBU_VK_SELFTEST", "SSBU_CXXRT_SELFTEST", "SSBU_MISC_SELFTEST", "SSBU_EH_MAIN_TEST"};
     for (size_t i = 0; i < sizeof no_data / sizeof no_data[0]; i++) if (getenv(no_data[i])) return;
-    for (int asked = 0; g_dp.status != DP_OK; asked++) {
-        if (dp_unattended() || !dp_picker_hook || asked == 16 || !dp_picker_hook(&g_dp)) {
+    int pick = dp_pick_requested();                   /* --pick-data / SSBU_PICK_DATA=1: the picker opens with usable data too */
+    for (int asked = 0; g_dp.status != DP_OK || pick; asked++) {
+        int h = !dp_unattended() && dp_picker_hook && asked < 16 ? dp_picker_hook(&g_dp) : 0;
+        pick = 0;
+        if (h <= 0 && g_dp.status == DP_OK) {          /* usable data: start with them, unless the player quit */
+            if (h < 0) { printf("game data: the player quit in the data picker\n"); exit(0); }
+            break;
+        }
+        if (h <= 0) {
             printf("\n%s\n", g_dp.message);
             fprintf(stderr, "%s\n", g_dp.message);
             exit(DP_EXIT_DATA);

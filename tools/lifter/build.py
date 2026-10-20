@@ -32,8 +32,8 @@ if plat.LINUX:
     LINUX_HOST_SKIP = ['nnmovie_mf.c', 'loose_host.c']
     # plat_posix.c / vmem.c / fiber_aarch64.S / plat_crash.c: the Win32 subset of plat.h, the guest address space, the fiber switch, the crash handler, low-heap malloc policy (must stay in the exe: .preinit_array).
     # hostpath.c: the Win32 file calls of nnfs.c / nnfsdir.c over POSIX, case-insensitive paths, host_exe_dir (also used by nvn_vk_posix.h).
-    # datapaths.c: where the player's own game data are (--data, SSBU_DATA, the saved choice) and whether they are usable (boot.c, nnmisc.c).
-    LINUX_HOST_ADD = ['plat_posix.c', 'vmem.c', 'fiber_aarch64.S', 'plat_crash.c', 'plat_heap.c', 'hostpath.c', 'datapaths.c']
+    # datapaths.c: where the player's own game data are (--data, SSBU_DATA, the saved choice) and whether they are usable (boot.c, nnmisc.c); datapicker*.c: the in-game picker for them.
+    LINUX_HOST_ADD = ['plat_posix.c', 'vmem.c', 'fiber_aarch64.S', 'plat_crash.c', 'plat_heap.c', 'hostpath.c', 'datapaths.c', 'datapicker.c', 'datapicker_sdl.c']
     _skip = set(LINUX_HOST_SKIP + [x for x in os.environ.get('RECOMP_HOST_SKIP', '').split(',') if x])
     HOST_SOURCES = [x for x in HOST_SOURCES if x not in _skip] + [x for x in LINUX_HOST_ADD + os.environ.get('RECOMP_HOST_ADD', '').split(',')
                                                                   if x and x not in HOST_SOURCES]

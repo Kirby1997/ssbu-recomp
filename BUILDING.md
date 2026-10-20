@@ -237,6 +237,12 @@ passes every option through. The runtime finds your game data itself (`runtime/d
 `<dump>/sysdata/fonts`, else `build/linux-arm64/sysdata/fonts`. DLC: `--dlc`, `SSBU_DLC_LIST` or `dlc=` (a `dlc.txt`, or the folder
 of your DLC dumps), else `build/linux-arm64/config/dlc.txt`, else `~/.config/ssbu-recomp/dlc.txt`. Saves: `--userdata`,
 `SSBU_USERDATA`, `userdata=`, else `build/linux-arm64/userdata` if it exists, else `~/.local/share/ssbu-recomp/userdata`.
-`--check-data` prints what was found and exits; a start whose data are missing or unusable (no `data.arc`, no `.nrr`, a dump of
-the other game build than the one built, missing fonts) prints the reason and exits with code 9. On Linux `scripts/install.py`
-is not used (it is the Windows installer).
+`--check-data` prints what was found and exits. When the data are missing or unusable (no `data.arc`, no `.nrr`, a dump of the
+other game build than the one built, missing fonts), the game shows its own picker before the game window opens
+(`runtime/datapicker.c`): the reason, then a folder browser for controller, keyboard or mouse (A = the right face button opens,
+B goes up, X uses the folder shown, Y lists places such as the SD card and USB drives); in Desktop Mode the system folder dialog is
+offered first. The folder chosen is checked and saved as `data=` (and `fonts=` when only the fonts were missing) and wins over
+`--data` / `SSBU_DATA` for that start; at the next start those win again, so take them out of the launch options. To change it
+later, start once with `--pick-data` (Steam: launch options `%command% --pick-data`, or `SSBU_PICK_DATA=1 %command%`). Runs
+without a display or with `SSBU_SHOW=0`, and scripted runs (`SSBU_SEQ`, `SSBU_ERROR_DIALOG=0`, ...), print the reason and exit
+with code 9 instead. On Linux `scripts/install.py` is not used (it is the Windows installer).

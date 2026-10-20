@@ -33,7 +33,7 @@ const int sdk_data_count = 0;
 void cxxrt_install_data(void) { }
 int nnhid_pad_selftest(void) { return 0; }
 int nnpad_tool(int argc, char **argv) { (void)argc; (void)argv; return -1; }
-static int g_hook_calls, g_hook_mode;           /* 0 give up, 1 choose the good dump, 2 say "chosen" without changing anything */
+static int g_hook_calls, g_hook_mode;           /* 0 give up, 1 choose the good dump, 2 say "chosen" without changing anything, 3 quit */
 static char g_dump[1024];
 void runtime_init(const char *elf, const char *trace) {          /* boot.c got past check_romfs: say what it set up, stop */
     (void)trace;
@@ -557,6 +557,7 @@ static int hook(const dp_result *r) {
     g_hook_calls++;
     printf("HOOK %d status=%s\n", g_hook_calls, dp_status_name(r->status));
     if (g_hook_mode == 1) return dp_save_choice(g_dump) == 0;
+    if (g_hook_mode == 3) return -1;
     return g_hook_mode == 2;
 }
 /* boot.c's main in a child: stdout to a file; returns the exit code, *out = what it printed */
@@ -676,6 +677,33 @@ static void t_boot(void) {
     CHECK(boot_child(&o, 1, (char *[]){"ssbu_native", e4, NULL}) == 42);
     HAS(o, "hooks=1");
     unsetenv("SSBU_DATA");
+    SECTION("boot --pick-data / SSBU_PICK_DATA=1: the picker opens with usable data too; keep -> runs, quit -> 0, chosen -> checked");
+    fresh();
+    CHECK(boot_child(&o, 0, (char *[]){"ssbu_native", e4, "--pick-data", "--data", g_dump, NULL}) == 42);
+    HAS(o, "HOOK 1 status=ok"); HAS(o, "hooks=1"); HAS(o, "argc=2"); HAS(o, "(command line)");
+    CHECK(boot_child(&o, 3, (char *[]){"ssbu_native", e4, "--pick-data", "--data", g_dump, NULL}) == 0);
+    HAS(o, "HOOK 1 status=ok"); HAS(o, "the player quit in the data picker"); CHECK(!strstr(o, "RUNTIME_INIT"));
+    make_dump(bad, 0x39c7e90);
+    CHECK(boot_child(&o, 1, (char *[]){"ssbu_native", e4, "--pick-data", "--data", bad, NULL}) == 42);   /* the pick wins over --data */
+    HAS(o, "hooks=1"); HAS(o, "(saved choice)");
+    snprintf(want, sizeof want, "romfs=%s/romfs", g_dump);
+    HAS(o, want);
+    setenv("SSBU_PICK_DATA", "1", 1);
+    CHECK(boot_child(&o, 0, (char *[]){"ssbu_native", e4, NULL}) == 42);
+    HAS(o, "HOOK 1 status=ok"); HAS(o, "hooks=1");
+    setenv("SSBU_PICK_DATA", "0", 1);
+    CHECK(boot_child(&o, 0, (char *[]){"ssbu_native", e4, NULL}) == 42);
+    CHECK(!strstr(o, "HOOK"));
+    unsetenv("SSBU_PICK_DATA");
+    setenv("SSBU_SEQ", "A 1", 1);                   /* unattended: --pick-data is ignored, the game starts */
+    CHECK(boot_child(&o, 3, (char *[]){"ssbu_native", e4, "--pick-data", NULL}) == 42);
+    CHECK(!strstr(o, "HOOK"));
+    unsetenv("SSBU_SEQ");
+    CHECK(boot_child(&o, -1, (char *[]){"ssbu_native", e4, "--pick-data", NULL}) == 42);     /* no picker linked: starts */
+    SECTION("boot: unusable data, the player quits in the picker -> 9 with the reason");
+    fresh();
+    CHECK(boot_child(&o, 3, (char *[]){"ssbu_native", e4, NULL}) == DP_EXIT_DATA);
+    HAS(o, "HOOK 1"); CHECK(!strstr(o, "HOOK 2")); HAS(o, "No game data folder is set");
     SECTION("boot --check-data: the userdata source as found (not the SSBU_USERDATA boot exports), nothing created");
     fresh();
     CHECK(boot_child(&o, -1, (char *[]){"ssbu_native", "--data", g_dump, e4, "--check-data", NULL}) == 0);
