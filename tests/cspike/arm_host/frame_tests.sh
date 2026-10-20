@@ -3,6 +3,9 @@
 #   sh frame_tests.sh [fp random pairs] [litmus iterations per thread] [x86 soft-hash file]
 # Exit status 0 only if everything passed.
 cd "$(dirname "$0")" || exit 2
+# Frame safety caps: bound the user's process count (litmus is multithreaded) and every test binary's run time
+ulimit -u $(( $(ps -eLf --no-headers -u "$(id -un)" | wc -l) + 300 ))
+TMO="timeout ${TEST_TIMEOUT:-600}"
 PAIRS=${1:-20000000}
 ITERS=${2:-1000000}
 X86HASH=${3:-}
@@ -60,7 +63,7 @@ done
 for CC in gcc clang; do
     if $CC $CFLAGS litmus.c -o litmus_$CC -lpthread; then
         echo "---- litmus ($CC, $ITERS iterations, 8 threads)"
-        if ./litmus_$CC "$ITERS" 8; then pass "litmus $CC"; else fail "litmus $CC"; fi
+        if $TMO ./litmus_$CC "$ITERS" 8; then pass "litmus $CC"; else fail "litmus $CC"; fi
     else fail "compile litmus.c ($CC)"; fi
 done
 
@@ -69,7 +72,7 @@ for CC in gcc clang; do
     if $CC $CFLAGS fp_native_test.c -o fp_native_$CC -lm -lpthread; then
         echo "---- fp ($CC, $PAIRS random pairs)"
         EX=""; [ "$CC" = gcc ] && EX=--exhaustive
-        ./fp_native_$CC "$PAIRS" $EX > fp_$CC.out; st=$?
+        $TMO ./fp_native_$CC "$PAIRS" $EX > fp_$CC.out; st=$?
         cat fp_$CC.out
         if [ $st -eq 0 ]; then pass "fp $CC"; else fail "fp $CC"; fi
     else fail "compile fp_native_test.c ($CC)"; fi
@@ -77,7 +80,7 @@ done
 for CC in gcc clang; do
     if $CC $CFLAGS neon_native_test.c -o neon_native_$CC -lm; then
         echo "---- neon native vs portable ($CC)"
-        if ./neon_native_$CC 200000; then pass "neon $CC"; else fail "neon $CC"; fi
+        if $TMO ./neon_native_$CC 200000; then pass "neon $CC"; else fail "neon $CC"; fi
     else fail "compile neon_native_test.c ($CC)"; fi
 done
 if [ -n "$X86HASH" ] && [ -f "$X86HASH" ]; then
