@@ -229,3 +229,14 @@ Output in `build/linux-arm64/work`: `ssbu_native`, `libssbu_game_eh_o1.so` (the 
 finds them through `RPATH=$ORIGIN`. All code is built with `-ffp-contract=off -fno-math-errno -fno-omit-frame-pointer -march=armv8.2-a+lse`;
 shared objects with `-fPIC -fvisibility=hidden -fno-semantic-interposition`, modules with `-Wl,-Bsymbolic`. Run:
 `python3 scripts/run.py --build build/linux-arm64 --userdata <folder>`; from ssh set `WAYLAND_DISPLAY=gamescope-0` (or `DISPLAY=:0`).
+
+Or `scripts/play-linux.sh [--data <dump folder>]` (`--help`): it starts `build/linux-arm64/work/ssbu_native` from its folder and
+passes every option through. The runtime finds your game data itself (`runtime/datapaths.c`), first found wins: `--data <folder>`
+(the folder `tools/extract/dump_folder.py` makes, or its `romfs/`), `SSBU_DATA` / `SSBU_ROMFS`, `data=<folder>` in
+`~/.config/ssbu-recomp/config`, then the build's own `state.json` / `../romfs`. Fonts: `--fonts`, `SSBU_FONTS`, `fonts=`, else
+`<dump>/sysdata/fonts`, else `build/linux-arm64/sysdata/fonts`. DLC: `--dlc`, `SSBU_DLC_LIST` or `dlc=` (a `dlc.txt`, or the folder
+of your DLC dumps), else `build/linux-arm64/config/dlc.txt`, else `~/.config/ssbu-recomp/dlc.txt`. Saves: `--userdata`,
+`SSBU_USERDATA`, `userdata=`, else `build/linux-arm64/userdata` if it exists, else `~/.local/share/ssbu-recomp/userdata`.
+`--check-data` prints what was found and exits; a start whose data are missing or unusable (no `data.arc`, no `.nrr`, a dump of
+the other game build than the one built, missing fonts) prints the reason and exits with code 9. On Linux `scripts/install.py`
+is not used (it is the Windows installer).

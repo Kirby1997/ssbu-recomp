@@ -684,6 +684,8 @@ def how_to_run(cx):
     say('  python scripts/run.py %s--userdata <a folder for your saves> [--seconds 0]' % ('--build %s ' % os.path.relpath(cx.build, REPO) if cx.linux else ''))
     if cx.linux:
         say('or by hand:   cd %s && ./%s ../binaries/%s/main.elf 0' % (os.path.relpath(cx.work), cx.exe, cx.state.get('game_version', '13.0.4')))
+        say('or:           scripts/play-linux.sh%s [--data <dump folder>]   (or SSBU_DATA, or data=<folder> in ~/.config/ssbu-recomp/config;'
+            ' --check-data shows what is found)' % ('' if os.path.normpath(cx.build) == os.path.join(REPO, 'build', 'linux-arm64') else ' --build %s' % cx.build))
     else:
         say('or by hand:   cd build\\work   and run   %s ..\\binaries\\%s\\main.elf 0' % (EXE, cx.state.get('game_version', '13.0.4')))
     say('with the environment variables SSBU_ROMFS=%s  SSBU_USERDATA=<saves>  (options: BUILDING.md)' % d.get('romfs', '<romfs>'))

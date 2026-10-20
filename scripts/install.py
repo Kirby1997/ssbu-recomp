@@ -215,6 +215,11 @@ def main():
     ap.add_argument('--jobs', type=int)
     ap.add_argument('--prepare-only', action='store_true', help='stop before the build (steps 1-3 only)')
     a = ap.parse_args()
+    if os.name != 'nt':        # MSVC, the LLVM installer, vswhere, winget: Windows only. Linux has its own three commands.
+        sys.exit('install.py is the Windows installer. On Linux / the Steam Frame (BUILDING.md, "Linux / Steam Frame"):\n'
+                 '  python3 tools/extract/dump_folder.py <base .xci/.nsp> <update .nsp> <dump folder> --firmware <firmware folder>\n'
+                 '  python3 scripts/setup.py --target linux-arm64 --dump <dump folder>\n'
+                 '  scripts/play-linux.sh --data <dump folder>')
     step_packages()
     ask_files(a)
     dump = step_dump(a)
