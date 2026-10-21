@@ -638,6 +638,31 @@ UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
     ww_protect(lo, hi - lo);
     return 0;
 }
+#if defined(__aarch64__)
+/* aarch64 hosts (48-bit VA): mmap(NULL) hands out the top-down area at 0xffff_xxxx_xxxx, above the 2^47 a Windows process (and
+ * the guest's 47-bit pointers) never saw. VirtualAlloc(NULL) is placed instead from just above the guest's fixed addresses
+ * (image 0x71_0000_0000 and the NRO/rollback ranges below 0x76_0000_0000) upward, below 2^47: a bump cursor probed with
+ * MAP_FIXED_NOREPLACE (no extra syscall in the common case), wrapping at 2^47 so released ranges get reused. Called with
+ * g_vm_lock held. Returns MAP_FAILED when nothing below 2^47 is free: never a pointer above it. */
+#define LOW_START 0x7600000000ULL
+#define LOW_END   0x800000000000ULL
+static uintptr_t g_low_cursor = LOW_START;
+static void *low_place(size_t n, int prot, int flags) {
+    size_t step = (n + 0xffff) & ~(size_t)0xffff;
+    uintptr_t at = g_low_cursor;
+    for (int tries = 0; tries < 4096; tries++) {
+        if (at + n > LOW_END || at < LOW_START) at = LOW_START;
+        void *p = mmap((void *)at, n, prot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED && (uintptr_t)p == at) { g_low_cursor = at + step; return p; }
+        if (p != MAP_FAILED) munmap(p, n);          /* kernel without MAP_FIXED_NOREPLACE put it elsewhere */
+        else if (errno != EEXIST) return MAP_FAILED;
+        at += tries < 64 ? step : 1ULL << 30;       /* step past what is there, then jump by 1 GiB */
+        at &= ~(uintptr_t)0xffff;
+    }
+    errno = ENOMEM;
+    return MAP_FAILED;
+}
+#endif
 /* MEM_RESERVE maps the range PROT_NONE (address space only) and MEM_COMMIT is an mprotect; reservations start on 64 KB, the
  * Windows allocation granularity. Decommit (VirtualFree MEM_DECOMMIT) drops the pages, so a new commit reads zeros as on Windows. */
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
@@ -651,6 +676,9 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
         void *p;
         if (addr) p = mmap((void *)lo, n, commit ? prot_posix(prot) : PROT_NONE, flags | MAP_FIXED_NOREPLACE, -1, 0);
+#if defined(__aarch64__)
+        else p = low_place(n, commit ? prot_posix(prot) : PROT_NONE, flags);
+#else
         else {
             /* 64 KB alignment: over-allocate and trim */
             p = mmap(NULL, n + 0x10000, commit ? prot_posix(prot) : PROT_NONE, flags, -1, 0);
@@ -661,6 +689,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
                 p = (void *)al;
             }
         }
+#endif
         if (p == MAP_FAILED || (addr && (uintptr_t)p != lo)) {
             if (p != MAP_FAILED) munmap(p, n);
             pthread_mutex_unlock(&g_vm_lock);

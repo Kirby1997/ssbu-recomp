@@ -183,7 +183,7 @@ if TARGET_LINUX:
     HOST_FLAGS = HOST_FLAGS[:_sdl_inc] + HOST_FLAGS[_sdl_inc + 2:] + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags')
     # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Not in the Linux build yet: online play
     # (net_relay.c: Winsock extensions, COM UPnP; net_off.c answers "off", as with SSBU_ONLINE unset)
-    HOST_SOURCES = [n for n in HOST_SOURCES if n != 'net_relay.c'] + ['plat_posix.c', 'plat_mf.c', 'net_off.c']
+    HOST_SOURCES = [n for n in HOST_SOURCES if n != 'net_relay.c'] + ['plat_posix.c', 'plat_mf.c', 'net_off.c'] + (['plat_heap.c'] if TARGET_ARM64 else [])      # plat_heap.c (C3): arm64 only, the C heap below 2^47 (needs the -no-pie link below); x86 builds are unchanged
     LIBS = pkg('--libs') + ['-lGL', '-lm', '-ldl', '-lpthread']      # libGL: the OpenGL front end is linked (not used)
     HAVE_IMGUI, CXX_SOURCES = False, []                  # the settings menu (menu.cpp) is Win32 + D3D: menu_stub.c on Linux for now
 
