@@ -1,5 +1,0 @@
-Copies of linux-arm64's tests/arm_host (lifter memory-ordering decoder test + litmus harness), run here against UPSTREAM's
-tools/lifter/recomp.py and runtime/runtime.h to measure the ordering gap. test_lifter_atomics.py gained a synthetic
-main.elf stand-in (upstream's recomp.py reads one at import; no game data). No changes to upstream's lifter.
-  python3 test_lifter_atomics.py                    decoder cases (expectations = our c730816 lowering)
-  python3 test_lifter_atomics.py --gen litmus_gen.h ; cc -O1 -I../../../runtime -I. litmus.c -lpthread   (on the Frame)
