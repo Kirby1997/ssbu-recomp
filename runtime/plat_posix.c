@@ -958,7 +958,7 @@ void *_aligned_realloc(void *p, size_t size, size_t align) {
     _aligned_free(p);
     return q;
 }
-/* Paths: '\\' becomes '/'. File names are case-sensitive here, unlike Windows (FindFirstFile patterns still match either case). */
+/* Paths: '\\' becomes '/'. The file system's names are case-sensitive; the file calls below fall back to a case-insensitive lookup (plat_ci_*) when the exact path is missing. */
 const char *plat_path(const char *in, char *out, size_t n) {
     size_t i = 0;
     for (; in[i] && i + 1 < n; i++) out[i] = in[i] == '\\' ? '/' : in[i];
@@ -966,6 +966,158 @@ const char *plat_path(const char *in, char *out, size_t n) {
     return out;
 }
 #define P(in, buf) plat_path((in), (buf), sizeof (buf))
+/* ---- Case-insensitive lookup (Windows paths are; romfs, mods and saves moved from Windows keep their case). Used only when the
+ * path as given does not exist: reads try the plain call first (a correct-case path costs no extra syscall); calls that create
+ * look first, so an existing file in another case is opened rather than shadowed by a new one. plat_ci_fix rewrites a path in
+ * place, component by component, to the names as stored. ASCII folding only. A name present in two cases resolves to the
+ * exact match first, else the first in upper-case order. Folder listings are cached while the folder's dev/inode/mtime are
+ * unchanged and the mtime is older than 2 s (a coarse timestamp cannot hide a change), so a create, rename or delete (ours or
+ * anyone's) is seen by the next lookup. The cache lock guards the table only; a folder is read with no lock held. */
+static int ci_cmp(const char *a, const char *b) {
+    for (;; a++, b++) {
+        unsigned ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (!ca) return 0;
+    }
+}
+static int ci_order(const void *x, const void *y) { const char *a = *(const char *const *)x, *b = *(const char *const *)y; int r = ci_cmp(a, b); return r ? r : strcmp(a, b); }
+typedef struct CiDir { struct CiDir *next; char *path; dev_t dev; ino_t ino; struct timespec mtime; int n; char **names; } CiDir;
+#define CI_BUCKETS 256
+#define CI_MAX 2048
+static CiDir *g_ci[CI_BUCKETS];
+static int g_ci_count;
+static pthread_mutex_t g_ci_mu = PTHREAD_MUTEX_INITIALIZER;
+static void ci_free(CiDir *d) { if (d) { free(d->names); free(d->path); free(d); } }
+static CiDir *ci_read(const char *dir, const struct stat *st) {      /* names live in the same block as the array */
+    DIR *dh = opendir(dir);
+    if (!dh) return NULL;
+    size_t cap = 64, n = 0, bytes = 0, bcap = 4096;
+    uintptr_t *off = malloc(cap * sizeof *off);
+    char *pool = malloc(bcap);
+    struct dirent *de;
+    while ((de = readdir(dh)) != NULL) {
+        size_t l = strlen(de->d_name) + 1;
+        if (n == cap) off = realloc(off, (cap *= 2) * sizeof *off);
+        while (bytes + l > bcap) pool = realloc(pool, bcap *= 2);
+        memcpy(pool + bytes, de->d_name, l);
+        off[n++] = bytes; bytes += l;
+    }
+    closedir(dh);
+    CiDir *d = calloc(1, sizeof *d);
+    d->names = malloc(n * sizeof(char *) + bytes + 1);
+    char *block = (char *)(d->names + n);
+    memcpy(block, pool, bytes);
+    for (size_t i = 0; i < n; i++) d->names[i] = block + off[i];
+    free(off); free(pool);
+    d->n = (int)n;
+    qsort(d->names, n, sizeof(char *), ci_order);
+    d->path = strdup(dir);
+    d->dev = st->st_dev; d->ino = st->st_ino; d->mtime = st->st_mtim;
+    return d;
+}
+static int ci_find(const CiDir *d, const char *name, char *real) {   /* in memory: leftmost entry equal ignoring case, exact match preferred */
+    int lo = 0, hi = d->n - 1, at = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2, r = ci_cmp(d->names[mid], name);
+        if (r < 0) lo = mid + 1; else { if (!r) at = mid; hi = mid - 1; }
+    }
+    if (at < 0) return 0;
+    int pick = at;
+    for (int i = at; i < d->n && !ci_cmp(d->names[i], name); i++) if (!strcmp(d->names[i], name)) { pick = i; break; }
+    strcpy(real, d->names[pick]);
+    return 1;
+}
+static int ci_lookup(const char *dir, const char *name, char *real) {
+    struct stat st;
+    if (stat(dir, &st) || !S_ISDIR(st.st_mode)) return 0;
+    unsigned h = 2166136261u;
+    for (const char *s = dir; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    h &= CI_BUCKETS - 1;
+    pthread_mutex_lock(&g_ci_mu);
+    CiDir **pp = &g_ci[h], *d = NULL;
+    for (; *pp; pp = &(*pp)->next) if (!strcmp((*pp)->path, dir)) { d = *pp; break; }
+    if (d && d->dev == st.st_dev && d->ino == st.st_ino && d->mtime.tv_sec == st.st_mtim.tv_sec && d->mtime.tv_nsec == st.st_mtim.tv_nsec) {
+        int r = ci_find(d, name, real);
+        pthread_mutex_unlock(&g_ci_mu);
+        return r;
+    }
+    if (d) { *pp = d->next; ci_free(d); g_ci_count--; }       /* changed: drop it */
+    pthread_mutex_unlock(&g_ci_mu);
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    CiDir *own = ci_read(dir, &st);                            /* the disk read holds no lock */
+    if (!own) return 0;
+    int r = ci_find(own, name, real);
+    if (now.tv_sec - st.st_mtim.tv_sec > 2) {                  /* stable folder: keep the listing */
+        pthread_mutex_lock(&g_ci_mu);
+        if (g_ci_count >= CI_MAX) {
+            for (int i = 0; i < CI_BUCKETS; i++) while (g_ci[i]) { CiDir *x = g_ci[i]; g_ci[i] = x->next; ci_free(x); }
+            g_ci_count = 0;
+        }
+        own->next = g_ci[h]; g_ci[h] = own; g_ci_count++;
+        pthread_mutex_unlock(&g_ci_mu);
+    } else ci_free(own);
+    return r;
+}
+/* Rewrites `out` (a '/' path) to the stored case, as far as it exists. 1 = the result exists. */
+static int plat_ci_fix(char *out) {
+    struct stat st;
+    size_t len = strlen(out);
+    while (len > 1 && out[len - 1] == '/') out[--len] = 0;
+    if (!len) return 0;
+    if (stat(out, &st) == 0) return 1;
+    if (errno != ENOENT && errno != ENOTDIR) return 0;
+    size_t start = 0;                                          /* first byte after the deepest existing folder */
+    for (size_t i = len; i-- > 0;) {
+        if (out[i] != '/') continue;
+        if (i == 0) { start = 1; break; }
+        out[i] = 0;
+        int ok = stat(out, &st) == 0 && S_ISDIR(st.st_mode);
+        out[i] = '/';
+        if (ok) { start = i + 1; break; }
+    }
+    char *p = out + start, name[NAME_MAX + 1], real[NAME_MAX + 1];
+    while (*p) {
+        char *e = strchr(p, '/');
+        size_t cl = e ? (size_t)(e - p) : strlen(p);
+        if (cl && !(cl == 1 && p[0] == '.') && !(cl == 2 && p[0] == '.' && p[1] == '.')) {
+            if (cl > NAME_MAX) { errno = ENAMETOOLONG; return 0; }
+            memcpy(name, p, cl); name[cl] = 0;
+            int ok;
+            if (p == out) ok = ci_lookup(".", name, real);
+            else if (p == out + 1 && out[0] == '/') ok = ci_lookup("/", name, real);
+            else { p[-1] = 0; ok = ci_lookup(out, name, real); p[-1] = '/'; }
+            if (!ok) { errno = ENOENT; return 0; }
+            memcpy(p, real, cl);
+        }
+        p += cl;
+        if (*p == '/') p++;
+    }
+    return stat(out, &st) == 0;
+}
+/* After a plain call on `b` failed with ENOENT/ENOTDIR: 1 = b now names an existing file in another case, so retry. errno is kept otherwise. */
+static int plat_ci_retry(char *b) {
+    int e = errno;
+    if (e != ENOENT && e != ENOTDIR) return 0;
+    char t[PATH_MAX];
+    snprintf(t, sizeof t, "%s", b);
+    if (plat_ci_fix(t) && strcmp(t, b)) { strcpy(b, t); return 1; }
+    errno = e;
+    return 0;
+}
+/* Before a call that creates: the folders (and the file, if it exists) get their stored case; the missing tail is kept as given. */
+static void plat_ci_pre(char *b) {
+    struct stat st;
+    if (stat(b, &st) == 0) return;
+    char t[PATH_MAX];
+    snprintf(t, sizeof t, "%s", b);
+    int e = errno;
+    plat_ci_fix(t);
+    strcpy(b, t);
+    errno = e;
+}
 /* Opening a file: as plat_path, and Windows' null device NUL (any case; nnhid.c's pad self-test sets SSBU_REC=NUL) is
  * /dev/null rather than a file named NUL in the current directory. Only where files are opened: removing, renaming or
  * making a directory "NUL" is left alone. 1 = mapped to /dev/null. */
@@ -974,7 +1126,14 @@ static int plat_open_path(const char *in, char *out, size_t n) {
     plat_path(in, out, n);
     return 0;
 }
-FILE *plat_fopen(const char *path, const char *mode) { char b[PATH_MAX]; plat_open_path(path, b, sizeof b); return fopen(b, mode); }
+FILE *plat_fopen(const char *path, const char *mode) {
+    char b[PATH_MAX];
+    if (plat_open_path(path, b, sizeof b)) return fopen(b, mode);
+    if (strpbrk(mode, "wa+")) plat_ci_pre(b);            /* creating or truncating: look before, so the existing file is the one written */
+    FILE *f = fopen(b, mode);
+    if (!f && plat_ci_retry(b)) f = fopen(b, mode);
+    return f;
+}
 int plat_remove(const char *path) { char b[PATH_MAX]; return remove(P(path, b)); }
 int plat_rename(const char *a, const char *b) { char x[PATH_MAX], y[PATH_MAX]; return rename(P(a, x), P(b, y)); }
 char *_fullpath(char *out, const char *path, size_t n) {
@@ -1002,8 +1161,11 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *
     case TRUNCATE_EXISTING: of |= O_TRUNC; break;
     default: break;
     }
-    if (plat_open_path(path, b, sizeof b)) of &= ~O_EXCL;     /* NUL: the device exists, CREATE_NEW opens it as on Windows */
+    int nul = plat_open_path(path, b, sizeof b);
+    if (nul) of &= ~O_EXCL;                           /* NUL: the device exists, CREATE_NEW opens it as on Windows */
+    else if (of & O_CREAT) plat_ci_pre(b);            /* creating: an existing file in another case is the one opened (CREATE_NEW then fails as it exists) */
     int fd = open(b, of | O_CLOEXEC, 0666);
+    if (fd < 0 && !nul && plat_ci_retry(b)) fd = open(b, of | O_CLOEXEC, 0666);
     if (fd < 0 && errno == EISDIR && !(access & GENERIC_WRITE)) fd = open(b, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) { fail_errno(); return INVALID_HANDLE_VALUE; }
     if (flags & FILE_FLAG_SEQUENTIAL_SCAN) posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
@@ -1062,14 +1224,20 @@ static DWORD attrs_of(const struct stat *st, const char *name) {
     if (name && name[0] == '.' && name[1] && strcmp(name, "..")) a |= FILE_ATTRIBUTE_HIDDEN;
     return a;
 }
-DWORD GetFileAttributesA(LPCSTR path) { char b[PATH_MAX]; struct stat st; if (stat(P(path, b), &st)) { fail_errno(); return INVALID_FILE_ATTRIBUTES; } return attrs_of(&st, NULL); }
+DWORD GetFileAttributesA(LPCSTR path) {
+    char b[PATH_MAX]; struct stat st;
+    P(path, b);
+    if (stat(b, &st) && !(plat_ci_retry(b) && !stat(b, &st))) { fail_errno(); return INVALID_FILE_ATTRIBUTES; }
+    return attrs_of(&st, NULL);
+}
 static void st_times(const struct stat *st, FILETIME *c, FILETIME *a, FILETIME *w) {
     ft_set(c, ts_to_ft(&st->st_ctim)); ft_set(a, ts_to_ft(&st->st_atim)); ft_set(w, ts_to_ft(&st->st_mtim));
 }
 BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS lvl, LPVOID out) {
     (void)lvl;
     char b[PATH_MAX]; struct stat st;
-    if (stat(P(path, b), &st)) return fail_errno();
+    P(path, b);
+    if (stat(b, &st) && !(plat_ci_retry(b) && !stat(b, &st))) return fail_errno();
     WIN32_FILE_ATTRIBUTE_DATA *d = out;
     d->dwFileAttributes = attrs_of(&st, NULL);
     st_times(&st, &d->ftCreationTime, &d->ftLastAccessTime, &d->ftLastWriteTime);
@@ -1077,22 +1245,37 @@ BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS lvl, LPVOID out) {
     return TRUE;
 }
 BOOL SetFileAttributesA(LPCSTR path, DWORD attr) { (void)path; (void)attr; return TRUE; }      /* no attributes kept; a file's own mode never stops its deletion here (nnfs.c clears read-only for that) */
-BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; char b[PATH_MAX]; return mkdir(P(path, b), 0777) ? fail_errno() : TRUE; }
-BOOL RemoveDirectoryA(LPCSTR path) { char b[PATH_MAX]; return rmdir(P(path, b)) ? fail_errno() : TRUE; }
-BOOL DeleteFileA(LPCSTR path) { char b[PATH_MAX]; return unlink(P(path, b)) ? fail_errno() : TRUE; }
+BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; char b[PATH_MAX]; P(path, b); plat_ci_pre(b); return mkdir(b, 0777) ? fail_errno() : TRUE; }
+BOOL RemoveDirectoryA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (rmdir(b) && !(plat_ci_retry(b) && !rmdir(b))) return fail_errno(); return TRUE; }
+BOOL DeleteFileA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (unlink(b) && !(plat_ci_retry(b) && !unlink(b))) return fail_errno(); return TRUE; }
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {      /* rename() replaces the target in one step, as MOVEFILE_REPLACE_EXISTING does */
     char a[PATH_MAX], b[PATH_MAX];
     P(from, a); P(to, b);
+    struct stat st;
+    if (lstat(a, &st) && plat_ci_retry(a)) {}
+    plat_ci_pre(b);                                      /* the target's folders and, if it exists, its stored name */
     if (!(flags & MOVEFILE_REPLACE_EXISTING) && !access(b, F_OK)) { t_lasterr = ERROR_ALREADY_EXISTS; return FALSE; }
+    if (flags & MOVEFILE_WRITE_THROUGH) {                /* the data first: the new name must never reach the disk before it */
+        int fd = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0) { if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fsync(fd)) { int e = errno; close(fd); errno = e; return fail_errno(); } close(fd); }
+    }
     if (rename(a, b)) return fail_errno();
-    if (flags & MOVEFILE_WRITE_THROUGH) {                /* the file and the folder entry on disk before returning */
-        int fd = open(b, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) { fsync(fd); close(fd); }
-        char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%s", b);
-        char *sl = strrchr(dir, '/');
-        if (sl) { *sl = 0; fd = open(sl == dir ? "/" : dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC); }
-        else fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0) { fsync(fd); close(fd); }
+    if (flags & MOVEFILE_WRITE_THROUGH) {                /* then both folder entries on disk before returning */
+        char da[PATH_MAX], db[PATH_MAX];
+        const char *p[2] = {b, a};
+        char *d[2] = {db, da};
+        for (int k = 0; k < 2; k++) {
+            snprintf(d[k], PATH_MAX, "%s", p[k]);
+            char *sl = strrchr(d[k], '/');
+            if (!sl) strcpy(d[k], "."); else if (sl == d[k]) d[k][1] = 0; else *sl = 0;
+        }
+        for (int k = 0; k < 2; k++) {
+            if (k && !strcmp(da, db)) break;
+            int fd = open(d[k], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (fd < 0) return fail_errno();
+            int r = fsync(fd); int e = errno; close(fd);
+            if (r) { errno = e; return fail_errno(); }
+        }
     }
     return TRUE;
 }
@@ -1154,6 +1337,7 @@ HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd) {
     else { snprintf(o->dir_path, sizeof o->dir_path, "."); snprintf(o->pattern, sizeof o->pattern, "%s", b); }
     if (!strcmp(o->pattern, "*.*")) snprintf(o->pattern, sizeof o->pattern, "*");
     o->dir = opendir(o->dir_path);
+    if (!o->dir && plat_ci_retry(o->dir_path)) o->dir = opendir(o->dir_path);
     if (!o->dir) { fail_errno(); if (t_lasterr == ERROR_FILE_NOT_FOUND) t_lasterr = ERROR_PATH_NOT_FOUND; obj_release(o); return INVALID_HANDLE_VALUE; }
     if (!find_next(o, fd)) { obj_release(o); t_lasterr = ERROR_FILE_NOT_FOUND; return INVALID_HANDLE_VALUE; }
     return o;
