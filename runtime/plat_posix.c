@@ -1097,6 +1097,49 @@ static int plat_ci_fix(char *out) {
     }
     return stat(out, &st) == 0;
 }
+/* host_path_resolve (datapaths.c, C10): `in` -> `out`: '\\' becomes '/', existing components get their stored case, the missing tail is kept. 1 = it exists. */
+int host_path_resolve(const char *in, char *out, size_t n) {
+    char t[PATH_MAX];
+    plat_path(in, t, sizeof t);
+    int ok = plat_ci_fix(t);
+    snprintf(out, n, "%s", t);
+    return ok;
+}
+/* host_make_parents / host_fsync_parent (datapaths.c, C10): the folders above `path` (0 or -errno); fsync of the folder holding `path`. */
+int host_make_parents(const char *path) {
+    char rp[PATH_MAX];
+    struct stat st;
+    host_path_resolve(path, rp, sizeof rp);
+    char *s = strrchr(rp, '/');
+    if (!s || s == rp) return 0;
+    *s = 0;
+    if (stat(rp, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : -ENOTDIR;
+    *s = '/';
+    for (char *p = rp + 1; p <= s; p++) {
+        if (*p != '/' && p != s) continue;
+        char c = *p; *p = 0;
+        if (stat(rp, &st) != 0 && mkdir(rp, 0777) != 0 && errno != EEXIST) { int e = errno; *p = c; return -e; }
+        *p = c;
+    }
+    return 0;
+}
+int host_fsync_parent(const char *path) {
+    char rp[PATH_MAX];
+    host_path_resolve(path, rp, sizeof rp);
+    char *s = strrchr(rp, '/');
+    if (!s) strcpy(rp, "."); else if (s == rp) rp[1] = 0; else *s = 0;
+    int fd = open(rp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int r = fsync(fd) == 0 ? 0 : -errno;
+    close(fd);
+    return r;
+}
+/* host_exe_dir (datapaths.c, C10): the folder of the executable with a trailing '/'. */
+const char *host_exe_dir(void) {
+    static char dir[PATH_MAX + 2];
+    if (!dir[0]) { ssize_t k = readlink("/proc/self/exe", dir, PATH_MAX - 1); if (k > 0) { dir[k] = 0; char *s = strrchr(dir, '/'); if (s) s[1] = 0; else strcpy(dir, "./"); } else strcpy(dir, "./"); }
+    return dir;
+}
 /* After a plain call on `b` failed with ENOENT/ENOTDIR: 1 = b now names an existing file in another case, so retry. errno is kept otherwise. */
 static int plat_ci_retry(char *b) {
     int e = errno;
