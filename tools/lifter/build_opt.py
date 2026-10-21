@@ -44,8 +44,10 @@ import build_nro      # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-9.0.0\bin\clang.exe')
-OPT = os.environ.get('RECOMP_OPT', '-O1')
-EXTRA = ['-ffp-contract=off'] + os.environ.get('RECOMP_CFLAGS', '').split()
+OPT = os.environ.get('RECOMP_OPT', '-O2' if build.TARGET_ARM64 else '-O1')
+if build.TARGET_ARM64 and OPT not in ('-O2', '-O3'):
+    print('RECOMP_OPT=%s: the Frame build is tuned for -O2 or better; every step of the ladder below it is reported in _opt_report.txt' % OPT)
+EXTRA = ['-ffp-contract=off'] + build.CODEGEN_FLAGS + os.environ.get('RECOMP_CFLAGS', '').split()   # CODEGEN_FLAGS = the aarch64 driver flags (empty on windows / x86-64 linux)
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
 # Linux build: address-space limit per compiler, bytes (0: none). Set by limit_memory() from the job count.
@@ -93,8 +95,8 @@ def limit_memory(jobs):
     time limit runs out (c_00a3.c: 12 GB after 30 s), which gets processes killed, not slowed down; over the limit, clang
     fails and the file takes the next step of the fallback ladder, as on a timeout."""
     global MEM_LIMIT
-    if os.environ.get('RECOMP_TARGET') != 'linux':
-        return
+    if os.environ.get('RECOMP_TARGET') not in ('linux', 'linux-arm64'):
+        return      # the prlimit ladder stays for both Linux targets: a cross host is not the Frame's memory budget
     with open('/proc/meminfo') as f:
         kb = next(int(l.split()[1]) for l in f if l.startswith('MemTotal:'))
     MEM_LIMIT = max(4 << 30, ((kb << 10) - (4 << 30)) // max(1, jobs))

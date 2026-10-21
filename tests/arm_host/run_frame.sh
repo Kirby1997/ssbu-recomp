@@ -29,4 +29,5 @@ ssh -o BatchMode=yes "$HOST" 'mkdir -p ~/ssbu-port/lifter/runtime ~/ssbu-port/li
 scp -q "$ROOT/runtime/runtime.h" "$ROOT/runtime/fpexact.h" "$ROOT/runtime/neon.h" "$HOST:ssbu-port/lifter/runtime/"
 scp -q "$HERE/frame_tests.sh" "$HERE/litmus.c" "$HERE/codegen_check.c" "$HERE/fp_native_test.c" "$HERE/neon_native_test.c" \
     "$W/litmus_gen.h" "$W/litmus.s" "$W/litmus.words" "$W/x86.hash" "$HOST:ssbu-port/lifter/arm_host/"
-ssh -o BatchMode=yes "$HOST" "sh ~/ssbu-port/lifter/arm_host/frame_tests.sh $PAIRS $ITERS x86.hash"
+# FRAME_CFLAGS / FRAME_CCS / FRAME_ARCHS (see frame_tests.sh) are passed on when set
+ssh -o BatchMode=yes "$HOST" "FRAME_CFLAGS='${FRAME_CFLAGS:-}' FRAME_CCS='${FRAME_CCS:-}' FRAME_ARCHS='${FRAME_ARCHS:-}' sh ~/ssbu-port/lifter/arm_host/frame_tests.sh $PAIRS $ITERS x86.hash"

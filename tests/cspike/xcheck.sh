@@ -7,7 +7,7 @@ cd "$REPO"
 . tests/cspike/xenv.sh
 OUT=${OUT:-/tmp/ssbu-cspike-check}
 mkdir -p "$OUT"
-FLAGS="$X_ARCH $X_CODEGEN -O1 -g -w -fno-strict-aliasing -ferror-limit=0 -Werror=implicit-function-declaration \
+FLAGS="$X_ARCH $X_CODEGEN ${X_OPT:--O2} -g -w -fno-strict-aliasing -ferror-limit=0 -Werror=implicit-function-declaration \
  -Werror=int-conversion -Werror=incompatible-pointer-types -I runtime -I . -I tests/cspike/stubs \
  -Dfn_table=(*game_fn_table_p) -Dfn_table_count=(*game_fn_table_count_p) -Ddyn_syms=(*game_dyn_syms_p) \
  -Ddyn_sym_count=(*game_dyn_sym_count_p) -I$SYSROOT/usr/include $X_PLAT $X_PKG_CFLAGS"
@@ -20,7 +20,7 @@ ns = {'__file__': os.path.join(sys.argv[1], 'runtime', 'build.py')}
 # take the module prologue up to the link helpers, with pkg-config stubbed (no pkg-config on WSL)
 start = src.index('HOST_SOURCES = ['); end = src.index('def debug_link_flags')
 pro = src[:src.index('HOST_SOURCES = [')]
-code = 'import os, sys, subprocess\nCLANG="clang"\nHERE=%r\nGEN=HERE\nTARGET_LINUX=True\nPLAT_FLAGS=[]\n' % os.path.join(sys.argv[1], 'runtime')
+code = 'import os, sys, subprocess\nCLANG="clang"\nHERE=%r\nGEN=HERE\nTARGET_LINUX=True\nPLAT_FLAGS=[]\nOPT_BASE="-O1"\nCODEGEN_FLAGS=[]\nTARGET_ARM64=False\nTARGET_FLAGS=[]\n' % os.path.join(sys.argv[1], 'runtime')
 code += src[start:end].replace("subprocess.run(['pkg-config']", "(lambda *a, **k: type('R', (), {'stdout': ''})())(['pkg-config']")
 exec(code, ns)
 gen = {'sdkdata.c', 'nro_registry.c', 'sdklift_gen.c', 'game_data.c'}

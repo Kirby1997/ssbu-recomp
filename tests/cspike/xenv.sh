@@ -6,7 +6,7 @@ export SYSROOT="${SYSROOT:-$HOME/sysroots/steam-frame}"
 export SDL3_ROOT="${SDL3_ROOT:-$SYSROOT/opt/ssbu-deps/sdl3}"
 export CC="$LLVM_ROOT/bin/clang"
 # our Phase-1 codegen flags (PORT_AUDIT): LSE atomics, no fp contraction (bit-exact FP), frame pointers for backtraces
-export X_ARCH="--target=aarch64-linux-gnu --sysroot=$SYSROOT -march=armv8.2-a+lse"
+export X_ARCH="--target=aarch64-linux-gnu --sysroot=$SYSROOT ${X_CPU:--mcpu=cortex-x4}"      # the C2 flags (tools/lifter/build.py arm_target_flags); X_CPU=-march=armv8.2-a+lse for an LLVM before 18
 export X_CODEGEN="-ffp-contract=off -fno-math-errno -fno-omit-frame-pointer"
 # upstream's PLAT_FLAGS + the pkg-config --cflags of build.py's list
 export X_PLAT="-fPIC -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat"

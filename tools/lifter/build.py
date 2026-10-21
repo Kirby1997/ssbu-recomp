@@ -8,6 +8,7 @@
 """
 import concurrent.futures
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -21,9 +22,44 @@ OBJ = os.path.join(HERE, os.environ.get('RECOMP_OBJ', 'obj_eh_o1'))
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-8.0.0\bin\clang.exe')      # scripts\setup.py sets RECOMP_CLANG (LLVM/clang 9.0.0)
 # RECOMP_TARGET=linux: a native Linux build (ELF objects, the game and the modules as .so files, the exe linked with the
 # system's SDL3 / FreeType / OpenSSL). The Win32 calls of the host sources come from plat/windows.h + plat_posix.c.
-TARGET_LINUX = os.environ.get('RECOMP_TARGET') == 'linux'
+# RECOMP_TARGET=linux-arm64: the same ELF build for the Steam Frame (aarch64): cross from an x86-64 host against a
+# sysroot copied from the device, or native on the Frame itself. C2 adds the branches only: the Windows and the x86-64
+# Linux flag lists stay exactly as they were (TARGET_FLAGS and CODEGEN_FLAGS are empty there).
+TARGET = os.environ.get('RECOMP_TARGET', '')
+TARGET_LINUX = TARGET in ('linux', 'linux-arm64')
+TARGET_ARM64 = TARGET == 'linux-arm64'
+
+def arm_target_flags():
+    """Driver flags of the aarch64 target, used for compiling AND linking. RECOMP_TARGET_FLAGS (scripts/setup.py
+    --target linux-arm64, exported by toolchain/env.sh) wins; otherwise --sysroot from SYSROOT when cross-compiling and
+    the Frame's own core: Snapdragon 8 Gen 3 = 1 Cortex-X4, 5 Cortex-A720, 2 Cortex-A520 (armv9.2-a, LSE, SVE2 on every core).
+    A clang that has no -mcpu for those cores falls back to -march=armv8.2-a+lse (the set PORT_AUDIT Phase 1 validated)
+    and says so - the fallback is never silent."""
+    flags = ['--target=aarch64-linux-gnu', '-fuse-ld=lld']
+    sysroot = os.environ.get('SYSROOT') or os.environ.get('PKG_CONFIG_SYSROOT_DIR') or ''
+    if sysroot:
+        flags.append('--sysroot=' + os.path.abspath(os.path.expanduser(sysroot)))
+    for cpu in ('cortex-x4', 'cortex-a720'):
+        if subprocess.run([CLANG, '--target=aarch64-linux-gnu', '-mcpu=' + cpu, '-fsyntax-only', '-x', 'c', '/dev/null'],
+                          capture_output=True, text=True).returncode == 0:
+            return flags + ['-mcpu=' + cpu]
+    print('note: %s has no -mcpu for the Frame (Cortex-X4): building with -march=armv8.2-a+lse' % CLANG, flush=True)
+    return flags + ['-march=armv8.2-a+lse']
+
+TARGET_FLAGS = shlex.split(os.environ.get('RECOMP_TARGET_FLAGS', '')) if TARGET_ARM64 else []
+if TARGET_ARM64 and not any(f.startswith('-mcpu') or f.startswith('-march') for f in TARGET_FLAGS):
+    TARGET_FLAGS = arm_target_flags() + TARGET_FLAGS
+# clang on aarch64 fuses a*b+c into fmadd even at -O0; the lifted code has to stay bit-exact against the game, so the
+# contraction is off for every translation unit of the arm64 build (also native; x86-64 -O1 never fused one).
+CODEGEN_FLAGS = TARGET_FLAGS + ['-ffp-contract=off', '-fno-math-errno', '-fno-omit-frame-pointer'] if TARGET_ARM64 else []
+# The whole tree defaulted to -O1; on the Frame the lifted code is meant to start at -O2. OPT_BASE is the '-O1' the
+# code below substitutes for the per-file --opt=, so windows and x86-64 keep their -O1 lines character for character.
+OPT_BASE = '-O2' if TARGET_ARM64 else '-O1'
+# The dozen largest lifted files: on x86-64 clang 8/9 needed -O0 for them; clang 19 on aarch64 does not, so the floor
+# there is -O1 (RECOMP_SLOW_OPT overrides it; a file that lands on it is reported, see compile_one).
+SLOW_OPT = os.environ.get('RECOMP_SLOW_OPT', '-O1' if TARGET_ARM64 else '-O0')
 PLAT_FLAGS = ['-fPIC', '-fvisibility=hidden', '-include', os.path.join(HERE, 'plat', 'plat_pre.h')] if TARGET_LINUX else []
-CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + PLAT_FLAGS
+CFLAGS = ['-c', OPT_BASE, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + PLAT_FLAGS + CODEGEN_FLAGS
 HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'nnpad_gca.c', 'display.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnro.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c', 'nncxxlib.c', 'nnlibc2.c',
                 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'r1_state.c',
                 'loose_host.c', 'osk.c', 'nnldn.c', 'net_relay.c', 'rb_net.c']    # the new fighters' file layer (loose_files.c): off unless SSBU_CHARACTERS / SSBU_LOOSE_FILES is set
@@ -44,7 +80,7 @@ NOCRT_FLAGS = ['-nostdlibinc', '-isystem', NOCRT_DIR, '-DGAME_NOCRT'] if NOCRT e
 LLD_LINK = os.path.join(os.path.dirname(CLANG), 'lld-link.exe')
 # A handful of files hold functions so large that clang -O1 needs more than an hour on them;
 # pass --opt=-O0 to compile whatever is still missing without optimization.
-OPT = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--opt=')), '-O1')
+OPT = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--opt=')), OPT_BASE)
 GEN_HEADERS = ['runtime.h', 'neon.h', 'fpexact.h']
 SLOW_FILES = {'c_019e.c', 'c_00a3.c', 'c_013a.c', 'c_0099.c', 'c_0367.c', 'c_03f7.c', 'c_00b3.c', 'c_03d9.c', 'c_012f.c', 'c_00cf.c', 'c_040e.c', 'c_0180.c', 'c_04a5.c'}
 
@@ -54,8 +90,12 @@ def compile_one(name):
     obj = os.path.join(OBJ, name[:-2] + '.obj')
     t = time.time()
     # the dozen largest files hold functions clang 8 cannot optimise in reasonable time: keep them at -O0
-    opt = '-O0' if name in SLOW_FILES else OPT
-    flags = [opt if f == '-O1' else f for f in CFLAGS] + NOCRT_FLAGS
+    # (on aarch64 the floor is -O1; anything below the build's -O2 is named in the output)
+    opt = SLOW_OPT if name in SLOW_FILES else OPT
+    if TARGET_ARM64 and opt < OPT_BASE:      # never silent: every file under -O2 is named with the reason
+        print('  %s: compiled at %s, below the %s target of the Frame build (%s)' % (name, opt, OPT_BASE,
+              'SLOW_FILES floor, RECOMP_SLOW_OPT' if name in SLOW_FILES else '--opt= on the command line'), flush=True)
+    flags = [opt if f == OPT_BASE else f for f in CFLAGS] + NOCRT_FLAGS
     r = subprocess.run([CLANG] + flags + [src, '-o', obj], capture_output=True, text=True)
     return name, r.returncode, r.stderr[-2000:], time.time() - t
 
@@ -95,10 +135,10 @@ def cmd_compile(jobs, force):
 # The lifted game code lives in ssbu_game.dll, linked only when obj\ changes; the exe holds just the
 # host runtime, so the edit-link-run loop costs a couple of seconds (see game_shim.c, gamedll.c).
 GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1.dll')
-HOST_FLAGS = ['-O1', '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
+HOST_FLAGS = [OPT_BASE, '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
-              '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')]      # Khronos headers for nvn_vk.c (track V)
+              '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')] + CODEGEN_FLAGS + (['-fno-pie'] if TARGET_ARM64 else [])      # Khronos headers for nvn_vk.c (track V); arm64: -fno-pie so the exe's brk heap sits low (see the link below)
 SDL_DIR = os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'lib', 'x64')      # SDL3 for nnpad_sdl.c; SDL3.dll is copied beside the exe at link (SDL3_ROOT / VULKAN_HEADERS: scripts\setup.py)
 # U1 (plan\phases\U1_settings_menu.md): the settings menu (F1) is C++ on Dear ImGui v1.91.9b (MIT; the pinned archive and
 # its SHA-256 are in the public tree's scripts\install.py, TOOLS 'imgui'). IMGUI_ROOT = its folder (scripts\setup.py --imgui
@@ -109,11 +149,36 @@ IMGUI = os.environ.get('IMGUI_ROOT') or os.path.join(HERE, '..', 'reference', 'u
 HAVE_IMGUI = os.path.isfile(os.path.join(IMGUI, 'imgui.h')) and os.path.isfile(os.path.join(IMGUI, 'imgui.cpp'))
 CXX_SOURCES = ([os.path.join(HERE, 'menu.cpp')] + [os.path.join(IMGUI, n) for n in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp')]
                if HAVE_IMGUI else [])
-CXX_FLAGS = ['-x', 'c++', '-std=c++14', '-O1', '-g', '-w', '-fno-exceptions', '-fno-rtti', '-D_CRT_SECURE_NO_WARNINGS', '-DIMGUI_USER_CONFIG="menu_imconfig.h"', '-I', HERE, '-I', IMGUI]
+CXX_FLAGS = ['-x', 'c++', '-std=c++14', OPT_BASE, '-g', '-w', '-fno-exceptions', '-fno-rtti', '-D_CRT_SECURE_NO_WARNINGS', '-DIMGUI_USER_CONFIG="menu_imconfig.h"', '-I', HERE, '-I', IMGUI]
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32', '-lsetupapi']
 if TARGET_LINUX:
+    PKGS = ['sdl3', 'freetype2', 'openssl', 'libavformat', 'libavcodec', 'libswscale', 'libswresample', 'libavutil']
+    SYSROOT_DIR = next((f.split('=', 1)[1] for f in TARGET_FLAGS if f.startswith('--sysroot=')), '')
+    PKG_ENV = dict(os.environ)
+    if TARGET_ARM64 and SYSROOT_DIR:
+        # cross build: pkg-config reads the sysroot's .pc files only (LIBDIR replaces its default search path, which on
+        # an x86-64 host would find the host's libraries) and prefixes every path it returns with the sysroot, so the
+        # -I/-L of the Frame's libraries reach clang without a hand-written list. An existing PKG_CONFIG_LIBDIR wins.
+        PKG_ENV['PKG_CONFIG_SYSROOT_DIR'] = SYSROOT_DIR
+        PKG_ENV['PKG_CONFIG_LIBDIR'] = PKG_ENV.get('PKG_CONFIG_LIBDIR') or ':'.join(
+            os.path.join(SYSROOT_DIR, p) for p in ('usr/lib/pkgconfig', 'usr/share/pkgconfig', 'opt/ssbu-deps/sdl3/lib/pkgconfig'))
     def pkg(*args):
-        return subprocess.run(['pkg-config'] + list(args) + ['sdl3', 'freetype2', 'openssl', 'libavformat', 'libavcodec', 'libswscale', 'libswresample', 'libavutil'], capture_output=True, text=True, check=True).stdout.split()
+        """pkg-config, with PKG_CONFIG_SYSROOT_DIR for the arm64 target. No pkg-config on a cross host, or no .pc files
+        in the sysroot: fall back to the same libraries spelled out (SDL3_ROOT / the sysroot's /usr/include), which is
+        what toolchain/env.sh exports - and say so, so nobody links against the host's x86 libraries unnoticed."""
+        try:
+            return subprocess.run(['pkg-config'] + list(args) + PKGS, capture_output=True, text=True, check=True, env=PKG_ENV).stdout.split()
+        except (OSError, subprocess.CalledProcessError):
+            if not TARGET_ARM64:              # the x86-64 Linux build: exactly as before, pkg-config is required there
+                raise
+            sdl = os.environ.get('SDL3_ROOT') or (os.path.join(SYSROOT_DIR, 'opt', 'ssbu-deps', 'sdl3') if SYSROOT_DIR else
+                                                  os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18'))
+            inc = os.path.join(SYSROOT_DIR, 'usr', 'include') if SYSROOT_DIR else '/usr/include'
+            cflags = ['-I', os.path.join(sdl, 'include'), '-I', os.path.join(inc, 'freetype2'), '-I', os.path.join(inc, 'opus')]
+            libs = ['-L', os.path.join(sdl, 'lib'), '-Wl,-rpath-link,' + os.path.join(sdl, 'lib'),
+                    '-lSDL3', '-lfreetype', '-lssl', '-lcrypto', '-lavformat', '-lavcodec', '-lswscale', '-lswresample', '-lavutil']
+            print('pkg-config gave nothing (%s): falling back to the library list of toolchain/env.sh' % (SYSROOT_DIR or 'the system'), flush=True)
+            return cflags + libs if not args else (cflags if '--cflags' in args else libs)
     _sdl_inc = HOST_FLAGS.index('-I', HOST_FLAGS.index('-Ddyn_sym_count=(*game_dyn_sym_count_p)'))      # the SDL3 VC package: the system's SDL3 instead
     HOST_FLAGS = HOST_FLAGS[:_sdl_inc] + HOST_FLAGS[_sdl_inc + 2:] + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags')
     # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Not in the Linux build yet: online play
@@ -147,13 +212,13 @@ def nocrt_fltused(libdir):
     (the C runtime defines it; the module DLLs have no C runtime). The game DLL has it in game_data.c."""
     src, obj = os.path.join(NOCRT_DIR, 'fltused.c'), os.path.join(libdir, 'fltused.obj')
     if not os.path.exists(obj) or os.path.getmtime(obj) < os.path.getmtime(src):
-        r = subprocess.run([CLANG, '-c', '-O1'] + NOCRT_FLAGS + [src, '-o', obj], capture_output=True, text=True, errors='replace')
+        r = subprocess.run([CLANG, '-c', OPT_BASE] + NOCRT_FLAGS + CODEGEN_FLAGS + [src, '-o', obj], capture_output=True, text=True, errors='replace')
         if r.returncode:
             raise SystemExit('clang could not compile %s:\n%s' % (src, (r.stdout + r.stderr)[-2000:]))
     return obj
 
 
-def link_dll(objs, dll, rsp, implib=True, fltused=False):
+def link_dll(objs, dll, rsp, implib=True, fltused=False, symbolic=False):
     """Objects -> DLL: with clang's default linker (MSVC link.exe and the static C runtime) or, under RECOMP_NOCRT, with
     lld-link alone against the import libraries of nocrt\\ (ucrtbase.dll, ntdll.dll). fltused: add the _fltused object
     (DLLs whose objects do not define it). Returns the CompletedProcess."""
@@ -164,7 +229,11 @@ def link_dll(objs, dll, rsp, implib=True, fltused=False):
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     if TARGET_LINUX:          # a .so: -z now resolves everything at load, as a DLL is
-        return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll] + PLAT_FLAGS + ['-lm', '-Wl,-soname,' + os.path.basename(dll), '-Wl,-z,now'], capture_output=True, text=True, errors='replace')
+        # arm64: TARGET_FLAGS bring --target/--sysroot/-mcpu and ld.lld; --no-dependent-libraries because lld, unlike
+        # GNU ld, acts on the #pragma comment(lib, ...) the lifted objects carry (from the Windows build). symbolic:
+        # -Bsymbolic keeps every module .so bound to its own copies of call_indirect / host_import / guest_* / nro_catch_call.
+        extra = CODEGEN_FLAGS + ['-Wl,--no-dependent-libraries'] + (['-Wl,-Bsymbolic'] if symbolic else []) if TARGET_ARM64 else []   # CODEGEN_FLAGS already carries TARGET_FLAGS (--target/--sysroot/-mcpu/-fuse-ld=lld)
+        return subprocess.run([CLANG] + extra + ['-shared', '@' + rsp, '-o', dll] + PLAT_FLAGS + ['-lm', '-Wl,-soname,' + os.path.basename(dll), '-Wl,-z,now'], capture_output=True, text=True, errors='replace')
     if not NOCRT:
         return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True, errors='replace')
     os.makedirs(libdir, exist_ok=True)
@@ -177,7 +246,7 @@ def compile_game_data(objdir, shim):
     """The DLL's shim and GAME_DATA_SOURCES (the dump-derived host tables and the lifted SDK code) -> objects."""
     os.makedirs(objdir, exist_ok=True)
     newest_h = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith('.h')] + [os.path.getmtime(os.path.abspath(__file__))])
-    flags = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-DSDKLIFT_GEN', '-I', HERE, '-I', GEN] + NOCRT_FLAGS + PLAT_FLAGS + os.environ.get('RECOMP_DATA_CFLAGS', '').split()
+    flags = ['-c', OPT_BASE, '-w', '-fno-strict-aliasing', '-DSDKLIFT_GEN', '-I', HERE, '-I', GEN] + NOCRT_FLAGS + PLAT_FLAGS + CODEGEN_FLAGS + os.environ.get('RECOMP_DATA_CFLAGS', '').split()
     jobs, objs = [], []
     for src in [shim] + [os.path.join(HERE, n) for n in GAME_DATA_SOURCES]:
         if not os.path.exists(src):
@@ -188,7 +257,7 @@ def compile_game_data(objdir, shim):
         if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_h):
             jobs.append([CLANG] + flags + [src, '-o', obj])
     failed = 0
-    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+    with concurrent.futures.ThreadPoolExecutor(min(8, os.cpu_count() or 8) if TARGET_ARM64 else 8) as pool:
         for argv, r in zip(jobs, pool.map(lambda a: subprocess.run(a, capture_output=True, text=True, errors='replace'), jobs)):
             if r.returncode:
                 failed += 1
@@ -209,7 +278,7 @@ def build_game_dll():
     if os.path.exists(dll) and os.path.exists(lib) and os.path.getmtime(dll) >= newest:
         return 0
     t0 = time.time()
-    r = link_dll(objs, dll, os.path.join(data_dir, 'link.rsp'))
+    r = link_dll(objs, dll, os.path.join(data_dir, 'link.rsp'), symbolic=True)
     print((r.stdout + r.stderr)[-4000:])
     if r.returncode == 0:
         print('linked %s: %.0f MB in %.0fs%s' % (dll, os.path.getsize(dll) / 1048576.0, time.time() - t0, ' (lld-link, no C runtime)' if NOCRT else ''))
@@ -264,7 +333,9 @@ def cmd_link(host_only=False):
         if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), dep):
             jobs.append((src, obj))
     failed = 0
-    with concurrent.futures.ThreadPoolExecutor(16) as pool:
+    # 16 host-compile threads: the host files are small (nothing like the lifted ones), so they are not memory bound; on
+    # the aarch64 target never more than the machine that runs the compilers has CPUs (the Frame natively, the PC when cross)
+    with concurrent.futures.ThreadPoolExecutor(min(16, os.cpu_count() or 8) if TARGET_ARM64 else 16) as pool:
         for src, code, err in pool.map(compile_host, jobs):
             if code:
                 failed += 1
@@ -272,7 +343,11 @@ def cmd_link(host_only=False):
     if failed:
         return 1
     if TARGET_LINUX:
-        r = subprocess.run([CLANG] + objs + ['-L', HERE, '-l:' + GAME_DLL, '-Wl,-rpath,$ORIGIN', '-Wl,--build-id=sha1'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
+        # arm64: TARGET_FLAGS = the target and lld; -no-pie keeps the brk heap low (the game was handed pointers below
+        # 2^47 on Windows; a PIE + this kernel's mmap area puts them far above it, see vmem.c / OURS buildplat.py),
+        # --no-dependent-libraries ignores the deplibs the lifted objects carry.
+        extra = TARGET_FLAGS + ['-no-pie', '-Wl,--no-dependent-libraries'] if TARGET_ARM64 else []
+        r = subprocess.run([CLANG] + extra + objs + ['-L', HERE, '-l:' + GAME_DLL, '-Wl,-rpath,$ORIGIN', '-Wl,--build-id=sha1'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
     else:
         r = subprocess.run([CLANG] + objs + [game_import_lib(objdir), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
     if r.returncode == 0 and not TARGET_LINUX:

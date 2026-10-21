@@ -9,7 +9,11 @@ TMO="timeout ${TEST_TIMEOUT:-600}"
 PAIRS=${1:-20000000}
 ITERS=${2:-1000000}
 X86HASH=${3:-}
-CFLAGS="-O1 -fno-strict-aliasing -ffp-contract=off -I../runtime -I."
+# FRAME_CFLAGS / FRAME_CCS / FRAME_ARCHS: run the same checks with the flags of the real build (scripts/setup.py --target
+# linux-arm64: FRAME_CCS=clang FRAME_ARCHS=-mcpu=cortex-x4 FRAME_CFLAGS="-O2 -fno-math-errno -fno-omit-frame-pointer")
+CFLAGS="-O1 -fno-strict-aliasing -ffp-contract=off -I../runtime -I. $FRAME_CFLAGS"
+CCS=${FRAME_CCS:-gcc clang}
+ARCHS=${FRAME_ARCHS:-default -mno-outline-atomics -march=armv8.2-a+rcpc}      # "default": no -m flag
 FAILED=0
 pass() { echo "ok   $*"; }
 fail() { echo "FAIL $*"; FAILED=1; }
@@ -32,8 +36,9 @@ want() {   # want <object> <function> <regex that must match> [regex that must n
     if [ -n "$4" ] && printf '%s\n' "$b" | grep -Eq "$4"; then fail "$TAG $2: has /$4/"; printf '%s\n' "$b" | sed 's/^/       /'; return; fi
     pass "$TAG $2: $(printf '%s\n' "$b" | grep -Eo "$3" | head -1)"
 }
-for CC in gcc clang; do
-    for ARCH in "" "-mno-outline-atomics" "-march=armv8.2-a+rcpc"; do
+for CC in $CCS; do
+    for ARCH in $ARCHS; do
+        [ "$ARCH" = default ] && ARCH=""
         TAG="[$CC ${ARCH:-default}]"
         O=cg_$CC$(echo "$ARCH" | tr -c 'a-z0-9' '_').o
         if ! $CC $CFLAGS $ARCH -c codegen_check.c -o "$O"; then fail "$TAG compile codegen_check.c"; continue; fi
@@ -63,7 +68,7 @@ for CC in gcc clang; do
 done
 
 # ---------------------------------------------------------------- 2. litmus tests on lifted code
-for CC in gcc clang; do
+for CC in $CCS; do
     if $CC $CFLAGS litmus.c -o litmus_$CC -lpthread; then
         echo "---- litmus ($CC, $ITERS iterations, 8 threads)"
         if $TMO ./litmus_$CC "$ITERS" 8; then pass "litmus $CC"; else fail "litmus $CC"; fi
@@ -71,7 +76,7 @@ for CC in gcc clang; do
 done
 
 # ---------------------------------------------------------------- 3. floating point vs. the instructions; neon.h native vs. portable
-for CC in gcc clang; do
+for CC in $CCS; do
     if $CC $CFLAGS fp_native_test.c -o fp_native_$CC -lm -lpthread; then
         echo "---- fp ($CC, $PAIRS random pairs)"
         EX=""; [ "$CC" = gcc ] && EX=--exhaustive
@@ -80,7 +85,7 @@ for CC in gcc clang; do
         if [ $st -eq 0 ]; then pass "fp $CC"; else fail "fp $CC"; fi
     else fail "compile fp_native_test.c ($CC)"; fi
 done
-for CC in gcc clang; do
+for CC in $CCS; do
     if $CC $CFLAGS neon_native_test.c -o neon_native_$CC -lm; then
         echo "---- neon native vs portable ($CC)"
         if $TMO ./neon_native_$CC 200000; then pass "neon $CC"; else fail "neon $CC"; fi
