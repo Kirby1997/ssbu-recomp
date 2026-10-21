@@ -46,8 +46,8 @@ static inline float f3s(int op, float acc, float a, float b, uint32_t *mask, int
     case F_MAXNM: return fp_maxmin32(a, b, 0, 1);
     case F_MINNM: return fp_maxmin32(a, b, 1, 1);
     case F_ABD: return fabsf(a - b);
-    case F_RECPS: return fmaf(-a, b, 2.0f);
-    case F_RSQRTS: return fmaf(-a, b, 3.0f) / 2.0f;
+    case F_RECPS: return fp_recps32(a, b);                 /* fpexact.h: 0 x inf = 2.0, NaN rules of the Arm manual */
+    case F_RSQRTS: return fp_rsqrts32(a, b);               /* 0 x inf = 1.5 */
     case F_CMEQ: *is_mask = 1; *mask = a == b ? ~0u : 0; return 0;
     case F_CMGE: *is_mask = 1; *mask = a >= b ? ~0u : 0; return 0;
     case F_CMGT: *is_mask = 1; *mask = a > b ? ~0u : 0; return 0;
@@ -67,8 +67,8 @@ static inline double f3d(int op, double acc, double a, double b, uint64_t *mask,
     case F_MAXNM: return fp_maxmin64(a, b, 0, 1);
     case F_MINNM: return fp_maxmin64(a, b, 1, 1);
     case F_ABD: return fabs(a - b);
-    case F_RECPS: return fma(-a, b, 2.0);
-    case F_RSQRTS: return fma(-a, b, 3.0) / 2.0;
+    case F_RECPS: return fp_recps64(a, b);
+    case F_RSQRTS: return fp_rsqrts64(a, b);
     case F_CMEQ: *is_mask = 1; *mask = a == b ? ~0ull : 0; return 0;
     case F_CMGE: *is_mask = 1; *mask = a >= b ? ~0ull : 0; return 0;
     case F_CMGT: *is_mask = 1; *mask = a > b ? ~0ull : 0; return 0;
@@ -89,16 +89,18 @@ static inline void v_f3v(V128 *d, const V128 *pn, const V128 *pm, int op, int db
         *d = r;
         return;
     }
+    /* max / min return an operand and recps / rsqrts are exact (fpexact.h): no generated NaN for fnan to fix */
+    int exact = (op >= F_MAX && op <= F_MINNM) || op == F_RECPS || op == F_RSQRTS;
     for (int i = 0; i < n; i++) {
         int is_mask = 0;
         if (dbl) {
             uint64_t m = 0;
             double v = f3d(op, acc.df[i], a.df[i], b.df[i], &m, &is_mask);
-            if (is_mask) r.d[i] = m; else r.df[i] = op >= F_MAX && op <= F_MINNM ? v : fnan64(v);      /* max / min return an operand: no generated NaN to fix */
+            if (is_mask) r.d[i] = m; else r.df[i] = exact ? v : fnan64(v);
         } else {
             uint32_t m = 0;
             float v = f3s(op, acc.f[i], a.f[i], b.f[i], &m, &is_mask);
-            if (is_mask) r.w[i] = m; else r.f[i] = op >= F_MAX && op <= F_MINNM ? v : fnan32(v);
+            if (is_mask) r.w[i] = m; else r.f[i] = exact ? v : fnan32(v);
         }
     }
     *d = r;

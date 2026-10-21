@@ -89,6 +89,65 @@ static inline double recpe_d(double x) { uint64_t b; memcpy(&b, &x, 8); b = fp_r
 static inline float rsqrte_f(float x) { uint32_t b; memcpy(&b, &x, 4); b = (uint32_t)fp_rsqrte_bits(b, 0); memcpy(&x, &b, 4); return x; }
 static inline double rsqrte_d(double x) { uint64_t b; memcpy(&b, &x, 8); b = fp_rsqrte_bits(b, 1); memcpy(&x, &b, 8); return x; }
 
+/* FRECPS / FRSQRTS (FPRecipStepFused / FPRSqrtStepFused of the Arm manual, FPCR = 0): 2 - a*b and (3 - a*b) / 2 with one
+ * rounding, except that infinity times zero gives exactly 2.0 / 1.5 (fma would give NaN). The first operand is negated
+ * BEFORE NaN processing, so a NaN coming from it changes sign. NaN choice as FPProcessNaNs: a signalling NaN first
+ * (first operand first), returned quiet; then a quiet NaN (first operand first). */
+static inline int fp_nan2_32(uint32_t a, uint32_t b, uint32_t *r) {
+    int na = (a & 0x7fffffffu) > 0x7f800000u, nb = (b & 0x7fffffffu) > 0x7f800000u;
+    if (!(na | nb)) return 0;
+    int sa = na && !(a & 0x00400000u), sb = nb && !(b & 0x00400000u);
+    *r = (sa ? a : sb ? b : na ? a : b) | 0x00400000u;
+    return 1;
+}
+static inline int fp_nan2_64(uint64_t a, uint64_t b, uint64_t *r) {
+    int na = (a & 0x7fffffffffffffffull) > 0x7ff0000000000000ull, nb = (b & 0x7fffffffffffffffull) > 0x7ff0000000000000ull;
+    if (!(na | nb)) return 0;
+    int sa = na && !(a & 0x0008000000000000ull), sb = nb && !(b & 0x0008000000000000ull);
+    *r = (sa ? a : sb ? b : na ? a : b) | 0x0008000000000000ull;
+    return 1;
+}
+/* step = 0: FRECPS (2 + n*b), step = 1: FRSQRTS ((3 + n*b) / 2), with n = -a. */
+static inline float fp_step32_soft(float a, float b, int step) {
+    uint32_t ua, ub, r;
+    memcpy(&ua, &a, 4); memcpy(&ub, &b, 4);
+    ua ^= 0x80000000u;
+    if (fp_nan2_32(ua, ub, &r)) { float f; memcpy(&f, &r, 4); return f; }
+    int ia = (ua & 0x7fffffffu) == 0x7f800000u, ib = (ub & 0x7fffffffu) == 0x7f800000u;
+    int za = (ua & 0x7fffffffu) == 0, zb = (ub & 0x7fffffffu) == 0;
+    if ((ia && zb) || (za && ib)) return step ? 1.5f : 2.0f;
+    if (ia || ib) { r = ((ua ^ ub) & 0x80000000u) | 0x7f800000u; float f; memcpy(&f, &r, 4); return f; }
+    float n;
+    memcpy(&n, &ua, 4);
+    if (!step) return fmaf(n, b, 2.0f);
+    /* (3 + n*b) / 2 rounded once: halving the rounded sum is exact (a non-zero sum is far above the subnormal range)
+     * unless the sum overflowed; then halve the larger operand (exact: it is at least 2^63) and add 1.5 instead. */
+    float t = fmaf(n, b, 3.0f);
+    if (fabsf(t) == INFINITY) return fabsf(n) >= fabsf(b) ? fmaf(n * 0.5f, b, 1.5f) : fmaf(n, b * 0.5f, 1.5f);
+    return t * 0.5f;
+}
+static inline double fp_step64_soft(double a, double b, int step) {
+    uint64_t ua, ub, r;
+    memcpy(&ua, &a, 8); memcpy(&ub, &b, 8);
+    ua ^= 0x8000000000000000ull;
+    if (fp_nan2_64(ua, ub, &r)) { double f; memcpy(&f, &r, 8); return f; }
+    int ia = (ua & 0x7fffffffffffffffull) == 0x7ff0000000000000ull, ib = (ub & 0x7fffffffffffffffull) == 0x7ff0000000000000ull;
+    int za = (ua & 0x7fffffffffffffffull) == 0, zb = (ub & 0x7fffffffffffffffull) == 0;
+    if ((ia && zb) || (za && ib)) return step ? 1.5 : 2.0;
+    if (ia || ib) { r = ((ua ^ ub) & 0x8000000000000000ull) | 0x7ff0000000000000ull; double f; memcpy(&f, &r, 8); return f; }
+    double n;
+    memcpy(&n, &ua, 8);
+    if (!step) return fma(n, b, 2.0);
+    double t = fma(n, b, 3.0);
+    if (fabs(t) == INFINITY) return fabs(n) >= fabs(b) ? fma(n * 0.5, b, 1.5) : fma(n, b * 0.5, 1.5);
+    return t * 0.5;
+}
+
+static inline float fp_recps32(float a, float b) { return fp_step32_soft(a, b, 0); }
+static inline double fp_recps64(double a, double b) { return fp_step64_soft(a, b, 0); }
+static inline float fp_rsqrts32(float a, float b) { return fp_step32_soft(a, b, 1); }
+static inline double fp_rsqrts64(double a, double b) { return fp_step64_soft(a, b, 1); }
+
 /* FCVT between half precision (IEEE binary16, FPCR.AHP = 0) and single / double: FPConvert of the Arm manual with
  * round-to-nearest-even and FPCR.DN = 0. A NaN keeps its sign and the top bits of its payload and becomes quiet
  * (FPConvertNaN). Done on the bit patterns, so there is one rounding and no dependence on the host's conversions. */
