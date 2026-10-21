@@ -18,6 +18,35 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 
 </div>
 
+> [!NOTE]
+> **This fork targets the Valve Steam Frame: a native aarch64 Linux build, no emulator, no x86 translation.**
+> It builds on upstream's Linux layer and adds what an ARM host needs. Work is on the `linux-c` branch
+> (`setup.py --target linux-arm64`); `main` follows upstream. **Status: in progress, the game does not boot on the
+> Frame yet.**
+>
+> | | Steam Frame (as measured on the device) |
+> |---|---|
+> | SoC | Qualcomm Snapdragon 8 Gen 3: 1 × Cortex-X4, 5 × Cortex-A720, 2 × Cortex-A520 |
+> | ISA | AArch64, Armv9-A with LSE atomics and SVE2 on every core; builds use `-mcpu=cortex-x4 -O2` |
+> | GPU | Adreno 750, Mesa Turnip, Vulkan 1.4 (BC / ASTC, graphics pipeline library) |
+> | OS | SteamOS (Arch based), Linux 6.18, glibc 2.39, 4 KiB pages, 48-bit virtual addresses |
+> | RAM | 16 GB (15 GiB usable) |
+>
+> What the port changes, besides the build target:
+> - **Memory ordering:** the Switch's acquire / release and exclusive accesses map to ARM's own (`ldar` / `stlr` /
+>   `casal`); on x86 they could rely on the CPU's strong ordering, on ARM they can't.
+> - **Addresses below 2^47:** the game assumes 47-bit pointers, but the kernel hands out memory above that on aarch64;
+>   heap and `VirtualAlloc` are kept low.
+> - **Files:** case-insensitive paths and crash-safe save renames. **Game data:** found the same way on every start,
+>   with an in-game picker for Game Mode to come.
+> - Still to do before the first boot: thread and fiber stacks below 2^47, fast ARM fibers and fiber-local storage,
+>   fiber-safe TLS, Windows-style locks, crash reports. Then performance work: the Frame has far less headroom than
+>   the PCs upstream is tested on.
+>
+> Build from an x86-64 PC (`source toolchain/env.sh`, sysroot from `toolchain/sync_sysroot.sh`) or natively on the
+> Frame. As upstream: everything is generated from **your own dump** of the game; nothing of the game is in this
+> repository.
+
 > The project is called **OpenSmash-Ultimate**. The repository is still named `Denkishi/ssbu-recomp`.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**
