@@ -33,3 +33,27 @@ gamescope). The folder is checked and saved as `data=`.
 To change it later, start once with the picker: in Steam's launch options `%command% --pick-data` or
 `SSBU_PICK_DATA=1 %command%`. Scripted runs, `SSBU_SHOW=0` and runs without a display print the reason and exit with code 9
 instead.
+
+## Crash reports
+
+On a crash the game writes `<exe>_crash.txt` to the user data folder (`SSBU_REPORT_DIR` for another one): the signal,
+host and guest call stacks as module+offset, registers and the stack. It is written without malloc or stdio, on a stack of
+its own, so a stack overflow is reported too. The process then dies of the original signal (exit status and core dump as
+usual); `SSBU_CRASH_EXIT=1` exits with code 4 instead, as on Windows.
+
+## Waiting for a Frame run
+
+Written and tested only on other machines (macOS arm64) so far. Run these on the device before relying on them:
+
+| Script | Checks |
+|---|---|
+| `tests/port/crash/run_frame.sh` | crash reports (gcc, clang, fortify, PAC) |
+| `tests/port/picker/run_frame.sh` | the picker's logic and its SDL window with a virtual gamepad |
+| `tests/port/boot`, `tests/port/fs` | game data lookup and file layer after the upstream merge |
+| `tests/arm_host/run_frame.sh` | lifter memory ordering, FP and NEON |
+
+## Playing against upstream builds
+
+This fork's lifter matches the Switch more closely in a few edge cases (CLREX, FRECPS / FRSQRTS of 0 and infinity, some
+LSE / LDAPR encodings that now trap instead of being skipped), on every host, Windows included. A fork build and an upstream
+build are therefore not guaranteed to simulate identically, which matters for a rollback match between them.
