@@ -19,9 +19,10 @@ Tested on one PC: CachyOS (Arch-based, kernel 7.2), 24 threads, 31 GB RAM, NVIDI
 
 | | |
 |---|---|
-| Build from the dump | works: game library, 98 script modules, executable; `check` step passes (SDK self-test, pad self-test 56/56, C++ runtime self-test 145/145, differential test 32,043 / 32,043) |
+| Build from the dump | works: game library, 98 script modules, executable; `check` step passes (SDK self-test, pad self-test 56/56, C++ runtime self-test 145/145, differential test 32,043 / 32,043; it runs only with `--full-check`) |
 | Opening movie, title, menus, character and stage select | work |
-| F1 settings menu, on-screen keyboard | not on Linux yet (both draw with Windows APIs). Text input, for example naming a Mii, opens a zenity or kdialog dialog instead |
+| F1 settings menu | built and drawn as on Windows (Dear ImGui over the Vulkan picture; keyboard, mouse and controller), see [Settings menu (F1)](#settings-menu-f1). **Compiles and links in CI; not yet tried on a real Linux desktop or a Steam Deck** |
+| On-screen keyboard | not on Linux (it draws with Windows APIs). Text input, for example naming a Mii, opens a zenity or kdialog dialog instead |
 | A whole Smash match (scripted input, 1v1 vs CPU) | works: steady 60 fps, sound, no audio underruns |
 | Keyboard | works (tested); controllers through SDL3 are the same code as on Windows but **not tested with a real pad on Linux** |
 | Album movie recording (the game's video capture to the album) | **not implemented** on Linux; the 7 self-test cases for it are accepted as known failures |
@@ -40,10 +41,13 @@ Tested on one PC: CachyOS (Arch-based, kernel 7.2), 24 threads, 31 GB RAM, NVIDI
   ```
   From `.nsp` files and your own keys: `deps/venv/bin/python tools/extract/romfs_extract.py <base.nsp> <update.nsp> <out>`
   and `tools/extract/nca_exefs.py`; they read the keys from `~/.switch/prod.keys`.
-- **RAM:** 16 GB or more. `setup.py` runs one compiler per 4 GB of RAM by default (`--jobs N` overrides it), and each
-  compiler may use (RAM - 4 GB) / jobs. A few generated files need far more than that at full optimisation (one passed
-  20 GB); over its share a file is compiled with less optimisation instead, and the build log lists those files.
-  Running out of memory would not slow the build down, it would get processes killed, possibly your desktop's.
+- **RAM:** 16 GB or more. `setup.py` runs one compiler per CPU thread by default (at most 24; `--jobs N` overrides it),
+  and the compilers share RAM - 4 GB: each one reserves what its file is expected to need before it starts (at least
+  1.5 GB; most files need well under 1 GB, a few need many GB) and is held to it. A file that needs more is compiled again
+  with twice as much, up to the whole share; a few generated files need more than that at full optimisation (one passed
+  20 GB) and are compiled with less optimisation instead, and the build log lists those files. Running out of memory
+  would not slow the build down, it would get processes killed, possibly your desktop's: that is what the sharing
+  prevents. (Before 2026-10-20 the rule was one compiler per 4 GB of RAM: 3 on a 16 GB Steam Deck with 8 threads.)
 - **Disk:** about 12 GB for `build-linux/`, plus about 4 GB of shader cache after the first play session, plus the dump
   itself (about 16 GB).
 - **GPU:** a Vulkan 1.3 driver. With `VK_EXT_graphics_pipeline_library` (current NVIDIA, Mesa RADV and ANV drivers have
@@ -69,10 +73,30 @@ Then, without root, into `deps/` (ignored by git):
 `--no-system` skips the package manager if you install the packages yourself. On another distribution the script lists
 what to install.
 
+**Steam Deck (SteamOS):** SteamOS is read-only and every update removes what pacman installed, so `install_deps.sh` stops
+there and shows how to build inside a [distrobox](https://distrobox.it) container instead (SteamOS 3.5 and newer
+include distrobox and podman), in Desktop Mode, from Konsole, with this folder in your home folder:
+
+```
+distrobox create --name ssbu --image docker.io/library/archlinux:latest
+distrobox enter ssbu
+scripts/linux/install_deps.sh            # inside the container; on a Deck it also installs vulkan-radeon and libpulse
+deps/venv/bin/python scripts/setup.py --target linux --dump <your dump folder>
+./play.sh                                # also from inside the container (distrobox enter ssbu)
+```
+
+`install_deps.sh --steamos-host` installs on SteamOS itself instead (it needs a sudo password,
+`sudo steamos-readonly disable` and the pacman keys, and the next SteamOS update removes the packages again). A Deck now runs 8 compilers instead of 3: the build should take
+roughly 2 to 2.5 hours instead of 4.5 (an estimate from the job counts, not measured on a Deck yet).
+
 The FFmpeg must be able to decode VP9 and Vorbis (the game's movies). Every distribution's normal FFmpeg can;
 `setup.py` checks it.
 
-Optional: `zenity` or `kdialog`. The game's on-screen keyboard (naming a Mii, a ruleset, ...) opens a dialog with one of them.
+Optional: `zenity` or `kdialog`. The game's on-screen keyboard (naming a Mii, a ruleset, ...) and the settings menu's
+"Type in a dialog" buttons (your name, a room code) open a dialog with one of them.
+
+`install_deps.sh` also fetches Dear ImGui v1.91.9b (MIT) into `deps/imgui`: the in-game settings menu (F1). Without it the
+game builds without the menu (`setup.py` says so; `--imgui <folder>` or `IMGUI_ROOT` point to another copy).
 
 ## 2. Build
 
@@ -92,7 +116,11 @@ Use the venv's Python, as shown. The build goes into `build-linux/`, in eleven s
 
 The build can be stopped at any time (Ctrl+C, or a crash). Run the same command again and it continues where it
 stopped; finished steps are skipped. Every invocation needs `--dump`. Other options: `--status`, `--redo <step>`,
-`--from <step>`, `--jobs N`, `--help`.
+`--from <step>`, `--jobs N`, `--full-check` (the check step also runs the translator's long differential test), `--help`.
+Files that fail to compile (often for lack of memory) are compiled again with fewer jobs before the build stops.
+A file that runs into the 180 s time limit is compiled again with more of its longest functions unoptimised; a retry
+that would leave exactly the same functions unoptimised as the attempt that just failed is skipped (it would fail the
+same way), so the few hopeless files reach their unoptimised fallback after one or two 180 s attempts, not three.
 
 When something is missing, step `deps` stops at once with what to install. It compiles and runs a small test program
 against every library, so a broken package shows there and not an hour later.
@@ -134,8 +162,31 @@ Remapping, player slots, dead zones and rumble: `build-linux/config/controllers.
 start, explains itself, and is re-read within a second of being saved. `build-linux/work/ssbu_native --pad-test` shows
 what a pad sends.
 
-Window: `build-linux/config/graphics.ini` (`window = windowed | borderless | fullscreen`, size, vsync). Only
-`windowed` was tested on Linux.
+Window: `build-linux/config/graphics.ini` (`window = windowed | borderless | fullscreen`, size, vsync), or F1 > Display.
+Only `windowed` was tested on Linux.
+
+### Settings menu (F1)
+
+The same menu as on Windows ([BUILDING.md, "In-game menu (F1)"](BUILDING.md#in-game-menu-f1)), drawn over the game.
+
+| To open or close it | |
+|---|---|
+| Keyboard | **F1** (F2: the stats overlay) |
+| Controller | the **Home / Guide** button or the **Capture / Share** button (when the system lets SDL see it) |
+| Any controller, Steam Deck | hold **− and + together for 1 second** (Xbox-style pads: View + Menu; Steam Deck: the two buttons left and right of the screen, View and Menu) |
+| Close | also **+** or **Esc**, or the Close button |
+
+Inside: d-pad / left stick move, A selects, B goes back, L / R switch pages; mouse and keyboard work too.
+
+**Steam Deck:** the Steam button and the "..." button belong to Steam, so use **View + Menu held for 1 s**. While you hold
+them the game sees − and + (a match may pause) until the menu opens; after that the game gets no input until you
+release every button. Another way: in the game's Steam Input layout, bind a back button (L4 / R4 / L5 / R5) to the
+keyboard key F1. Text boxes: in Desktop Mode use the keyboard or "Type in a dialog" (zenity / kdialog); in Game Mode,
+Steam's on-screen keyboard (Steam + X) types into the active box (SDL may also open it by itself when a box is
+selected; not verified).
+
+Not on Linux yet: **Online play** (the Experimental page saves the settings for later and says so), and the Log page
+shows the log only when the game's output goes to a file (`play.sh` does that).
 
 ## Fonts
 
@@ -154,7 +205,9 @@ the same `--dump` (add `--redo convert` if you built before).
 - **The game exits at once with code 7:** a font file is missing (see "Fonts"). The log line starts with `nn::pl:`.
 - **A black window that never changes:** look at the output for `nvn_vk:` lines. `vulkaninfo --summary` must list your GPU.
 - **No sound:** the game plays through SDL3, so PipeWire / PulseAudio must be running. The log says which audio device was opened.
-- **To report a problem**, include `~/.local/share/ssbu-recomp/last_run.log` (written by every `./play.sh`). It lists the
+- **To report a problem**, run `scripts/linux/collect_logs_linux.sh`: it makes `~/ssbu_linux_report_<date>.zip` with the
+  build logs, the last game logs and facts about your PC (distribution, GPU and driver, Vulkan, library versions), never
+  your dump or a game file. Send that file, or at least `~/.local/share/ssbu-recomp/last_run.log` (written by every `./play.sh`). It lists the
   libraries, the GPU and driver, the controllers found, and the error. If no frame was shown for 5 s,
   `build-linux/work/ssbu_native_freeze.txt` has a report of every thread.
 
@@ -175,3 +228,14 @@ executable that finds its libraries next to itself (`rpath $ORIGIN`). `tests/pla
 layer by itself:
 `clang -I runtime/plat -include runtime/plat/plat_pre.h tests/plat_selftest.c runtime/plat_posix.c $(pkg-config --cflags --libs sdl3 openssl) -lm -o plat_selftest`
 (55 checks, 0 failures on the PC above).
+
+## What to report (testers)
+
+Please answer these, even if the answer is "no", and attach the file of `scripts/linux/collect_logs_linux.sh`:
+
+1. Your distribution and version, GPU and driver, X11 or Wayland.
+2. Did `install_deps.sh` and `setup.py` finish? If not, which step failed (the line starting with `FAILED at step`)?
+3. Did the `check` step pass (the line `SSBU_SDK_SELFTEST:` and the differential test line)?
+4. Did the game window open? Did the opening movie play, with sound?
+5. Did the title screen appear? Did a fight start, and how did the speed feel?
+6. Which controller did you use (keyboard, which pad)?

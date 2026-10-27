@@ -23,6 +23,10 @@
 
 #include "plat_pre.h"
 
+#ifdef __cplusplus                                       /* menu.cpp (the settings menu) is C++: these are the C functions of plat_posix.c */
+extern "C" {
+#endif
+
 #define WINAPI
 #define CALLBACK
 #define APIENTRY
@@ -82,6 +86,7 @@ typedef UINT MMRESULT;
 #define ERROR_NO_MORE_FILES 18
 #define ERROR_SHARING_VIOLATION 32
 #define ERROR_HANDLE_EOF 38
+#define ERROR_TIMEOUT 1460                 /* SleepConditionVariable* on a timeout (plat_posix.c cv_wait) */
 #define ERROR_FILE_EXISTS 80
 #define ERROR_INVALID_PARAMETER 87
 #define ERROR_DISK_FULL 112
@@ -157,8 +162,13 @@ void Sleep(DWORD ms);
 #define InterlockedAnd(p, v) __atomic_fetch_and((p), (v), PLAT_SC)
 #define InterlockedAnd64 InterlockedAnd
 #define InterlockedXor(p, v) __atomic_fetch_xor((p), (v), PLAT_SC)
+#ifdef __APPLE__              /* Apple's clang has no __typeof_unqual__: a volatile local serves the exchange as well */
+#define PLAT_TYPEOF_UNQUAL __typeof__
+#else
+#define PLAT_TYPEOF_UNQUAL __typeof_unqual__
+#endif
 #define InterlockedCompareExchange(p, x, c) \
-    ({ __typeof_unqual__(*(p)) plat_c_ = (c); __atomic_compare_exchange_n((p), &plat_c_, (x), 0, PLAT_SC, PLAT_SC); plat_c_; })
+    ({ PLAT_TYPEOF_UNQUAL(*(p)) plat_c_ = (c); __atomic_compare_exchange_n((p), &plat_c_, (x), 0, PLAT_SC, PLAT_SC); plat_c_; })
 #define InterlockedCompareExchange64 InterlockedCompareExchange
 #define InterlockedCompareExchangeAcquire InterlockedCompareExchange
 #define InterlockedCompareExchangeRelease InterlockedCompareExchange
@@ -314,6 +324,8 @@ BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, DWORD *old);
 SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len);
 UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR *count, ULONG *gran);   /* not available: 1 (callers fall back) */
 UINT ResetWriteWatch(LPVOID base, SIZE_T size);
+int plat_write_fault(void *addr);                        /* macOS write watch: 1 = a fault on a watched page, resolved (hostrt.c's crash handler asks first) */
+void plat_prepare_write(void *p, size_t n);              /* before the kernel writes into [p, p+n) (read, fread): marks watched pages written */
 BOOL FlushInstructionCache(HANDLE p, LPCVOID base, SIZE_T size);
 BOOL ReadProcessMemory(HANDLE p, LPCVOID src, LPVOID dst, SIZE_T n, SIZE_T *got);
 typedef struct {
@@ -389,6 +401,10 @@ int plat_remove(const char *path);
 #define _unlink plat_remove
 int plat_rename(const char *a, const char *b);
 #define rename plat_rename
+#ifdef __APPLE__                                         /* fread into write-watched memory: the kernel's write would fail, not fault */
+size_t plat_fread(void *p, size_t size, size_t n, FILE *f);
+#define fread plat_fread
+#endif
 const char *plat_path(const char *in, char *out, size_t n);        /* '\' -> '/' */
 
 /* ---- files ---- */
@@ -486,6 +502,7 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR w, int wn, LPSTR s, int n,
 /* ---- input (SDL keyboard state; plat_posix.c) ---- */
 #define WM_KEYDOWN 0x0100                  /* window messages: named by shared code, never sent (the window is SDL's) */
 #define WM_CHAR 0x0102
+#define WHEEL_DELTA 120                    /* one notch of a mouse wheel (menu.cpp gets SDL's wheel in these units) */
 #define VK_BACK 0x08
 #define VK_TAB 0x09
 #define VK_RETURN 0x0D
@@ -507,6 +524,7 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR w, int wn, LPSTR s, int n,
 #define VK_NUMPAD0 0x60
 #define VK_NUMPAD9 0x69
 #define VK_F1 0x70
+#define VK_F2 0x71
 #define VK_F12 0x7B
 #define VK_LSHIFT 0xA0
 #define VK_RSHIFT 0xA1
@@ -567,8 +585,8 @@ HANDLE FindFirstFileW(LPCWSTR pattern, WIN32_FIND_DATAW *fd);
 BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd);
 /* stack walking for the diagnostics: PCs of the calling thread, innermost first (_Unwind_Backtrace) */
 int plat_backtrace(uintptr_t *pcs, int max);
-int plat_current_stack_bounds(uintptr_t *lo, uintptr_t *hi);   /* the running fiber's or thread's stack (TEB StackLimit..StackBase) */
-uint32_t plat_exe_stamp(void);       /* rb_net.c: the PE header's link time stamp on Windows; here 4 bytes of the exe's ELF build id */
+int plat_current_stack(uintptr_t *lo, uintptr_t *hi);    /* the stack this thread runs on now (a fiber's or the thread's) */
+uint32_t plat_exe_stamp(void);       /* rb_net.c: the PE header's link time stamp on Windows; on Linux 4 bytes of the exe's ELF build id */
 
 /* OpenGL renderer: extension entry points from the current context (SDL) */
 void *wglGetProcAddress(const char *name);
@@ -617,4 +635,7 @@ typedef struct { DWORD biSize; LONG biWidth, biHeight; WORD biPlanes, biBitCount
 BOOL GetClientRect(HWND h, RECT *r);                     /* the window's size in pixels */
 int GetWindowTextA(HWND h, LPSTR out, int n);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

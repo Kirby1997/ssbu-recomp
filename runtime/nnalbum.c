@@ -388,6 +388,7 @@ static void album_ReadAlbumMovieStream(Ctx *c) {                                
     if (i < 0 || (int64_t)A4 < 0) r = CAPS_RESULT(i < 0 ? 23 : 8);                   /* [suyu] ResultOutOfRange */
     else if (A1 && A2) {
         uint8_t *dst = (uint8_t *)(uintptr_t)A1;
+        { void r1_wrote(uint64_t, uint64_t); r1_wrote(A1, A2); }      /* R1 / R4 (r1_state.c): the kernel writes these guest pages */
         while (got < A2 && A4 + got < g_streams[i].size) {
             OVERLAPPED ov;
             DWORD n = 0, want = (DWORD)(A2 - got > 0x1000000 ? 0x1000000 : A2 - got);
@@ -492,6 +493,8 @@ static HRESULT mm_open(const uint8_t *param) {
     CreateDirectoryA(album_dir(), NULL);
     snprintf(g_mm.tmp_path, sizeof g_mm.tmp_path, "%s\\recording.tmp.mp4", album_dir());
     MultiByteToWideChar(CP_ACP, 0, g_mm.tmp_path, -1, wpath, MAX_PATH);
+    int movie_mf_present(void);                              /* nnmovie_mf.c: Media Foundation is delay-loaded (absent on Windows N) */
+    if (!movie_mf_present()) return E_FAIL;
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(wpath, NULL, NULL, &g_mm.writer);
     if (SUCCEEDED(hr)) hr = MFCreateMediaType(&t);

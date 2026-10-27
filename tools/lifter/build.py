@@ -25,9 +25,14 @@ CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-8.0.0\bin\clang.exe')      # sc
 # RECOMP_TARGET=linux-arm64: the same ELF build for the Steam Frame (aarch64): cross from an x86-64 host against a
 # sysroot copied from the device, or native on the Frame itself. C2 adds the branches only: the Windows and the x86-64
 # Linux flag lists stay exactly as they were (TARGET_FLAGS and CODEGEN_FLAGS are empty there).
+# RECOMP_TARGET=macos: the same on macOS / Apple Silicon (Mach-O, .dylib files; plan/phases/MAC1_port.md). Work in progress:
+# the host runtime compiles and its platform layer passes tests/plat_selftest.c; the game library and the module libraries
+# are made as .dylib (build_nro.py, build_opt.py), not yet built from a dump on a Mac (MAC3).
 TARGET = os.environ.get('RECOMP_TARGET', '')
 TARGET_LINUX = TARGET in ('linux', 'linux-arm64')
 TARGET_ARM64 = TARGET == 'linux-arm64'
+TARGET_MACOS = TARGET == 'macos'
+TARGET_POSIX = TARGET_LINUX or TARGET_MACOS
 
 def arm_target_flags():
     """Driver flags of the aarch64 target, used for compiling AND linking. RECOMP_TARGET_FLAGS (scripts/setup.py
@@ -58,7 +63,12 @@ OPT_BASE = '-O2' if TARGET_ARM64 else '-O1'
 # The dozen largest lifted files: on x86-64 clang 8/9 needed -O0 for them; clang 19 on aarch64 does not, so the floor
 # there is -O1 (RECOMP_SLOW_OPT overrides it; a file that lands on it is reported, see compile_one).
 SLOW_OPT = os.environ.get('RECOMP_SLOW_OPT', '-O1' if TARGET_ARM64 else '-O0')
-PLAT_FLAGS = ['-fPIC', '-fvisibility=hidden', '-include', os.path.join(HERE, 'plat', 'plat_pre.h')] if TARGET_LINUX else []
+PLAT_FLAGS = ['-fPIC', '-fvisibility=hidden', '-include', os.path.join(HERE, 'plat', 'plat_pre.h')] if TARGET_POSIX else []
+MACOS_MIN = ['-mmacosx-version-min=14.4'] if TARGET_MACOS else []     # os_sync_wait_on_address (plat_posix.c): macOS 14.4+
+PLAT_FLAGS += MACOS_MIN
+# Linux x86-64: 16-byte atomics (the lifted LDXP/STXP, CASP) inline as cmpxchg16b, as clang does by default for Windows x64;
+# without it -O1 code calls __atomic_compare_exchange_16 (libatomic), which the libraries are not linked with
+PLAT_FLAGS += ['-mcx16'] if TARGET_LINUX and not TARGET_ARM64 else []      # (an x86 option: aarch64 has LDXP/STXP / CASP itself)
 CFLAGS = ['-c', OPT_BASE, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + PLAT_FLAGS + CODEGEN_FLAGS
 HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'nnpad_gca.c', 'display.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnro.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c', 'nncxxlib.c', 'nnlibc2.c',
                 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'r1_state.c',
@@ -100,22 +110,55 @@ def compile_one(name):
     return name, r.returncode, r.stderr[-2000:], time.time() - t
 
 
+order_key = None          # build_opt.py: compile order (slowest first by measured time)
+
+
 def cmd_compile(jobs, force):
     os.makedirs(OBJ, exist_ok=True)
     sources = sorted(n for n in os.listdir(GEN) if n.endswith('.c'))
     # only the headers the generated code includes; hostrt.h belongs to the host sources, which cmd_link rebuilds when they are stale
     newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in GEN_HEADERS)
-    todo = []
+    # content check on top of the dates: an object whose source, headers and flags hash to what it was compiled from is kept
+    # even when the files are newer (an update that rewrote them with the same bytes, a lifter run that regenerated equal
+    # files): before, any newer date recompiled, and touching runtime.h recompiled the whole game
+    import hashlib, json
+    hpath = os.path.join(OBJ, '_srchash.json')
+    try:
+        known = json.load(open(hpath))
+    except (OSError, ValueError):
+        known = {}
+    hh = hashlib.sha1(repr([os.environ.get(k, '') for k in ('RECOMP_CFLAGS', 'RECOMP_INLINE', 'RECOMP_OPT', 'RECOMP_TARGET', 'RECOMP_NOCRT')]).encode())
+    for h in GEN_HEADERS:
+        with open(os.path.join(HERE, h), 'rb') as f:
+            hh.update(f.read())
+    hkey = hh.hexdigest()
+    def src_hash(n):
+        with open(os.path.join(GEN, n), 'rb') as f:
+            return hashlib.sha1(f.read() + hkey.encode()).hexdigest()
+    todo, cur, kept = [], {}, 0
     for n in sources:
         obj = os.path.join(OBJ, n[:-2] + '.obj')
-        if force or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(os.path.join(GEN, n)), newest_header):
+        if force or not os.path.exists(obj):
             todo.append(n)
+            continue
+        if os.path.getmtime(obj) >= max(os.path.getmtime(os.path.join(GEN, n)), newest_header):
+            cur[n] = known[n] if n in known else src_hash(n)     # (first run with the check: the record is made now)
+            continue
+        cur[n] = src_hash(n)
+        if known.get(n) == cur[n]:
+            os.utime(obj, None)                  # equal content: the object stands; dated now so the date check agrees next time
+            kept += 1
+        else:
+            todo.append(n)
+    if kept:
+        print('objects kept because their source, headers and flags are unchanged (only the dates were newer): %d' % kept, flush=True)
     wanted = set(n[:-2] + '.obj' for n in sources)
     for n in os.listdir(OBJ):
         if n.endswith('.obj') and n not in wanted:
             os.remove(os.path.join(OBJ, n))
     # longest first (source size: the compile time follows it): the biggest files no longer start last and hold up the end
-    todo.sort(key=lambda n: -os.path.getsize(os.path.join(GEN, n)))
+    # (build_opt.py sets order_key: by the seconds each file took before, see build_opt.hints)
+    todo.sort(key=order_key or (lambda n: -os.path.getsize(os.path.join(GEN, n))))
     print('sources: %d   to compile: %d   jobs: %d' % (len(sources), len(todo), jobs), flush=True)
     t0 = time.time()
     failed, done, cpu = [], 0, 0.0
@@ -125,16 +168,40 @@ def cmd_compile(jobs, force):
             cpu += secs
             if code:
                 failed.append(name)
-                print('FAILED %s\n%s' % (name, err), flush=True)
-            if done % 50 == 0 or done == len(todo):
+                # 2026-10-21 (a tester: 539 files FAILED with no text, 6-11 s each, 10 jobs): the exit code says which kind (Windows
+                # 0xC0000005 / 0xC0000017 / 0xC000012D, or a negative signal elsewhere = the compiler crashed or ran out of memory)
+                why = '' if (err or '').strip() else ' (exit code %s, no message: the compiler crashed - usually out of memory with %d at once; it is compiled again with fewer at the end)' % (
+                    ('0x%08X' % (code & 0xffffffff)) if isinstance(code, int) and (code < 0 or code > 255) else code, jobs)
+                print('FAILED %s%s\n%s' % (name, why, err), flush=True)
+            if done % 10 == 0 or done == len(todo):
                 print('  %d/%d   %.0fs elapsed   %.0fs compiler time' % (done, len(todo), time.time() - t0, cpu), flush=True)
+    # a file that failed while many compilers ran at once usually ran out of memory (clang crashes "due to signal" on the
+    # biggest files): those are compiled again with far fewer at a time, then one by one, before the step gives up
+    for retry_jobs in (max(1, jobs // 4), 1):
+        if not failed or retry_jobs >= jobs:
+            continue
+        again, failed = failed, []
+        print('compiling again with %d job(s): %d file(s) that failed (usually out of memory with %d at once)' % (retry_jobs, len(again), jobs), flush=True)
+        with concurrent.futures.ThreadPoolExecutor(retry_jobs) as pool:
+            for name, code, err, secs in pool.map(compile_one, again):
+                if code:
+                    failed.append(name)
+                    print('FAILED again %s\n%s' % (name, err), flush=True)
     print('compiled: %d   failed: %d   elapsed: %.0fs' % (len(todo) - len(failed), len(failed), time.time() - t0), flush=True)
+    for n in todo:                                   # what each object was made from (cmd_compile's content check)
+        if n not in failed:
+            cur[n] = src_hash(n)
+    try:
+        with open(hpath, 'w') as f:
+            json.dump(cur, f)
+    except OSError:
+        pass
     return 1 if failed else 0
 
 
 # The lifted game code lives in ssbu_game.dll, linked only when obj\ changes; the exe holds just the
 # host runtime, so the edit-link-run loop costs a couple of seconds (see game_shim.c, gamedll.c).
-GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1.dll')
+GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1' + ('.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'))
 HOST_FLAGS = [OPT_BASE, '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
@@ -151,7 +218,18 @@ CXX_SOURCES = ([os.path.join(HERE, 'menu.cpp')] + [os.path.join(IMGUI, n) for n 
                if HAVE_IMGUI else [])
 CXX_FLAGS = ['-x', 'c++', '-std=c++14', OPT_BASE, '-g', '-w', '-fno-exceptions', '-fno-rtti', '-D_CRT_SECURE_NO_WARNINGS', '-DIMGUI_USER_CONFIG="menu_imconfig.h"', '-I', HERE, '-I', IMGUI]
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi', '-lshell32', '-lsetupapi']
-if TARGET_LINUX:
+# Media Foundation delay-loaded: Windows N without the Media Feature Pack has no MFPlat.dll, and the exe must still start
+# there (the movies then play with FFmpeg, mf_ffmpeg.c); nnmovie_mf.c's movie_mf_present() is asked before any call.
+LIBS += ['-ldelayimp', '-Wl,/DELAYLOAD:MFPlat.DLL', '-Wl,/DELAYLOAD:MFReadWrite.dll']
+# mf_ffmpeg.c: the movie fallback for PCs whose Media Foundation cannot play the movies (plat_mf.c on FFmpeg's DLLs, which
+# the exe loads at run time: nothing is linked). Built only with FFmpeg's headers: FFMPEG_ROOT (scripts\setup.py sets it),
+# default deps\ffmpeg, the package scripts\fetch_media.py downloads; without them the exe simply has no fallback.
+FFMPEG_ROOT = os.environ.get('FFMPEG_ROOT') or os.path.join(HERE, 'deps', 'ffmpeg')
+HAVE_FFMPEG = os.path.isfile(os.path.join(FFMPEG_ROOT, 'include', 'libavcodec', 'avcodec.h'))
+if HAVE_FFMPEG and not TARGET_POSIX:
+    HOST_SOURCES.append('mf_ffmpeg.c')
+    HOST_FLAGS = HOST_FLAGS + ['-I', os.path.join(FFMPEG_ROOT, 'include')]
+if TARGET_POSIX:
     PKGS = ['sdl3', 'freetype2', 'openssl', 'libavformat', 'libavcodec', 'libswscale', 'libswresample', 'libavutil']
     SYSROOT_DIR = next((f.split('=', 1)[1] for f in TARGET_FLAGS if f.startswith('--sysroot=')), '')
     PKG_ENV = dict(os.environ)
@@ -183,9 +261,15 @@ if TARGET_LINUX:
     HOST_FLAGS = HOST_FLAGS[:_sdl_inc] + HOST_FLAGS[_sdl_inc + 2:] + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags')
     # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Not in the Linux build yet: online play
     # (net_relay.c: Winsock extensions, COM UPnP; net_off.c answers "off", as with SSBU_ONLINE unset)
-    HOST_SOURCES = [n for n in HOST_SOURCES if n != 'net_relay.c'] + ['plat_posix.c', 'plat_mf.c', 'net_off.c', 'datapaths.c'] + (['plat_heap.c'] if TARGET_ARM64 else [])      # plat_heap.c (C3): arm64 only, the C heap below 2^47 (needs the -no-pie link below); x86 builds are unchanged
+    HOST_SOURCES = [n for n in HOST_SOURCES if n != 'net_relay.c'] + ['plat_posix.c', 'plat_mf.c', 'net_off.c'] + (['datapaths.c'] if TARGET_LINUX else []) + (['plat_heap.c'] if TARGET_ARM64 else [])      # datapaths.c (C10): Linux only (macOS keeps boot.c's state.json lookup); plat_heap.c (C3): arm64 only, the C heap below 2^47 (needs the -no-pie link below); x86 builds are unchanged
     LIBS = pkg('--libs') + ['-lGL', '-lm', '-ldl', '-lpthread']      # libGL: the OpenGL front end is linked (not used)
-    HAVE_IMGUI, CXX_SOURCES = False, []                  # the settings menu (menu.cpp) is Win32 + D3D: menu_stub.c on Linux for now
+    if TARGET_MACOS:                                     # OpenGL is a system framework; dl / pthread are in libSystem
+        LIBS = pkg('--libs') + ['-framework', 'OpenGL', '-lm']
+    # U2 (plan/phases/U2_menu_linux.md): the settings menu on Linux / macOS too: menu.cpp's own SDL branch, plat/windows.h
+    # (C++-safe), the same Vulkan pass; the C++ library for ImGui's static locals
+    CXX_FLAGS = CXX_FLAGS + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags') + CODEGEN_FLAGS     # arm64: the target / sysroot / -mcpu as for the C sources
+    if HAVE_IMGUI:
+        LIBS += ['-lc++'] if TARGET_MACOS else ['-lstdc++']
 
 
 def debug_link_flags(out):
@@ -228,6 +312,8 @@ def link_dll(objs, dll, rsp, implib=True, fltused=False, symbolic=False):
         objs = list(objs) + [nocrt_fltused(libdir)]
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
+    if TARGET_MACOS:          # a .dylib found through the exe's rpath; undefined names resolve at load, as on Linux
+        return subprocess.run([CLANG, '-dynamiclib', '@' + rsp, '-o', dll] + PLAT_FLAGS + ['-lm', '-Wl,-install_name,@rpath/' + os.path.basename(dll), '-Wl,-undefined,dynamic_lookup'], capture_output=True, text=True, errors='replace')
     if TARGET_LINUX:          # a .so: -z now resolves everything at load, as a DLL is
         # arm64: TARGET_FLAGS bring --target/--sysroot/-mcpu and ld.lld; --no-dependent-libraries because lld, unlike
         # GNU ld, acts on the #pragma comment(lib, ...) the lifted objects carry (from the Windows build). symbolic:
@@ -252,7 +338,10 @@ def compile_game_data(objdir, shim):
         if not os.path.exists(src):
             print('%s is missing: an earlier step of scripts/setup.py writes it (tables, sdk, modules)' % src)
             return None
-        obj = os.path.join(objdir, ('_shim' if src == shim else os.path.basename(src)[:-2]) + '.obj')
+        # a shim other than the default gets an object of its own name: setup.py --rollback links game_shim_r1.c into the
+        # same data folder, and the default shim's newer object would otherwise be taken for it (r1_m1 / r1_m2 undefined)
+        name = '_shim' if os.path.basename(shim) == 'game_shim_eh.c' else '_shim_' + os.path.basename(shim)[:-2]
+        obj = os.path.join(objdir, (name if src == shim else os.path.basename(src)[:-2]) + '.obj')
         objs.append(obj)
         if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_h):
             jobs.append([CLANG] + flags + [src, '-o', obj])
@@ -267,7 +356,7 @@ def compile_game_data(objdir, shim):
 
 def build_game_dll():
     dll = os.path.join(HERE, GAME_DLL)
-    lib = dll if TARGET_LINUX else dll[:-4] + '.lib'          # Linux: the exe links against the .so itself
+    lib = dll if TARGET_POSIX else dll[:-4] + '.lib'          # Linux: the exe links against the .so itself
     shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
     data_dir = OBJ + '_data'                 # beside OBJ, not in it (cmd_compile removes what it does not know there)
     data_objs = compile_game_data(data_dir, shim)
@@ -321,10 +410,15 @@ def cmd_link(host_only=False):
     objs, jobs = [], []
     if not HAVE_IMGUI:
         print('settings menu: Dear ImGui not found in %s (IMGUI_ROOT): built without it (menu_stub.c; F1 does nothing)' % IMGUI)
+    # RECOMP_R1=1: the rollback exe (ssbu_native_rb.exe, scripts/setup.py --rollback): its C++ runtime marks the pages it
+    # writes (r1src/nncxxrt.c, R1_MARK), like the game DLL built with -DR1_MARK (ssbu_game_r1.dll) it imports
+    r1 = os.environ.get('RECOMP_R1') == '1'
     for n in HOST_SOURCES + ['gamedll.c'] + ([] if HAVE_IMGUI else ['menu_stub.c']):
-        src, obj = os.path.join(HERE, n), os.path.join(objdir, n[:-2] + '.obj')
+        src, obj = os.path.join(HERE, 'r1src' if r1 and n == 'nncxxrt.c' else '', n), os.path.join(objdir, n[:-2] + '.obj')
         objs.append(obj)
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0):
+        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,
+                                                                       os.path.getmtime(os.path.join(HERE, 'plat_mf.c')) if n == 'mf_ffmpeg.c' else 0,   # mf_ffmpeg.c includes plat_mf.c
+                                                                       os.path.getmtime(os.path.join(HERE, 'skyline.c')) if n == 'nnro.c' else 0):   # nnro.c includes skyline.c
             jobs.append((src, obj))
     for src in CXX_SOURCES:                          # U1: the settings menu (C++); imgui's own files depend on their source and menu_imconfig.h only
         obj = os.path.join(objdir, os.path.splitext(os.path.basename(src))[0] + '_cxx.obj')
@@ -342,15 +436,19 @@ def cmd_link(host_only=False):
                 print('FAILED %s\n%s' % (os.path.basename(src), err))
     if failed:
         return 1
-    if TARGET_LINUX:
+    if TARGET_MACOS:          # host alone (build.py host): the game library's names are left to be found at load
+        game = ['-Wl,-undefined,dynamic_lookup'] if host_only else [os.path.join(HERE, GAME_DLL)]
+        r = subprocess.run([CLANG] + MACOS_MIN + objs + game + ['-Wl,-rpath,@executable_path'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
+    elif TARGET_LINUX:
         # arm64: TARGET_FLAGS = the target and lld; -no-pie keeps the brk heap low (the game was handed pointers below
         # 2^47 on Windows; a PIE + this kernel's mmap area puts them far above it, see vmem.c / OURS buildplat.py),
         # --no-dependent-libraries ignores the deplibs the lifted objects carry.
         extra = TARGET_FLAGS + ['-no-pie', '-Wl,--no-dependent-libraries'] if TARGET_ARM64 else []
-        r = subprocess.run([CLANG] + extra + objs + ['-L', HERE, '-l:' + GAME_DLL, '-Wl,-rpath,$ORIGIN', '-Wl,--build-id=sha1'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
+        game = ['-Wl,--unresolved-symbols=ignore-in-object-files'] if host_only else ['-L', HERE, '-l:' + GAME_DLL]      # host alone: a compile + link check, not runnable
+        r = subprocess.run([CLANG] + extra + objs + game + ['-Wl,-rpath,$ORIGIN', '-Wl,--build-id=sha1'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
     else:
         r = subprocess.run([CLANG] + objs + [game_import_lib(objdir), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
-    if r.returncode == 0 and not TARGET_LINUX:
+    if r.returncode == 0 and not TARGET_POSIX:
         import shutil
         try:
             shutil.copy2(os.path.join(SDL_DIR, 'SDL3.dll'), os.path.join(HERE, 'SDL3.dll'))

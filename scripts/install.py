@@ -25,7 +25,8 @@ also written to build\\install_state.json; scripts/setup.py keeps its own build\
               runtime\\fonts_open are used.
  6. tools     LLVM/clang 9 and the prebuilt runtime (or SDL3, Vulkan-Headers, glslang, suyu, MSVC to build everything).
  7. dlc       build\\config\\dlc.txt from the DLC file names (the runtime unlocks that content; names only).
- 7. media     libopus (music) into deps\\opus; the Store codecs for the movies are checked (links printed when missing).
+ 7. media     libopus (music) into deps\\opus; FFmpeg (the movies where Windows cannot play WebM) into deps\\ffmpeg, both
+              SHA-256 checked; the Store codecs for the movies are checked (links printed when missing).
  8. build     scripts/setup.py: deps stage convert modules tables lift sdk compile nro link check.
  9. shortcuts "SSBU native" on the desktop and in the Start menu, "SSBU native - Installer" in the Start menu (scripts/shortcuts.py).
 10. unblock   Unblock-File over tools, scripts and the built exe / dlls (cheap, idempotent).
@@ -105,8 +106,8 @@ TOOLS = {   # checked 2026-10-19: SDL3 and glslang equal GitHub's own asset dige
 # The prebuilt runtime package of the GitHub Release of this version (scripts/make_release.py): (URL, SHA-256 of the zip).
 # (None, None) until the maintainer has uploaded the package made from this commit and written its hash here; the
 # download is refused when the hash does not match, and setup.py uses the package only with the tree it was built from.
-RUNTIME_RELEASE = ('https://github.com/Denkishi/ssbu-recomp/releases/download/runtime-5a25ee9/ssbu-runtime-5a25ee9091.zip',
-                   '5695ec652c6bb5734dc3340e9941d75d8ff95f766952937aeefa176e94577f78')
+RUNTIME_RELEASE = ('https://github.com/Denkishi/ssbu-recomp/releases/download/runtime-6de107d/ssbu-runtime-6de107db53.zip',
+                   '6432fd0aab76811032683e4e148631187ab8e5db06ecfeda74fa0ed71eeb9c8e')
 
 SETUP_STEPS = ['deps', 'stage', 'convert', 'modules', 'tables', 'lift', 'sdk', 'compile', 'nro', 'link', 'check']
 # expected seconds, measured 2026-10-19 on a PC with 12 jobs and 32 threads (compile and nro scale with 12 / jobs)
@@ -206,7 +207,7 @@ def stream(cmd, env=None, cwd=None, on_line=None, hb=None, prefix=''):
                 last = time.time()
                 h = hb()
                 if h:
-                    PROG.emit(ev='progress', id=h[0], done=int(h[1]), total=int(h[2]), est=True)
+                    PROG.emit(ev='progress', id=h[0], done=int(h[1]), total=int(h[2]), est=h[3] if len(h) > 3 else True)
             continue
         if line is None:
             break
@@ -581,8 +582,18 @@ def step_dump(cx):
                    'Check that prod.keys belongs to the same console as the game files, and that base and update are the same game.')
     if os.path.isdir(out) and not dump_ok(out):
         os.replace(out, out + '.old_%d' % int(time.time()))      # an unfinished dump of an older run: kept aside, not deleted
+    rebuilt = False
+    if os.path.isdir(out) and dump_ok(out):
+        # a complete dump made from OTHER game files (the player chose another update, e.g. 13.0.5 -> 13.0.4): the installer
+        # made it, the new one replaces it, and the build is made again from the conversion on (a tester's switch to 13.0.4
+        # kept the 13.0.5 dump and game, 2026-10-20)
+        say('   the game files changed (%s): the old unpacked game is replaced and the game is built again' % os.path.basename(cx.update))
+        shutil.rmtree(out, ignore_errors=True)
+        rebuilt = True
     if not os.path.isdir(out):
         os.replace(part, out)
+    if rebuilt:
+        cx.setup_args += ['--from', 'convert']
     try:                                                         # what this dump was made from (Resume keeps it next time)
         with open(os.path.join(out, 'made_from.json'), 'w', encoding='utf-8') as f:
             json.dump({'key': made_from_key(cx.base, cx.update)}, f)
@@ -801,10 +812,18 @@ def step_media(cx):
     else:
         got = fetch_media.fetch_opus(DEPS)
         msg = 'libopus ready' if got else 'no music (libopus could not be fetched; the game runs silent)'
+    # FFmpeg: the movies' fallback where Windows cannot play WebM (codecs missing or broken, Windows N); always fetched,
+    # since the Store check below cannot tell a broken copy of the codecs from a working one
+    if a.dry_run:
+        ff = fetch_media.ffmpeg_ready(DEPS)
+        msg += '; FFmpeg is already in deps\\ffmpeg' if ff else '; would download FFmpeg (movie fallback, 3 MB) into deps\\ffmpeg, SHA-256 checked'
+    else:
+        ff = fetch_media.fetch_ffmpeg(DEPS)
+        msg += '; FFmpeg ready (movie fallback)' if ff else '; no FFmpeg (movies only with Windows\' own codecs)'
     codecs = fetch_media.check_codecs()
     missing = [k for k, v in codecs.items() if v is not True]
     if missing:
-        msg += '; movie codecs missing or unknown (Store links printed above): ' + ', '.join(missing)
+        msg += '; Store codecs missing or unknown: ' + ', '.join(missing) + (' (FFmpeg plays the movies)' if ff else ' (Store links printed above)')
     return ('dry' if a.dry_run else 'done'), msg
 
 
@@ -879,6 +898,8 @@ def step_build(cx, P):
                 P.end(s, 'dry', 'would run scripts/setup.py step %s' % s)
         return
     cmd = [sys.executable, os.path.join(HERE, 'setup.py'), '--build', BUILD, '--dump', cx.dump] + cx.setup_args
+    if getattr(a, 'no_inline', False):
+        cmd += ['--no-inline']
     if a.jobs:
         cmd += ['--jobs', str(a.jobs)]
     if cx.rebuild_from and cx.rebuild_from in SETUP_STEPS:
@@ -917,9 +938,34 @@ def step_build(cx, P):
             P.start(s)
             P.end(s, 'dry', 'would run')
 
+    def compiled(s):
+        """(done, total) files of this run of the step from its log (build.py prints "  N/M   Ts elapsed" after the line
+        "sources: S   to compile: M"), or None. Before, the window showed seconds against the estimate (2835 / 2660)."""
+        if s != 'compile':
+            return None
+        try:
+            with open(os.path.join(BUILD, 'logs', 'compile.log'), 'rb') as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 262144))
+                t = f.read().decode('utf-8', 'replace')
+        except OSError:
+            return None
+        i = t.rfind('sources: ')
+        m = re.match(r'sources: \d+\s+to compile: (\d+)', t[i:]) if i >= 0 else None
+        if not m or not int(m.group(1)):
+            return None
+        n = re.findall(r'^\s+(\d+)/\d+\s+\d+s elapsed', t[i:], re.M)
+        return (int(n[-1]) if n else 0, int(m.group(1)))
+
     def hb():
         s = cur['id']
-        return (s, time.time() - P.t0.get(s, time.time()), est(s)) if s in ('compile', 'nro', 'lift', 'link') else None
+        if s not in ('compile', 'nro', 'lift', 'link'):
+            return None
+        c = compiled(s)
+        if c:
+            return (s, c[0], c[1], False)
+        e = est(s)
+        return (s, min(time.time() - P.t0.get(s, time.time()), 0.95 * e), e)      # seconds: never past the estimate
     rc, tail = stream(cmd, on_line=on_line, hb=hb, prefix='   ')
     if rc:
         if cur['id']:
@@ -975,7 +1021,17 @@ class Ctx:
         self.dlc, self.setup_args, self.blockers = [], [], []
         self.restart_from = None
         self.rebuild_from = a.reexec if a.reexec and a.reexec != '-' else None
-        self.jobs = a.jobs or min(24, os.cpu_count() or 4)
+        self.jobs = a.jobs or default_jobs()
+
+
+def default_jobs():
+    """Compiler jobs when none was given: precheck's rule (about 1.5 GB of RAM per job, at most the logical CPUs), at most
+    24. Only the CPU count made a 32-thread PC run 24 clang processes at once, and big files then failed for lack of memory."""
+    try:
+        import precheck
+        return max(1, min(24, precheck.suggested_jobs(precheck._ram_gb())))
+    except Exception:                            # noqa: BLE001
+        return min(8, os.cpu_count() or 4)
 
 
 def make_plan(cx):
@@ -1014,6 +1070,8 @@ def parse(argv):
                                         '.nsz decompression (about 25 GB; default <repo>\\build). Remembered in build_location.txt, '
                                         'so Resume, setup.py, run.py, Play SSBU.bat and the shortcuts use it too')
     ap.add_argument('--jobs', type=int, help='parallel compiler jobs')
+    ap.add_argument('--no-inline', action='store_true', help='a shorter game compile (about 45 %% less), a slower game (setup.py --no-inline)')
+    ap.add_argument('--rollback', action='store_true', help='not needed any more (online rollback runs on the normal build); ignored')
     ap.add_argument('--prepare-only', action='store_true', help='stop before the build (steps 1-7 only)')
     ap.add_argument('--runtime', help='prebuilt runtime package (zip or folder) to use instead of the one of the GitHub Release')
     ap.add_argument('--no-runtime', action='store_true', help='build everything here, the exe too (needs the MSVC Build Tools)')

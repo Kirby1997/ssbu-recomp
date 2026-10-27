@@ -1,6 +1,6 @@
 /* datapaths.c - the player's game data on Linux: where they are (CLI, environment, saved choice, build layout), whether
  * they are usable, and the saved choice itself. See datapaths.h. Linux only; the Windows build does not compile it. */
-#ifndef _WIN32
+#ifdef __linux__
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>

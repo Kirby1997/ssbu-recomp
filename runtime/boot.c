@@ -10,7 +10,7 @@
 #include <time.h>
 #include "runtime.h"
 #include "hostrt.h"
-#ifndef _WIN32
+#ifdef __linux__
 #include "datapaths.h"
 #endif
 
@@ -328,7 +328,7 @@ static DWORD WINAPI crash_test(LPVOID arg) {
     return 0;
 }
 
-#ifdef _WIN32
+#ifndef __linux__
 /* A launch without scripts/run.py (the exe started by itself, from build\work): the RomFS folder that run.py would pass is
  * taken from ..\state.json ("romfs", written by scripts/setup.py) when that folder has data.arc. A variable that is set is
  * left alone. Without this a direct start looked for ..\romfs, found no data.arc, and the game crashed reading the file it
@@ -499,7 +499,7 @@ static void check_romfs(void) {
 #endif
 
 int main(int argc, char **argv) {
-#ifndef _WIN32
+#ifdef __linux__
     if (dp_take_args(&argc, argv) < 0) return 1;     /* datapaths.c: --data/--fonts/--dlc/--userdata/--check-data leave argv */
     __argc = argc;
     if (argc == 1) {                         /* no main.elf named: the build's own (state.json game_version), not ..\binaries\13.0.4 */
