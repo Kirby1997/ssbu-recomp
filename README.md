@@ -36,12 +36,13 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 > - **Memory ordering:** the Switch's acquire / release and exclusive accesses map to ARM's own (`ldar` / `stlr` /
 >   `casal`); on x86 they could rely on the CPU's strong ordering, on ARM they can't.
 > - **Addresses below 2^47:** the game assumes 47-bit pointers, but the kernel hands out memory above that on aarch64;
->   heap and `VirtualAlloc` are kept low.
+>   heap, `VirtualAlloc` and thread and fiber stacks are kept low.
+> - **Threads and fibers:** a fiber switch is a register save (no system call); fiber-local storage and critical
+>   sections behave as on Windows when another thread resumes a fiber.
 > - **Files:** case-insensitive paths and crash-safe save renames. **Game data:** found the same way on every start,
 >   with an in-game picker for Game Mode to come.
-> - Still to do before the first boot: thread and fiber stacks below 2^47, fast ARM fibers and fiber-local storage,
->   fiber-safe TLS, Windows-style locks, crash reports. Then performance work: the Frame has far less headroom than
->   the PCs upstream is tested on.
+> - Still to do before the first boot: crash reports, and running the thread / fiber tests on the Frame. Then
+>   performance work: the Frame has far less headroom than the PCs upstream is tested on.
 >
 > Build from an x86-64 PC (`source toolchain/env.sh`, sysroot from `toolchain/sync_sysroot.sh`) or natively on the
 > Frame. As upstream: everything is generated from **your own dump** of the game; nothing of the game is in this
