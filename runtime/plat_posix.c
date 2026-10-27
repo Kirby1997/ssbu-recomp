@@ -1722,8 +1722,10 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {      /* rename() replace
 BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
     char a[PATH_MAX], b[PATH_MAX];
     int in = open(P(from, a), O_RDONLY | O_CLOEXEC);
+    if (in < 0 && plat_ci_retry(a)) in = open(a, O_RDONLY | O_CLOEXEC);      /* as CreateFileA: the source in another case */
     if (in < 0) return fail_errno();
-    int out = open(P(to, b), O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
+    plat_ci_pre(P(to, b));                                                  /* an existing target in another case is the one written */
+    int out = open(b, O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
     if (out < 0) { close(in); return fail_errno(); }
     char buf[1 << 16]; ssize_t k; BOOL ok = TRUE;
     while ((k = read(in, buf, sizeof buf)) > 0) if (write(out, buf, (size_t)k) != k) { ok = fail_errno(); break; }

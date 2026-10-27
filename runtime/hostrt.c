@@ -1052,7 +1052,7 @@ static int uc_write(const ucontext_t *u) {
     const uint8_t *p = (const uint8_t *)u->uc_mcontext.__reserved, *e = p + sizeof u->uc_mcontext.__reserved;
     while (p + 8 <= e) {
         uint32_t magic, size; memcpy(&magic, p, 4); memcpy(&size, p + 4, 4);
-        if (!magic || size < 8 || p + size > e) break;
+        if (!magic || size < 8 || size > (size_t)(e - p)) break;
         if (magic == 0x45535201u && size >= 16) {           /* ESR_MAGIC: struct esr_context { head; u64 esr; } */
             uint64_t esr; memcpy(&esr, p + 8, 8);
             uint32_t ec = (uint32_t)(esr >> 26) & 0x3f;

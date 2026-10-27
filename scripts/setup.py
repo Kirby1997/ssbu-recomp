@@ -1221,6 +1221,9 @@ def game_env(cx, **extra):
 
 
 def step_check(cx):
+    if cx.arm64 and not cx.native:                       # a cross build: this host cannot run the aarch64 exe
+        say('  self-tests: skipped (aarch64 exe: run them on the Frame)')
+        return
     exe = os.path.join(cx.work, exe_name(cx))
     main_elf = os.path.join(cx.bin, 'main.elf')
     scratch = os.path.join(cx.build, 'selftest_userdata')
