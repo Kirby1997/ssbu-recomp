@@ -39,8 +39,10 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 >   heap and `VirtualAlloc` are kept low.
 > - **Files:** case-insensitive paths and crash-safe save renames. **Game data:** found the same way on every start,
 >   with an in-game picker for Game Mode to come.
+> - **Crash reports:** written without malloc or stdio, on a stack of their own, to `<exe>_crash.txt` in the user data
+>   folder (host and guest call stacks as module+offset); the process then dies of the original signal, core dump included.
 > - Still to do before the first boot: thread and fiber stacks below 2^47, fast ARM fibers and fiber-local storage,
->   fiber-safe TLS, Windows-style locks, crash reports. Then performance work: the Frame has far less headroom than
+>   fiber-safe TLS, Windows-style locks. Then performance work: the Frame has far less headroom than
 >   the PCs upstream is tested on.
 >
 > Build from an x86-64 PC (`source toolchain/env.sh`, sysroot from `toolchain/sync_sysroot.sh`) or natively on the

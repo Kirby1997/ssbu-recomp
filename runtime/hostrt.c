@@ -8,6 +8,9 @@
 #include <dbghelp.h>                                /* minidump types; dbghelp.dll itself is loaded only when a dump is written */
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include "plat_crash.h"
+#endif
 
 #define FILE_OFF 0x1000ULL
 #define IMAGE_SIZE 0x7500000ULL          /* the whole image with bss: 13.0.4 and 13.0.5 both end below it */
@@ -698,7 +701,8 @@ void module_coverage_report(FILE *out);      /* nnro.c: script module functions 
 void (*g_exit_report_hook)(FILE *);          /* a test's own last line (nnsdk2.c eh_main_test) */
 void (*g_plugin_report_hook)(void);          /* skyline.c: how often the plugins' hooks ran */
 
-void report_and_exit(int code) {
+/* The run's summaries (also the second step of a crash report on Linux aarch64: plat_crash.c). Does not end the process. */
+static void report_summaries(void) {
     if (g_exit_report_hook) g_exit_report_hook(stdout);
     if (g_plugin_report_hook) g_plugin_report_hook();
     audit_exit_counts();
@@ -710,8 +714,11 @@ void report_and_exit(int code) {
     hid_report(stdout);
     os_thread_report(stdout);
     module_coverage_report(stdout);
-    if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }
+    if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); g_trace = NULL; }
     fflush(stdout);
+}
+void report_and_exit(int code) {
+    report_summaries();
     ExitProcess((UINT)code);
 }
 
@@ -996,6 +1003,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
 }
 #else
 #include <signal.h>
+#include <sys/stat.h>                                   /* mkdir: the report folder (Linux aarch64) */
 #ifndef __APPLE__                                   /* macOS: the context types come with <signal.h> */
 #include <ucontext.h>
 #endif
@@ -1125,6 +1133,65 @@ static void crash_file_report(int sig, siginfo_t *si, ucontext_t *u) {
     fprintf(f, "\n");
     fclose(f);
 }
+#ifdef SSBU_ASYNC_CRASH
+/* Linux aarch64: the report is plat_crash.c's (async-signal-safe, alternate stack, report file opened by the handler); this is
+ * what hostrt.c adds to it. The old crash_signal / crash_file_report above stay as the fallback when it cannot be installed. */
+const char *nro_module_name_of(uint64_t addr, uint64_t *off);     /* nnro.c */
+/* One guest function of the call stack: "f_<addr>", and the module and offset it is in. */
+static void crash_put_guest(uint64_t g) {
+    uint64_t off = 0;
+    const char *m = nro_module_name_of(g, &off);
+    crash_put("f_"); crash_put_hex(g, 0);
+    if (m) { crash_put(" ("); crash_put(m); crash_put("+0x"); crash_put_hex(off, 0); crash_put(")"); }
+    else if (g >= GUEST_BASE && g < GUEST_BASE + IMAGE_SIZE) { crash_put(" (main+0x"); crash_put_hex(g - GUEST_BASE, 0); crash_put(")"); }
+}
+/* crash_install's section (async-signal-safe: thread variables, the lifted function tables, write(2) through plat_crash.c) */
+static void crash_section(const crash_info *ci) {
+    uintptr_t lo = 0, hi = 0;
+    if (plat_current_fiber_stack(&lo, &hi)) {
+        crash_put("running on a host FIBER stack 0x"); crash_put_hex(lo, 0); crash_put("..0x"); crash_put_hex(hi, 0);
+        crash_put(ci->sp >= lo && ci->sp < hi ? ", stack pointer inside it\n" : ", stack pointer OUTSIDE it\n");
+    } else crash_put("running on the thread's own stack\n");
+    Ctx *c = t_cur_ctx;
+    if (c) {
+        crash_put("last guest function entered: "); crash_put_guest(c->fn); crash_put("\nguest registers:\n");
+        for (int i = 0; i < 31; i++) {
+            crash_put(i < 10 ? "  x" : " x"); crash_put_dec(i); crash_put(" "); crash_put_hex(c->x[i], 16); crash_put(i % 3 == 2 ? "\n" : "");
+        }
+        crash_put("\n  sp  "); crash_put_hex(c->x[31], 16); crash_put("\n");
+    } else crash_put("no guest code was running on this thread\n");
+    crash_put("guest call stack (innermost first):\n");
+    uint64_t last = 0;
+    int shown = 0;
+    for (int i = 0; i < ci->npcs && shown < 40; i++) {
+        uint64_t g = guest_function_of(ci->pcs[i]);
+        if (g && g != last) { crash_put("  "); crash_put_guest(g); crash_put("\n"); shown++; last = g; }
+    }
+    if (!shown) crash_put("  (no lifted function on the host stack)\n");
+}
+/* Second step: the run's summaries with stdio (they may hang on a lock the crash left held: plat_crash.c ends it after SSBU_CRASH_TIMEOUT). */
+static void crash_summaries(const crash_info *ci) { (void)ci; report_summaries(); }
+/* Where the report goes, decided now and not in the handler: SSBU_REPORT_DIR, else the user data folder (SSBU_USERDATA, which
+ * boot.c's dp_apply has set and created by now), else the exe's folder; the file is "<exe name>_crash.txt". */
+static int crash_report_path(char *out, size_t size) {
+    char exe[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    for (char *p = exe; *p; p++) if (*p == '\\') *p = '/';
+    char *base = strrchr(exe, '/');
+    const char *dir = getenv("SSBU_REPORT_DIR");
+    if (!dir || !dir[0]) dir = getenv("SSBU_USERDATA");
+    int k;
+    if (dir && dir[0]) { mkdir(dir, 0755); k = snprintf(out, size, "%s/%s_crash.txt", dir, base ? base + 1 : exe); }
+    else k = snprintf(out, size, "%s_crash.txt", exe);
+    return k > 0 && (size_t)k < size;
+}
+static int install_async_crash(void) {
+    char path[4096];
+    crash_set_fault_filter(plat_write_fault);
+    return crash_install(crash_report_path(path, sizeof path) ? path : NULL, crash_section, crash_summaries, 4);
+}
+#endif
 static void install_crash_handler(void);
 static void crash_signal(int sig, siginfo_t *si, void *uc) {
     if ((sig == SIGSEGV || sig == SIGBUS) && plat_write_fault(si->si_addr)) {     /* macOS write watch: a first write, resolved */
@@ -1165,6 +1232,9 @@ static void crash_signal(int sig, siginfo_t *si, void *uc) {
     report_and_exit(4);
 }
 static void install_crash_handler(void) {
+#ifdef SSBU_ASYNC_CRASH
+    if (install_async_crash() == 0) return;
+#endif
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = crash_signal;

@@ -37,6 +37,7 @@
 #include <signal.h>
 #include <pwd.h>
 #include <unwind.h>
+#include "plat_crash.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -288,6 +289,9 @@ static int is_obj(HANDLE h) { return h && h != INVALID_HANDLE_VALUE && h != PSEU
 static __thread PlatObj *t_self;
 static void *thread_tramp(void *p) {
     PlatObj *o = p;
+#ifdef SSBU_ASYNC_CRASH
+    crash_thread_init();                       /* alternate signal stack: a stack overflow on this thread still gets its crash report (plat_crash.c) */
+#endif
     t_self = o;
     o->tid = os_tid();
     pthread_mutex_lock(&o->m);
