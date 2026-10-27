@@ -47,6 +47,7 @@ Written and tested only on other machines (macOS arm64) so far. Run these on the
 
 | Script | Checks |
 |---|---|
+| `tests/port/threads/run_frame.sh` | stacks and `__thread` below 2^47, fibers, fiber-local storage, critical sections |
 | `tests/port/crash/run_frame.sh` | crash reports (gcc, clang, fortify, PAC) |
 | `tests/port/picker/run_frame.sh` | the picker's logic and its SDL window with a virtual gamepad |
 | `tests/port/boot`, `tests/port/fs` | game data lookup and file layer after the upstream merge |

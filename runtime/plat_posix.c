@@ -83,6 +83,11 @@ static int dyld_image_of(void *m, const char **path, uintptr_t *base) {
 #else
 #define PLAT_SO_EXT ".so"
 #endif
+/* aarch64 Linux (the Steam Frame): fibers switch with fiber_switch_a64 below, thread and fiber stacks are placed below
+ * 2^47 (low_stack). PLAT_LINUX_PATHS_ON_MAC (tests/port/threads/run.sh mac) compiles the same code on macOS arm64. */
+#if defined(__aarch64__) && (defined(__linux__) || defined(PLAT_LINUX_PATHS_ON_MAC))
+#define PLAT_A64_LINUX 1
+#endif
 static pid_t os_tid(void) {                    /* the kernel's id of the calling thread */
 #ifdef __APPLE__
     uint64_t t = 0;
@@ -203,8 +208,63 @@ static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), vo
     if (r == -1 && e == ETIMEDOUT) { t_lasterr = 1460; return FALSE; }      /* ERROR_TIMEOUT */
     return TRUE;
 }
+#ifdef PLAT_LINUX_SYNC
+/* CRITICAL_SECTION (plat/windows.h): a futex word (0 free, 1 held, 2 held and maybe waited on) under Windows' owner and
+ * recursion fields. The owner is a thread id, as on Windows: a thread that enters while it is the owner only counts up
+ * (also when the entering code is another fiber than the one that took it, as on Windows), and LeaveCriticalSection
+ * releases whoever calls it, so a fiber that took the lock on one host thread can leave it on another. Before it waits
+ * the lock spins a while on a free word (the game's mutexes are held for short stretches). */
+static inline void cs_relax(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+static void cs_acquire(CRITICAL_SECTION *cs) {
+    uint32_t z = 0;
+    if (__atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    for (int i = 0; i < 100; i++) {
+        cs_relax();
+        z = 0;
+        if (__atomic_load_n(&cs->Lock, __ATOMIC_RELAXED) == 0 && __atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    }
+    while (__atomic_exchange_n(&cs->Lock, 2, __ATOMIC_ACQUIRE) != 0) futex(&cs->Lock, FUTEX_WAIT_PRIVATE, 2, NULL);
+}
+void InitializeCriticalSection(CRITICAL_SECTION *cs) { memset(cs, 0, sizeof *cs); }
+void EnterCriticalSection(CRITICAL_SECTION *cs) {
+    HANDLE me = (HANDLE)(uintptr_t)GetCurrentThreadId();
+    if (__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->RecursionCount++; return; }
+    cs_acquire(cs);
+    __atomic_store_n(&cs->OwningThread, me, __ATOMIC_RELAXED);
+    cs->RecursionCount = 1;
+}
+BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
+    HANDLE me = (HANDLE)(uintptr_t)GetCurrentThreadId();
+    if (__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->RecursionCount++; return TRUE; }
+    uint32_t z = 0;
+    if (!__atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return FALSE;
+    __atomic_store_n(&cs->OwningThread, me, __ATOMIC_RELAXED);
+    cs->RecursionCount = 1;
+    return TRUE;
+}
+void LeaveCriticalSection(CRITICAL_SECTION *cs) {
+    if (cs->RecursionCount <= 0) {                        /* not entered: Windows corrupts the section; here it is said once */
+        static volatile int said;
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) fprintf(stderr, "plat: LeaveCriticalSection(%p) of a section nobody entered\n", (void *)cs);
+        return;
+    }
+    if (--cs->RecursionCount) return;
+    __atomic_store_n(&cs->OwningThread, (HANDLE)0, __ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&cs->Lock, 0, __ATOMIC_RELEASE) == 2) futex(&cs->Lock, FUTEX_WAKE_PRIVATE, 1, NULL);
+}
+/* As on Windows the section is left once for the wait (callers have entered it once) and entered again after it. */
+static void cs_unlock(void *l) { LeaveCriticalSection(l); }
+static void cs_lock(void *l) { EnterCriticalSection(l); }
+#else
 static void cs_unlock(void *l) { pthread_mutex_unlock(l); }
 static void cs_lock(void *l) { pthread_mutex_lock(l); }
+#endif
 static void srw_unlock(void *l) { pthread_rwlock_unlock(l); }
 static void srw_lock_x(void *l) { pthread_rwlock_wrlock(l); }
 static void srw_lock_s(void *l) { pthread_rwlock_rdlock(l); }
@@ -214,6 +274,7 @@ BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULO
 }
 void WakeConditionVariable(CONDITION_VARIABLE *cv) { __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST); futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL); }
 void WakeAllConditionVariable(CONDITION_VARIABLE *cv) { __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST); futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL); }
+#ifndef PLAT_LINUX_SYNC                           /* (Linux: above) */
 void InitializeCriticalSection(CRITICAL_SECTION *cs) {         /* a CRITICAL_SECTION is re-entrant on Windows: a recursive mutex */
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
@@ -221,6 +282,7 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs) {         /* a CRITICAL_SEC
     pthread_mutex_init(cs, &a);
     pthread_mutexattr_destroy(&a);
 }
+#endif
 BOOL InitOnceExecuteOnce(INIT_ONCE *once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx) {
     /* 0 not run, 1 running, 2 done. Per object (a callback may start another init-once); a failed callback lets the next caller retry. */
     for (;;) {
@@ -249,6 +311,9 @@ typedef struct PlatObj {
     /* threads */
     pthread_t th; pid_t tid; DWORD exit_code; int started;
     LPTHREAD_START_ROUTINE fn; LPVOID arg;
+#ifdef PLAT_A64_LINUX
+    void *stack_map; size_t stack_map_size;      /* the thread's own stack (low_stack), guard page included */
+#endif
     /* files, finds, mappings */
     int fd;
     DIR *dir; char dir_path[MAX_PATH]; char pattern[MAX_PATH];
@@ -286,6 +351,29 @@ static int is_tagged(HANDLE h, uint64_t tag) { return ((uint64_t)(uintptr_t)h & 
 static int is_obj(HANDLE h) { return h && h != INVALID_HANDLE_VALUE && h != PSEUDO_THREAD && h != PSEUDO_PROCESS && !is_tagged(h, FD_TAG) && !is_tagged(h, PID_TAG); }
 
 /* threads */
+#ifdef PLAT_LINUX_SYNC
+static void fls_thread_end(void);
+#endif
+#ifdef PLAT_A64_LINUX
+/* aarch64 Linux: glibc maps a thread's stack at the top of the address space (above 2^47 on the Frame) and puts the
+ * thread's TLS block (the __thread variables; the guest is handed some of their addresses: errno, h_errno,
+ * gethostbyname's result) in that mapping. CreateThread gives every thread a stack from low_stack instead, below 2^47
+ * with a 64 KB guard under it, and glibc then puts the TLS block there too. glibc does not free a stack it was given:
+ * a thread that ends puts its stack on g_dead as its last step, and the next CreateThread joins those threads (which
+ * waits only for the rest of their exit) and unmaps their stacks. */
+#define STACK_GUARD 0x10000u
+static void *low_stack(size_t size, size_t guard);
+typedef struct DeadStack { struct DeadStack *next; pthread_t th; void *map; size_t size; } DeadStack;
+static DeadStack *g_dead;
+static pthread_mutex_t g_dead_lock = PTHREAD_MUTEX_INITIALIZER;
+static void dead_reap(void) {
+    pthread_mutex_lock(&g_dead_lock);
+    DeadStack *d = g_dead;
+    g_dead = NULL;
+    pthread_mutex_unlock(&g_dead_lock);
+    while (d) { DeadStack *n = d->next; pthread_join(d->th, NULL); munmap(d->map, d->size); free(d); d = n; }
+}
+#endif
 static __thread PlatObj *t_self;
 static void *thread_tramp(void *p) {
     PlatObj *o = p;
@@ -298,11 +386,27 @@ static void *thread_tramp(void *p) {
     while (!o->started) pthread_cond_wait(&o->cv, &o->m);     /* CREATE_SUSPENDED: held until ResumeThread */
     pthread_mutex_unlock(&o->m);
     DWORD r = o->fn(o->arg);
+#ifdef PLAT_LINUX_SYNC
+    fls_thread_end();                                         /* FLS callbacks before the handle is signalled, as on Windows */
+#endif
+#ifdef PLAT_A64_LINUX
+    void *map = o->stack_map;
+    size_t map_size = o->stack_map_size;
+#endif
     pthread_mutex_lock(&o->m);
     o->exit_code = r; o->signaled = 1;
     pthread_cond_broadcast(&o->cv);
     pthread_mutex_unlock(&o->m);
     obj_release(o);
+#ifdef PLAT_A64_LINUX
+    DeadStack *d = malloc(sizeof *d);                         /* (no memory: the stack stays mapped) */
+    if (d) {
+        d->th = pthread_self(); d->map = map; d->size = map_size;
+        pthread_mutex_lock(&g_dead_lock);
+        d->next = g_dead; g_dead = d;
+        pthread_mutex_unlock(&g_dead_lock);
+    }
+#endif
     return NULL;
 }
 HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags, DWORD *tid) {
@@ -311,10 +415,23 @@ HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTIN
     o->fn = fn; o->arg = arg; o->refs = 2; o->started = !(flags & CREATE_SUSPENDED); o->exit_code = STILL_ACTIVE;
     pthread_attr_t a;
     pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, stack ? (stack < (1 << 20) ? (1 << 20) : stack) : (SIZE_T)8 << 20);   /* Windows default: 1 MB; ours: 8 MB */
+    SIZE_T size = stack ? (stack < (1 << 20) ? (1 << 20) : stack) : (SIZE_T)8 << 20;   /* Windows default: 1 MB; ours: 8 MB */
+#ifdef PLAT_A64_LINUX
+    dead_reap();
+    size = (size + 0xffff) & ~(SIZE_T)0xffff;
+    o->stack_map = low_stack(size, STACK_GUARD);
+    if (!o->stack_map) { pthread_attr_destroy(&a); free(o); t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
+    o->stack_map_size = size + STACK_GUARD;
+    pthread_attr_setstack(&a, (uint8_t *)o->stack_map + STACK_GUARD, size);   /* joinable: dead_reap joins it */
+#else
+    pthread_attr_setstacksize(&a, size);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+#endif
     int e = pthread_create(&o->th, &a, thread_tramp, o);
     pthread_attr_destroy(&a);
+#ifdef PLAT_A64_LINUX
+    if (e) munmap(o->stack_map, o->stack_map_size);
+#endif
     if (e) { free(o); t_lasterr = err_from_errno(e); return NULL; }
     if (tid) { while (!__atomic_load_n(&o->tid, __ATOMIC_ACQUIRE)) sched_yield(); *tid = (DWORD)o->tid; }
     return o;
@@ -527,17 +644,60 @@ DWORD TlsAlloc(void) { pthread_key_t k; return pthread_key_create(&k, NULL) ? TL
 BOOL TlsFree(DWORD i) { return pthread_key_delete((pthread_key_t)i) == 0; }
 LPVOID TlsGetValue(DWORD i) { return pthread_getspecific((pthread_key_t)i); }
 BOOL TlsSetValue(DWORD i, LPVOID v) { return pthread_setspecific((pthread_key_t)i, v) == 0; }
+#ifndef PLAT_LINUX_SYNC                           /* (Linux: with the fibers below) */
 /* FLS: the callback runs when a thread ends (pthread key destructor); Windows also runs it when a fiber is deleted. */
 DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION cb) { pthread_key_t k; return pthread_key_create(&k, cb) ? FLS_OUT_OF_INDEXES : (DWORD)k; }
 BOOL FlsFree(DWORD i) { return pthread_key_delete((pthread_key_t)i) == 0; }
 PVOID FlsGetValue(DWORD i) { return pthread_getspecific((pthread_key_t)i); }
 BOOL FlsSetValue(DWORD i, PVOID v) { return pthread_setspecific((pthread_key_t)i, v) == 0; }
+#endif
 
 /* ================================================================ fibers
  * On ucontext. As on Windows a fiber can be resumed on another thread than the one it last ran on (the running fiber is
  * per thread: t_fiber); swapcontext also saves and restores the signal mask, one system call per switch. The stack is
  * reserved whole at creation (MAP_NORESERVE: pages are used as touched), not grown from a commit size. */
-#if defined(__APPLE__) && defined(__aarch64__)
+#ifdef PLAT_LINUX_SYNC
+typedef struct PlatFls PlatFls;
+#define FIBER_FLS PlatFls *fls;                          /* the fiber's FLS values (NULL until one is set) */
+#else
+#define FIBER_FLS
+#endif
+#if defined(PLAT_A64_LINUX)
+/* aarch64 Linux: no ucontext (swapcontext is a system call per switch, for the signal mask). The switch saves exactly
+ * what AAPCS64 asks a callee to keep: x19-x28, fp, lr, sp and d8-d15 (the low halves of v8-v15; SVE / SME state is not
+ * callee-saved for an ordinary call), and FPCR, which is per fiber: saved on every switch, written back only when it
+ * differs (the msr is the costly part), so a fiber's rounding / flush-to-zero mode does not leak into the next one on
+ * the thread. x18 is a temporary on Linux (no shadow call stack here). `bti c` is a landing pad (a NOP without BTI);
+ * the switch never signs lr itself: callers' paciasp / autiasp pairs stay balanced because sp comes back with lr. A
+ * new fiber's first switch "returns" into fiber_entry on its own stack, with fp = 0 (the end of a frame-chain walk).
+ * The signal mask is not switched. No GCS (guarded control stack) switch: the Frame's cores have no GCS. The stack lies
+ * below 2^47 (low_stack) above a 64 KB guard. */
+typedef struct { uint64_t r[13]; uint64_t d[8]; uint64_t fpcr; } FiberRegs;    /* r: x19..x28, fp, lr, sp */
+void fiber_switch_a64(FiberRegs *from, FiberRegs *to);
+#ifdef __APPLE__                                  /* the macOS check (PLAT_LINUX_PATHS_ON_MAC): Mach-O spelling */
+#define FIBER_SYM "_fiber_switch_a64"
+#define FIBER_SYM_HEAD ".private_extern " FIBER_SYM "\n"
+#define FIBER_SYM_TAIL ""
+#else
+#define FIBER_SYM "fiber_switch_a64"
+#define FIBER_SYM_HEAD ".hidden " FIBER_SYM "\n.type " FIBER_SYM ", %function\n"
+#define FIBER_SYM_TAIL ".size " FIBER_SYM ", .-" FIBER_SYM "\n"
+#endif
+__asm__(".text\n.globl " FIBER_SYM "\n" FIBER_SYM_HEAD ".p2align 4\n" FIBER_SYM ":\n"
+        "  hint #34\n"                                                                  /* bti c */
+        "  mov x9, sp\n"
+        "  stp x19, x20, [x0, #0]\n  stp x21, x22, [x0, #16]\n  stp x23, x24, [x0, #32]\n  stp x25, x26, [x0, #48]\n"
+        "  stp x27, x28, [x0, #64]\n  stp x29, x30, [x0, #80]\n  str x9, [x0, #96]\n"
+        "  stp d8, d9, [x0, #104]\n  stp d10, d11, [x0, #120]\n  stp d12, d13, [x0, #136]\n  stp d14, d15, [x0, #152]\n"
+        "  mrs x10, fpcr\n  str x10, [x0, #168]\n"
+        "  ldp x19, x20, [x1, #0]\n  ldp x21, x22, [x1, #16]\n  ldp x23, x24, [x1, #32]\n  ldp x25, x26, [x1, #48]\n"
+        "  ldp x27, x28, [x1, #64]\n  ldp x29, x30, [x1, #80]\n  ldr x9, [x1, #96]\n  mov sp, x9\n"
+        "  ldp d8, d9, [x1, #104]\n  ldp d10, d11, [x1, #120]\n  ldp d12, d13, [x1, #136]\n  ldp d14, d15, [x1, #152]\n"
+        "  ldr x11, [x1, #168]\n  cmp x10, x11\n  b.eq 1f\n  msr fpcr, x11\n"
+        "1: ret\n" FIBER_SYM_TAIL);
+_Static_assert(__builtin_offsetof(FiberRegs, d) == 104 && __builtin_offsetof(FiberRegs, fpcr) == 168, "fiber_switch_a64 offsets");
+typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; FIBER_FLS } Fiber;
+#elif defined(__APPLE__) && defined(__aarch64__)
 /* macOS on Apple Silicon has no working ucontext: a switch of the callee-saved registers instead (x19-x28, fp, lr, sp,
  * d8-d15; everything else is the caller's to keep across a call). A new fiber's first switch "returns" into fiber_entry
  * on its own stack. The signal mask is not switched (ucontext did that with one system call per switch). */
@@ -554,23 +714,165 @@ __asm__(".text\n.globl _plat_fiber_switch\n.p2align 2\n_plat_fiber_switch:\n"
         "  ret\n");
 typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; } Fiber;
 #else
-typedef struct { ucontext_t uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; } Fiber;
+typedef struct { ucontext_t uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; FIBER_FLS } Fiber;
 #endif
 static __thread Fiber *t_fiber;
+#ifdef PLAT_LINUX_SYNC
+/* ---- fiber-local storage (Linux)
+ * One value set (PlatFls) per fiber (Fiber.fls) and per thread (t_fls_own, used while no fiber is current on it), made
+ * at the first non-NULL FlsSetValue. FlsGetValue / FlsSetValue use the set of the calling thread's current fiber
+ * (t_fiber), so the values go with the fiber when another thread resumes it (the game's fiber jobs: nncxxrt.c's
+ * exception state, nnunwind.c's records, fighter_host.c's per-fiber block). Only the thread running a fiber touches its
+ * set, without a lock; the slots are atomics because FlsFree and the end of a set take values out of them under
+ * g_fls_lock, which also holds the list of all sets. Callbacks run with no lock held: on DeleteFiber, on FlsFree, and
+ * at the end of a thread for the current fiber's set and the thread's own (CreateThread threads before the handle is
+ * signalled, other threads from a pthread key destructor; up to 4 rounds when a callback sets values again). */
+struct PlatFls { PlatFls *prev, *next; void *v[FLS_MAXIMUM_AVAILABLE]; };
+static pthread_mutex_t g_fls_lock = PTHREAD_MUTEX_INITIALIZER;
+static PlatFls g_fls_all = {&g_fls_all, &g_fls_all, {0}};
+static uint8_t g_fls_used[FLS_MAXIMUM_AVAILABLE];          /* 0 free, 1 allocated, 2 FlsFree running (written under the lock) */
+static PFLS_CALLBACK_FUNCTION g_fls_cb[FLS_MAXIMUM_AVAILABLE];
+static __thread PlatFls *t_fls_own;
+static __thread int t_fls_armed;
+static pthread_key_t g_fls_key;
+static pthread_once_t g_fls_once = PTHREAD_ONCE_INIT;
+static void fls_key_dtor(void *p) { (void)p; t_fls_armed = 0; fls_thread_end(); }
+static void fls_key_init(void) { if (pthread_key_create(&g_fls_key, fls_key_dtor)) { fprintf(stderr, "plat: FLS: no pthread key\n"); ExitProcess(3); } }
+static void fls_arm(void) {                               /* the end of this thread frees the sets it has then */
+    if (t_fls_armed) return;
+    pthread_once(&g_fls_once, fls_key_init);
+    t_fls_armed = 1;
+    pthread_setspecific(g_fls_key, (void *)1);
+}
+static PlatFls **fls_cur(void) { Fiber *f = t_fiber; return f ? &f->fls : &t_fls_own; }
+static void fls_set_free(PlatFls *s) {                    /* off the list, then the callbacks of its values, then freed */
+    if (!s) return;
+    PFLS_CALLBACK_FUNCTION cb[FLS_MAXIMUM_AVAILABLE];
+    void *val[FLS_MAXIMUM_AVAILABLE];
+    int n = 0;
+    pthread_mutex_lock(&g_fls_lock);
+    s->prev->next = s->next; s->next->prev = s->prev;
+    for (int i = 0; i < FLS_MAXIMUM_AVAILABLE; i++) {
+        void *v = __atomic_exchange_n(&s->v[i], NULL, __ATOMIC_RELAXED);
+        if (v && g_fls_used[i] && g_fls_cb[i]) { cb[n] = g_fls_cb[i]; val[n] = v; n++; }
+    }
+    pthread_mutex_unlock(&g_fls_lock);
+    free(s);
+    for (int k = 0; k < n; k++) cb[k](val[k]);
+}
+static void fls_thread_end(void) {
+    for (int round = 0; round < 4; round++) {
+        Fiber *f = t_fiber;
+        PlatFls *a = f ? f->fls : NULL, *b = t_fls_own;
+        if (f) f->fls = NULL;
+        t_fls_own = NULL;
+        if (!a && !b) return;
+        fls_set_free(a);
+        fls_set_free(b);
+    }
+}
+DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION cb) {               /* index 0 is not handed out: a zeroed index is never valid */
+    pthread_mutex_lock(&g_fls_lock);
+    for (DWORD i = 1; i < FLS_MAXIMUM_AVAILABLE; i++) {
+        if (g_fls_used[i]) continue;
+        g_fls_cb[i] = cb;
+        __atomic_store_n(&g_fls_used[i], 1, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_fls_lock);
+        return i;
+    }
+    pthread_mutex_unlock(&g_fls_lock);
+    t_lasterr = 259;                                      /* ERROR_NO_MORE_ITEMS */
+    return FLS_OUT_OF_INDEXES;
+}
+/* Every set's value in the slot goes to the callback (the lock is let go around each call, and the scan starts over);
+ * the index is handed out again only after that. */
+BOOL FlsFree(DWORD i) {
+    pthread_mutex_lock(&g_fls_lock);
+    if (i >= FLS_MAXIMUM_AVAILABLE || g_fls_used[i] != 1) { pthread_mutex_unlock(&g_fls_lock); t_lasterr = ERROR_INVALID_PARAMETER; return FALSE; }
+    PFLS_CALLBACK_FUNCTION cb = g_fls_cb[i];
+    __atomic_store_n(&g_fls_used[i], 2, __ATOMIC_RELAXED);    /* Get / Set fail from here on */
+    for (;;) {
+        void *v = NULL;
+        for (PlatFls *s = g_fls_all.next; s != &g_fls_all && !v; s = s->next) v = __atomic_exchange_n(&s->v[i], NULL, __ATOMIC_RELAXED);
+        if (!v) break;
+        if (!cb) continue;
+        pthread_mutex_unlock(&g_fls_lock);
+        cb(v);
+        pthread_mutex_lock(&g_fls_lock);
+    }
+    g_fls_cb[i] = NULL;
+    __atomic_store_n(&g_fls_used[i], 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_fls_lock);
+    return TRUE;
+}
+PVOID FlsGetValue(DWORD i) {
+    if (i >= FLS_MAXIMUM_AVAILABLE || __atomic_load_n(&g_fls_used[i], __ATOMIC_ACQUIRE) != 1) { t_lasterr = ERROR_INVALID_PARAMETER; return NULL; }
+    PlatFls *s = *fls_cur();
+    return s ? __atomic_load_n(&s->v[i], __ATOMIC_RELAXED) : NULL;
+}
+BOOL FlsSetValue(DWORD i, PVOID v) {
+    if (i >= FLS_MAXIMUM_AVAILABLE || __atomic_load_n(&g_fls_used[i], __ATOMIC_ACQUIRE) != 1) { t_lasterr = ERROR_INVALID_PARAMETER; return FALSE; }
+    PlatFls **ref = fls_cur(), *s = *ref;
+    if (!s) {
+        if (!v) return TRUE;
+        if (!(s = calloc(1, sizeof *s))) { t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return FALSE; }
+        pthread_mutex_lock(&g_fls_lock);
+        s->prev = &g_fls_all; s->next = g_fls_all.next;
+        g_fls_all.next->prev = s; g_fls_all.next = s;
+        pthread_mutex_unlock(&g_fls_lock);
+        *ref = s;
+        fls_arm();
+    }
+    __atomic_store_n(&s->v[i], v, __ATOMIC_RELAXED);
+    return TRUE;
+}
+/* tests (tests/port/threads): FLS value sets alive now */
+size_t plat_fls_sets(void) {
+    size_t n = 0;
+    pthread_mutex_lock(&g_fls_lock);
+    for (PlatFls *s = g_fls_all.next; s != &g_fls_all; s = s->next) n++;
+    pthread_mutex_unlock(&g_fls_lock);
+    return n;
+}
+#endif
 LPVOID ConvertThreadToFiber(LPVOID param) {
     if (t_fiber) return t_fiber;
     Fiber *f = calloc(1, sizeof *f);
     f->param = param; f->is_thread = 1;
+#ifdef PLAT_LINUX_SYNC
+    f->fls = t_fls_own;                                   /* the thread's FLS values become the fiber's, as on Windows */
+    t_fls_own = NULL;
+    fls_arm();
+#endif
     t_fiber = f;
     return f;
 }
-BOOL ConvertFiberToThread(void) { if (t_fiber && t_fiber->is_thread) free(t_fiber); t_fiber = NULL; return TRUE; }
+BOOL ConvertFiberToThread(void) {
+#ifdef PLAT_LINUX_SYNC
+    if (t_fiber && !t_fls_own) { t_fls_own = t_fiber->fls; t_fiber->fls = NULL; }    /* the values stay with the thread */
+    else if (t_fiber && t_fiber->is_thread) { PlatFls *s = t_fiber->fls; t_fiber->fls = NULL; fls_set_free(s); }   /* (it has its own already) */
+#endif
+    if (t_fiber && t_fiber->is_thread) free(t_fiber);
+    t_fiber = NULL;
+    return TRUE;
+}
 static void fiber_entry(void) { Fiber *f = t_fiber; f->fn(f->param); fprintf(stderr, "plat: a fiber returned\n"); ExitProcess(3); }
 LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_ROUTINE fn, LPVOID param) {
     (void)commit; (void)flags;
     Fiber *f = calloc(1, sizeof *f);
     f->fn = fn; f->param = param;
     f->stack_size = reserve ? reserve : (SIZE_T)1 << 20;
+#if defined(PLAT_A64_LINUX)
+    f->stack_size = (f->stack_size + 0xffff) & ~(size_t)0xffff;
+    uint8_t *m = low_stack(f->stack_size, STACK_GUARD);
+    if (!m) { free(f); return NULL; }
+    f->stack = m + STACK_GUARD;
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    f->uc.r[11] = (uint64_t)(uintptr_t)fiber_entry;                                     /* lr */
+    f->uc.r[12] = ((uint64_t)(uintptr_t)f->stack + f->stack_size) & ~(uint64_t)15;      /* sp */
+    f->uc.fpcr = fpcr;                                                                  /* the creator's mode */
+#else
     f->stack = mmap(NULL, f->stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
     if (f->stack == MAP_FAILED) { free(f); return NULL; }
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -582,13 +884,21 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     f->uc.uc_stack.ss_sp = f->stack; f->uc.uc_stack.ss_size = f->stack_size; f->uc.uc_link = NULL;
     makecontext(&f->uc, fiber_entry, 0);
 #endif
+#endif
     return f;
 }
+/* Nothing here touches a thread variable after the switch: it may return on another thread (the one that resumed the
+ * fiber has set t_fiber for itself). */
 void SwitchToFiber(LPVOID fiber) {
     Fiber *from = t_fiber, *to = fiber;
     if (from == to) return;
     t_fiber = to;
-#if defined(__APPLE__) && defined(__aarch64__)
+#ifdef PLAT_LINUX_SYNC
+    if (to->fls && !t_fls_armed) fls_arm();               /* this thread may end while running it: its values are freed then */
+#endif
+#if defined(PLAT_A64_LINUX)
+    fiber_switch_a64(&from->uc, &to->uc);
+#elif defined(__APPLE__) && defined(__aarch64__)
     plat_fiber_switch(&from->uc, &to->uc);
 #else
     swapcontext(&from->uc, &to->uc);
@@ -598,7 +908,16 @@ void DeleteFiber(LPVOID fiber) {
     Fiber *f = fiber;
     if (!f) return;
     if (f == t_fiber) { fprintf(stderr, "plat: DeleteFiber of the running fiber\n"); ExitProcess(3); }
+#ifdef PLAT_LINUX_SYNC
+    PlatFls *s = f->fls;
+    f->fls = NULL;
+    fls_set_free(s);                                      /* DeleteFiber runs the fiber's FLS callbacks, as on Windows */
+#endif
+#if defined(PLAT_A64_LINUX)
+    if (f->stack) munmap((uint8_t *)f->stack - STACK_GUARD, f->stack_size + STACK_GUARD);
+#else
     if (f->stack) munmap(f->stack, f->stack_size);
+#endif
     free(f);
 }
 LPVOID GetCurrentFiber(void) { return t_fiber; }
@@ -968,6 +1287,23 @@ static void *low_place(size_t n, int prot, int flags) {
     }
     errno = ENOMEM;
     return MAP_FAILED;
+}
+#endif
+#ifdef PLAT_A64_LINUX
+/* (C3b) Thread and fiber stacks: `size` bytes below 2^47 (low_place) over a `guard`-byte PROT_NONE guard, NULL when there
+ * is no room. Not entered in the VirtualQuery map (it reports them from /proc/self/maps, as before). */
+static void *low_stack(size_t size, size_t guard) {
+    size_t n = size + guard;
+#ifdef __APPLE__                                  /* the macOS check: placement is not what it checks */
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#else
+    pthread_mutex_lock(&g_vm_lock);
+    void *p = low_place(n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK);
+    pthread_mutex_unlock(&g_vm_lock);
+#endif
+    if (p == MAP_FAILED) return NULL;
+    if (guard && mprotect(p, guard, PROT_NONE)) { munmap(p, n); return NULL; }
+    return p;
 }
 #endif
 /* MEM_RESERVE maps the range PROT_NONE (address space only) and MEM_COMMIT is an mprotect; reservations start on 64 KB, the

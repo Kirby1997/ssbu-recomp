@@ -36,14 +36,16 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 > - **Memory ordering:** the Switch's acquire / release and exclusive accesses map to ARM's own (`ldar` / `stlr` /
 >   `casal`); on x86 they could rely on the CPU's strong ordering, on ARM they can't.
 > - **Addresses below 2^47:** the game assumes 47-bit pointers, but the kernel hands out memory above that on aarch64;
->   heap and `VirtualAlloc` are kept low.
+>   heap, `VirtualAlloc` and thread and fiber stacks are kept low.
+> - **Threads and fibers:** a fiber switch is a register save (no system call); fiber-local storage and critical
+>   sections behave as on Windows when another thread resumes a fiber.
 > - **Files:** case-insensitive paths and crash-safe save renames. **Game data:** found the same way on every start,
->   with an in-game picker for Game Mode (written, not yet run on the Frame).
+>   with an in-game picker for Game Mode.
 > - **Crash reports:** written without malloc or stdio, on a stack of their own, to `<exe>_crash.txt` in the user data
->   folder (host and guest call stacks as module+offset); the process then dies of the original signal, core dump included. Written, not yet run on the Frame.
-> - Still to do before the first boot: thread and fiber stacks below 2^47, fast ARM fibers and fiber-local storage,
->   fiber-safe TLS, Windows-style locks. Then performance work: the Frame has far less headroom than
->   the PCs upstream is tested on.
+>   folder (host and guest call stacks as module+offset); the process then dies of the original signal, core dump included.
+> - The thread and fiber work, the picker and the crash reports are written and tested on macOS arm64 only, not yet run
+>   on the Frame (the device runs are listed in [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)). Still to do before the first
+>   boot: those runs. Then performance work: the Frame has far less headroom than the PCs upstream is tested on.
 >
 > Frame-specific notes: [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md).
 >
