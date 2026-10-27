@@ -43,6 +43,8 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 >   fiber-safe TLS, Windows-style locks, crash reports. Then performance work: the Frame has far less headroom than
 >   the PCs upstream is tested on.
 >
+> Frame-specific notes: [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md).
+>
 > Build from an x86-64 PC (`source toolchain/env.sh`, sysroot from `toolchain/sync_sysroot.sh`) or natively on the
 > Frame. As upstream: everything is generated from **your own dump** of the game; nothing of the game is in this
 > repository.

@@ -135,14 +135,7 @@ It works from any folder (a symlink to it in `~/bin` is fine) and takes the opti
 The game's output shows in the terminal and is kept in `~/.local/share/ssbu-recomp/last_run.log`.
 
 - Saves go to `~/.local/share/ssbu-recomp/userdata` (`--userdata <folder>` for another one).
-- **Game data (native aarch64 / Steam Frame):** the runtime finds the dump itself (`runtime/datapaths.c`: `--data`, `SSBU_DATA` /
-  `SSBU_ROMFS`, `data=` in `~/.config/ssbu-recomp/config`, then the build's own layout). When the data are missing or unusable
-  (no `data.arc` or `.nrr`, packages that still need `tools/extract/dump_folder.py`, the other game build, missing system fonts)
-  and a display is present, the game opens its own picker before the game window: it names the problem and lets you choose the
-  folder with a controller (A opens, B goes up, X uses the folder shown, Y lists places such as the SD card and USB drives), the
-  keyboard or the mouse; in Desktop Mode the system folder dialog is offered first. The folder is checked and saved as `data=`.
-  To change it later start once with `--pick-data` (Steam launch options: `%command% --pick-data` or `SSBU_PICK_DATA=1 %command%`).
-  Scripted runs, `SSBU_SHOW=0` and runs without a display print the reason and exit with code 9 instead.
+- **Steam Frame (native aarch64):** finding the game data and the in-game picker are in [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md).
 - `scripts/linux/install_desktop.sh` adds **Super Smash Bros. Ultimate (recomp)** to your application menu; the game's
   output of the last start is then in `~/.local/share/ssbu-recomp/last_run.log`. `--remove` takes it out again.
 - **First start:** the game waits at a progress screen while it reads its shaders out of `data.arc` and prepares every
