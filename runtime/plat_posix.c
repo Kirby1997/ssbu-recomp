@@ -221,29 +221,36 @@ static inline void cs_relax(void) {
     __builtin_ia32_pause();
 #endif
 }
-static void cs_acquire(CRITICAL_SECTION *cs) {
+static int cs_try(CRITICAL_SECTION *cs) {
     uint32_t z = 0;
-    if (__atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    return __atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE);
+}
+static void cs_wait(CRITICAL_SECTION *cs) {                /* the word is taken: spin a while, then the futex */
     for (int i = 0; i < 100; i++) {
         cs_relax();
-        z = 0;
-        if (__atomic_load_n(&cs->Lock, __ATOMIC_RELAXED) == 0 && __atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+        if (__atomic_load_n(&cs->Lock, __ATOMIC_RELAXED) == 0 && cs_try(cs)) return;
     }
     while (__atomic_exchange_n(&cs->Lock, 2, __ATOMIC_ACQUIRE) != 0) futex(&cs->Lock, FUTEX_WAIT_PRIVATE, 2, NULL);
 }
+/* As Windows' RtlEnterCriticalSection: the word first, the owner (an acquire load) only when the word is taken. A thread
+ * whose old id is still in OwningThread (a fiber took the lock here, moved, and left it on another thread) takes a free
+ * lock afresh instead of counting up on a stale owner. */
 void InitializeCriticalSection(CRITICAL_SECTION *cs) { memset(cs, 0, sizeof *cs); }
 void EnterCriticalSection(CRITICAL_SECTION *cs) {
     HANDLE me = (HANDLE)(uintptr_t)GetCurrentThreadId();
-    if (__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->RecursionCount++; return; }
-    cs_acquire(cs);
+    if (!cs_try(cs)) {
+        if (__atomic_load_n(&cs->OwningThread, __ATOMIC_ACQUIRE) == me) { cs->RecursionCount++; return; }
+        cs_wait(cs);
+    }
     __atomic_store_n(&cs->OwningThread, me, __ATOMIC_RELAXED);
     cs->RecursionCount = 1;
 }
 BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
     HANDLE me = (HANDLE)(uintptr_t)GetCurrentThreadId();
-    if (__atomic_load_n(&cs->OwningThread, __ATOMIC_RELAXED) == me) { cs->RecursionCount++; return TRUE; }
-    uint32_t z = 0;
-    if (!__atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return FALSE;
+    if (!cs_try(cs)) {
+        if (__atomic_load_n(&cs->OwningThread, __ATOMIC_ACQUIRE) == me) { cs->RecursionCount++; return TRUE; }
+        return FALSE;
+    }
     __atomic_store_n(&cs->OwningThread, me, __ATOMIC_RELAXED);
     cs->RecursionCount = 1;
     return TRUE;
@@ -359,19 +366,43 @@ static void fls_thread_end(void);
  * thread's TLS block (the __thread variables; the guest is handed some of their addresses: errno, h_errno,
  * gethostbyname's result) in that mapping. CreateThread gives every thread a stack from low_stack instead, below 2^47
  * with a 64 KB guard under it, and glibc then puts the TLS block there too. glibc does not free a stack it was given:
- * a thread that ends puts its stack on g_dead as its last step, and the next CreateThread joins those threads (which
- * waits only for the rest of their exit) and unmaps their stacks. */
+ * a thread that ends puts its stack on g_dead as its last step, and a later CreateThread joins those that have ended
+ * and unmaps their stacks. */
 #define STACK_GUARD 0x10000u
 static void *low_stack(size_t size, size_t guard);
 typedef struct DeadStack { struct DeadStack *next; pthread_t th; void *map; size_t size; } DeadStack;
 static DeadStack *g_dead;
 static pthread_mutex_t g_dead_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Joins only threads that have ended (pthread_tryjoin_np: no waiting on another thread's exit destructors, which may want a
+ * lock the caller holds); the others stay listed for a later call. Never the calling thread's own entry (a destructor that
+ * runs after the thread listed itself, an FLS callback say, may call CreateThread). The macOS check has no tryjoin: there
+ * it joins, which waits. */
 static void dead_reap(void) {
     pthread_mutex_lock(&g_dead_lock);
-    DeadStack *d = g_dead;
+    DeadStack *d = g_dead, *keep = NULL, *last = NULL;
     g_dead = NULL;
     pthread_mutex_unlock(&g_dead_lock);
-    while (d) { DeadStack *n = d->next; pthread_join(d->th, NULL); munmap(d->map, d->size); free(d); d = n; }
+    while (d) {
+        DeadStack *n = d->next;
+#ifdef __APPLE__
+        int done = !pthread_equal(d->th, pthread_self()) && pthread_join(d->th, NULL) == 0;
+#else
+        int done = !pthread_equal(d->th, pthread_self()) && pthread_tryjoin_np(d->th, NULL) == 0;
+#endif
+        if (done) { munmap(d->map, d->size); free(d); }
+        else { d->next = keep; keep = d; if (!last) last = d; }
+        d = n;
+    }
+    if (!keep) return;
+    pthread_mutex_lock(&g_dead_lock);
+    last->next = g_dead; g_dead = keep;
+    pthread_mutex_unlock(&g_dead_lock);
+}
+/* An ending thread hands back the pages of its stack below where it runs now (they read as zeros if touched again), so
+ * the stacks of the last threads to end hold no memory while no CreateThread comes to unmap them; the address range stays. */
+static void stack_trim(void *map, size_t size) {
+    uintptr_t lo = (uintptr_t)map + STACK_GUARD, top = ((uintptr_t)__builtin_frame_address(0) - 0x4000) & ~(uintptr_t)0xfff;
+    if (top > lo && top < (uintptr_t)map + size) madvise((void *)lo, top - lo, MADV_DONTNEED);
 }
 #endif
 static __thread PlatObj *t_self;
@@ -399,6 +430,7 @@ static void *thread_tramp(void *p) {
     pthread_mutex_unlock(&o->m);
     obj_release(o);
 #ifdef PLAT_A64_LINUX
+    stack_trim(map, map_size);
     DeadStack *d = malloc(sizeof *d);                         /* (no memory: the stack stays mapped) */
     if (d) {
         d->th = pthread_self(); d->map = map; d->size = map_size;
@@ -455,30 +487,49 @@ DWORD GetThreadId(HANDLE h) { if (h == PSEUDO_THREAD) return GetCurrentThreadId(
 BOOL GetExitCodeThread(HANDLE h, DWORD *code) { if (!is_obj(h)) return FALSE; *code = ((PlatObj *)h)->exit_code; return TRUE; }
 BOOL SetThreadPriority(HANDLE h, int prio) { (void)h; (void)prio; return TRUE; }   /* no real-time scheduling without privileges */
 int GetThreadPriority(HANDLE h) { (void)h; return THREAD_PRIORITY_NORMAL; }
+/* A thread handle's pthread_t is used only under the object's lock and while the thread has not ended: after that it
+ * names memory that is gone (aarch64 Linux: the stack dead_reap unmapped, glibc's struct pthread inside it; a detached
+ * thread's elsewhere). Returns the object locked, or NULL (not a live thread; nothing locked). */
+static PlatObj *thread_live_lock(HANDLE h) {
+    if (!is_obj(h) || ((PlatObj *)h)->kind != PO_THREAD) return NULL;
+    PlatObj *o = h;
+    pthread_mutex_lock(&o->m);
+    if (!o->signaled) return o;
+    pthread_mutex_unlock(&o->m);
+    return NULL;
+}
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
-    pthread_t th = h == PSEUDO_THREAD ? pthread_self() : is_obj(h) ? ((PlatObj *)h)->th : 0;
-    if (!th || !mask) return 0;
+    if (!mask) return 0;
+    PlatObj *o = h == PSEUDO_THREAD ? NULL : thread_live_lock(h);
+    if (h != PSEUDO_THREAD && !o) return 0;
 #ifndef __APPLE__                                 /* macOS has no thread affinity: the mask is accepted, not applied */
     cpu_set_t set; CPU_ZERO(&set);
     for (int i = 0; i < 64; i++) if (mask >> i & 1) CPU_SET(i, &set);
-    if (pthread_setaffinity_np(th, sizeof set, &set)) return 0;
+    int bad = pthread_setaffinity_np(o ? o->th : pthread_self(), sizeof set, &set);
+    if (o) pthread_mutex_unlock(&o->m);
+    if (bad) return 0;
+#else
+    if (o) pthread_mutex_unlock(&o->m);
 #endif
     return ~(DWORD_PTR)0 >> (64 - (get_nprocs() < 64 ? get_nprocs() : 64));
 }
 /* The kernel's thread name: at most 15 characters (Windows keeps the whole description); non-ASCII becomes '?'. */
 HRESULT SetThreadDescription(HANDLE h, LPCWSTR name) {
-    pthread_t th = h == PSEUDO_THREAD ? pthread_self() : is_obj(h) ? ((PlatObj *)h)->th : 0;
     char s[16];
     int i = 0;
-    if (!th || !name) return E_FAIL;
+    if (!name) return E_FAIL;
     for (; i < 15 && name[i]; i++) s[i] = name[i] < 128 ? (char)name[i] : '?';
     s[i] = 0;
+    PlatObj *o = h == PSEUDO_THREAD ? NULL : thread_live_lock(h);
+    if (h != PSEUDO_THREAD && !o) return E_FAIL;
+    pthread_t th = o ? o->th : pthread_self();
 #ifdef __APPLE__                                  /* macOS names the calling thread only */
-    if (!pthread_equal(th, pthread_self())) return E_FAIL;
-    return pthread_setname_np(s) ? E_FAIL : S_OK;
+    int bad = !pthread_equal(th, pthread_self()) || pthread_setname_np(s);
 #else
-    return pthread_setname_np(th, s) ? E_FAIL : S_OK;
+    int bad = pthread_setname_np(th, s) != 0;
 #endif
+    if (o) pthread_mutex_unlock(&o->m);
+    return bad ? E_FAIL : S_OK;
 }
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     (void)p;
@@ -2392,18 +2443,28 @@ BOOLEAN SystemFunction036(PVOID buf, ULONG n) {
 }
 BOOL QueryThreadCycleTime(HANDLE h, ULONG64 *cycles) {
 #ifdef __APPLE__                                  /* the thread's CPU time from Mach (no pthread_getcpuclockid on macOS) */
-    pthread_t th = is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD ? ((PlatObj *)h)->th : pthread_self();
+    int is_thr = is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD;
+    PlatObj *o = is_thr ? thread_live_lock(h) : NULL;
+    if (is_thr && !o) return FALSE;                                          /* ended */
     thread_basic_info_data_t bi;
     mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
-    if (thread_info(pthread_mach_thread_np(th), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS) return FALSE;
+    kern_return_t kr = thread_info(pthread_mach_thread_np(o ? o->th : pthread_self()), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt);
+    if (o) pthread_mutex_unlock(&o->m);
+    if (kr != KERN_SUCCESS) return FALSE;
     *cycles = ((ULONG64)bi.user_time.seconds + (ULONG64)bi.system_time.seconds) * 1000000000ULL
             + ((ULONG64)bi.user_time.microseconds + (ULONG64)bi.system_time.microseconds) * 1000ULL;
     return TRUE;
 #else
     clockid_t id = CLOCK_THREAD_CPUTIME_ID;
-    if (is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD && pthread_getcpuclockid(((PlatObj *)h)->th, &id)) return FALSE;
+    PlatObj *o = NULL;
+    if (is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD) {
+        if (!(o = thread_live_lock(h))) return FALSE;                        /* ended */
+        if (pthread_getcpuclockid(o->th, &id)) { pthread_mutex_unlock(&o->m); return FALSE; }
+    }
     struct timespec ts;
-    if (clock_gettime(id, &ts)) return FALSE;
+    int bad = clock_gettime(id, &ts);                                        /* under the lock: the clock names the thread */
+    if (o) pthread_mutex_unlock(&o->m);
+    if (bad) return FALSE;
     *cycles = (ULONG64)ts.tv_sec * 1000000000ULL + (ULONG64)ts.tv_nsec;
     return TRUE;
 #endif

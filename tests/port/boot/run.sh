@@ -21,8 +21,10 @@ fi
 # datapaths.c is held to -Wall -Wextra -Werror
 $CCX $F -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare -Werror -c runtime/datapaths.c -o "$OUT/datapaths.o"
 $CCX $F -c runtime/plat_posix.c -o "$OUT/plat_posix.o"
+CRASH=""                                           # arm64: plat_posix.c's thread start calls plat_crash.c's crash_thread_init (C4)
+[ "$MODE" = arm64 ] && { $CCX $F -c runtime/plat_crash.c -o "$OUT/plat_crash.o"; CRASH="$OUT/plat_crash.o"; }
 $CCX $F -c runtime/nnmisc.c -o "$OUT/nnmisc.o"
 $CCX $F -Dmain=ssbu_boot_main -c runtime/boot.c -o "$OUT/boot.o"
-$CCX $F -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare tests/port/boot/test_boot.c "$OUT"/datapaths.o "$OUT"/plat_posix.o "$OUT"/nnmisc.o "$OUT"/boot.o $L -o "$OUT/test_boot"
+$CCX $F -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare tests/port/boot/test_boot.c "$OUT"/datapaths.o "$OUT"/plat_posix.o $CRASH "$OUT"/nnmisc.o "$OUT"/boot.o $L -o "$OUT/test_boot"
 [ "$MODE" = arm64 ] && { echo "built $OUT/test_boot"; exit 0; }
 timeout 300 "$OUT/test_boot" "${TMPDIR:-/tmp}/c10_scratch"

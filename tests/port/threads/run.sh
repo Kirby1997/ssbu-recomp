@@ -42,6 +42,10 @@ $CC $F -c $T/stubs.c -o "$OUT/stubs.o"
 PLAT="$OUT/plat_posix.o $OUT/libstubs.o"
 TESTS="test_threads test_sync test_fls test_os_fibers"
 if $CC $F -dM -E -x c /dev/null | grep -q __aarch64__; then              # test_fiber: the aarch64 switch
+    # plat_crash.c too (C4; Linux aarch64 thread starts call its crash_thread_init), so these runs set up the real alternate
+    # signal stack on every thread they make. Built as tests/port/crash builds it (without the plat headers).
+    $CC $(echo "$F" | sed 's#-include runtime/plat/plat_pre.h##; s#-I runtime/plat ##') -std=gnu11 -c runtime/plat_crash.c -o "$OUT/plat_crash.o"
+    PLAT="$PLAT $OUT/plat_crash.o"
     TESTS="test_fiber $TESTS"
     $CC $F $T/test_fiber.c $T/regcheck_a64.S $PLAT $L -o "$OUT/test_fiber"
 fi

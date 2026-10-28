@@ -11,7 +11,7 @@ cd "$REPO"
 OUT=${OUT:-/tmp/ssbu-cspike-bin}
 OBJ=${OBJ:-/tmp/ssbu-cspike-check}
 mkdir -p "$OUT"
-$CC $X_ARCH $X_CODEGEN $X_LD -O1 -g -w $X_PLAT -I$SDL3_ROOT/include tests/plat_selftest.c runtime/plat_posix.c \
+$CC $X_ARCH $X_CODEGEN $X_LD -O1 -g -w $X_PLAT -I$SDL3_ROOT/include tests/plat_selftest.c runtime/plat_posix.c runtime/plat_crash.c \
     -L$SDL3_ROOT/lib -lSDL3 -lssl -lcrypto -lm -lpthread -ldl -o "$OUT/plat_selftest"
 OUT=$OBJ tests/cspike/xcheck.sh >/dev/null || { echo "xcheck failed (logs in $OBJ)"; exit 1; }
 $CC $X_ARCH $X_LD $X_CODEGEN -O1 -w -fPIC -shared -I runtime $X_PLAT tests/cspike/nogame.c -Wl,-soname,ssbu_game_eh_o1.so \

@@ -7,8 +7,9 @@ if [ "${1:-x86}" = arm64 ]; then
     . tests/cspike/xenv.sh
     F="$X_ARCH $X_CODEGEN $X_LD -fno-pie -no-pie -O1 -g -w -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat -I$SDL3_ROOT/include"
     L="-L$SDL3_ROOT/lib -Wl,-rpath-link,$SDL3_ROOT/lib -lSDL3 -lssl -lcrypto -lm -lpthread -ldl"
-    $CC $F tests/cspike/c3_low.c runtime/plat_posix.c runtime/plat_heap.c $L -o "$OUT/c3_low"
-    $CC $F tests/plat_selftest.c runtime/plat_posix.c runtime/plat_heap.c $L -o "$OUT/plat_selftest"
+    # plat_crash.c: plat_posix.c's thread start calls its crash_thread_init on Linux aarch64 (C4)
+    $CC $F tests/cspike/c3_low.c runtime/plat_posix.c runtime/plat_heap.c runtime/plat_crash.c $L -o "$OUT/c3_low"
+    $CC $F tests/plat_selftest.c runtime/plat_posix.c runtime/plat_heap.c runtime/plat_crash.c $L -o "$OUT/plat_selftest"
 else
     # x86 WSL has no SDL3 / OpenSSL / new-kernel dev packages. Headers: SDL3, OpenSSL and linux/{userfaultfd,fs}.h come from the Frame sysroot
     # (arch-neutral); libcrypto is the system one by path; SDL_* symbols get abort() stubs (no test here reaches them).

@@ -8,7 +8,7 @@ if [ "$MODE" = arm64 ]; then
     . tests/cspike/xenv.sh
     F="$X_ARCH $X_CODEGEN $X_LD -fno-pie -no-pie -O1 -g -w -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat -I$SDL3_ROOT/include"
     L="-L$SDL3_ROOT/lib -Wl,-rpath-link,$SDL3_ROOT/lib -lSDL3 -lssl -lcrypto -lm -lpthread -ldl"
-    $CC $F tests/port/fs/test_fs.c runtime/plat_posix.c runtime/plat_heap.c $L -o "$OUT/test_fs"
+    $CC $F tests/port/fs/test_fs.c runtime/plat_posix.c runtime/plat_heap.c runtime/plat_crash.c $L -o "$OUT/test_fs"      # plat_crash.c: plat_posix.c's thread start (C4)
 else
     S=${SYSROOT:-$HOME/sysroots/steam-frame}; SDL3_ROOT=${SDL3_ROOT:-$S/opt/ssbu-deps/sdl3}
     mkdir -p "$OUT/inc/linux"; cp "$S/usr/include/linux/userfaultfd.h" "$S/usr/include/linux/fs.h" "$OUT/inc/linux/"
