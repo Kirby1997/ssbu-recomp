@@ -4,7 +4,8 @@
 # Exit status 0 only if everything passed.
 cd "$(dirname "$0")" || exit 2
 # Frame safety caps: bound the user's process count (litmus is multithreaded) and every test binary's run time
-ulimit -u $(( $(ps -eLf --no-headers -u "$(id -un)" | wc -l) + 300 ))
+N=0; if [ "$(uname -s)" = Linux ]; then N=$(ps -eLf --no-headers -u "$(id -un)" 2>/dev/null | wc -l); fi
+if [ "${N:-0}" -gt 0 ] 2>/dev/null; then ulimit -u $((N + 300)) 2>/dev/null; fi
 TMO="timeout ${TEST_TIMEOUT:-600}"
 PAIRS=${1:-20000000}
 ITERS=${2:-1000000}
@@ -92,7 +93,8 @@ for CC in $CCS; do
     else fail "compile neon_native_test.c ($CC)"; fi
 done
 if [ -n "$X86HASH" ] && [ -f "$X86HASH" ]; then
-    A=$(grep soft-hash fp_gcc.out); B=$(cat "$X86HASH")
+    set -- $CCS
+    A=$(grep soft-hash "fp_$1.out"); B=$(cat "$X86HASH")
     if [ "$A" = "$B" ]; then pass "software FP results on x86 = on AArch64 ($A)"; else fail "x86 soft hash '$B' != aarch64 '$A'"; fi
 fi
 

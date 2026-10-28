@@ -13,7 +13,7 @@ COMMA   := ,
 SANFL   := $(if $(SAN),-fsanitize=address$(COMMA)undefined -fno-sanitize-recover=undefined)
 WARN    := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers
 CFLAGS  := -O1 -g -std=gnu11 -D_GNU_SOURCE -fno-pie -fno-omit-frame-pointer -fno-strict-aliasing -pthread \
-           -include $(RT)/plat/plat_pre.h -I$(RT)/plat -I$(RT) -I$(REPO) -I$(REPO)/tests/port/boot -I$(SDL)/include -I. $(SANFL) \
+           -include $(RT)/plat/plat_pre.h -I$(RT)/plat -I$(RT) -I$(REPO) -I$(REPO)/tests/port/boot -I$(SDL)/include -idirafter $(REPO)/tests/port/threads/stub -I. $(SANFL) \
            -Dfn_table='(*game_fn_table_p)' -Dfn_table_count='(*game_fn_table_count_p)'
 LDFLAGS := -no-pie -pthread -rdynamic -ldl -lm -Wl,--unresolved-symbols=ignore-all $(SANFL)
 # as tests/port/boot/run.sh: the host's platform layer (plat_posix.c, which also holds the host_* path helpers) and datapaths.c;
@@ -23,7 +23,7 @@ OBJS    := $(addprefix $(BUILD)/,plat_posix.o datapaths.o)
 all: run
 build: $(BUILD)/test_picker
 run: build
-	@echo "== $(BUILD)/test_picker"; SSBU_VMEM_NO_REEXEC=1 ./$(BUILD)/test_picker $(SCRATCH) $(SCRATCH)/shots
+	@echo "== $(BUILD)/test_picker"; SSBU_VMEM_NO_REEXEC=1 ./$(BUILD)/test_picker "$(SCRATCH)" "$(SCRATCH)/shots"
 sdl: $(BUILD)/test_picker_sdl
 
 $(BUILD):

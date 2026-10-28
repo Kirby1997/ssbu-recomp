@@ -43,15 +43,58 @@ usual); `SSBU_CRASH_EXIT=1` exits with code 4 instead, as on Windows.
 
 ## Waiting for a Frame run
 
-Written and tested only on other machines (macOS arm64) so far. Run these on the device before relying on them:
+Several checks were written and tested only on other machines (macOS arm64) and still have to run on the device. One command
+runs all of them, natively on the Frame, with no PC and no ssh. It needs no root and changes nothing outside the checkout and
+its work folder `build-frame-tests/` (ignored by the repository).
 
-| Script | Checks |
+On the Frame, in a terminal (Desktop Mode, or ssh into the running session):
+
+```sh
+git clone -b frame-pending <this repository's URL> ssbu-recomp    # or, in an existing clone: fetch, check out and pull frame-pending
+cd ssbu-recomp
+sh tests/frame/run_all.sh
+```
+
+It first checks what it needs and prints a one-line fix for anything missing (SteamOS's root filesystem is read-only, so the
+fixes avoid pacman where they can: SDL3 comes from `toolchain/build_deps_on_device.sh`, kernel headers can come from a folder
+passed with `--kheaders`). A missing tool skips only the suites that need it, and the report says which. Then it runs every
+suite under a timeout, carries on after a failure, and prints a table. A full run is expected to take 10 to 30 minutes.
+
+| Option | Does |
 |---|---|
-| `tests/port/threads/run_frame.sh` | stacks and `__thread` below 2^47, fibers, fiber-local storage, critical sections |
-| `tests/port/crash/run_frame.sh` | crash reports (gcc, clang, fortify, PAC) |
-| `tests/port/picker/run_frame.sh` | the picker's logic and its SDL window with a virtual gamepad |
-| `tests/port/boot`, `tests/port/fs` | game data lookup and file layer after the upstream merge |
-| `tests/arm_host/run_frame.sh` | lifter memory ordering, FP and NEON |
+| `--quick` | a short subset of each suite (first compiler only, smaller counts): a few minutes |
+| `--suite NAME` | one suite (repeat it or use `NAME,NAME`); `--list` names them |
+| `--dry-run` | the preflight and the plan only; nothing is built or run |
+| `--work DIR` | another work folder (default `build-frame-tests/` in the checkout) |
+| `--sdl3 DIR`, `--kheaders DIR` | SDL3 prefix (default `~/ssbu-port/deps/sdl3`); a folder holding `linux/userfaultfd.h` |
+| `--with-shots` | put the picker's screenshots in the `.tar.gz` (off by default: a screenshot can show what else is on screen) |
+| `--ref-hash FILE` | the `soft-hash` line of another host, to compare the lifter's software-FP hash with |
+
+For the picker's display runs, start it from the running Game Mode session (for example over ssh while Steam's gamescope
+session is up); elsewhere those runs are skipped with a note.
+
+**What to send back:** the two files it prints at the end, `build-frame-tests/ssbu-frame-<stamp>.txt` (the report) and
+`.tar.gz` (the report and every log). The exit status is 0 when everything that ran passed. The report holds the summary
+table (result, check count and seconds per suite), the preflight, the device facts and the key lines of each suite. Device
+facts: `uname`, CPU features (BTI, PAC, MTE, SVE2, LSE), glibc, compiler versions, address-space settings
+(`vm.mmap_rnd_bits`, VA bits, the top of `/proc/self/maps`), gamescope state, the SDL3 version and `vulkaninfo --summary`.
+`$HOME` is written as `~`, user and host names are replaced, and no environment is dumped.
+
+| Suite | Covers | Script |
+|---|---|---|
+| `crash` | crash reports: gcc, clang, FORTIFY, PAC | `tests/port/crash/run_frame.sh` |
+| `fs` | file layer: case-insensitive paths, write-through rename | `tests/port/fs/run.sh native` |
+| `boot` | game data lookup and launch defaults (synthetic fixtures) | `tests/port/boot/run.sh native` |
+| `plat` | `VirtualAlloc` below 2^47, write watch, `plat_selftest`, Vulkan loader | `tests/cspike/c3_build.sh native` |
+| `threads` | stacks and `__thread` below 2^47, fibers, FLS, critical sections, BTI, TLS hazard | `tests/port/threads/run_frame.sh` |
+| `picker` | the data-folder picker, in an SDL window offscreen and on gamescope | `tests/port/picker/run_frame.sh` |
+| `lifter` | memory-ordering codegen, litmus tests, FP vs the instructions, NEON | `tests/arm_host/run_frame.sh` |
+
+The `run_frame.sh` scripts also work alone: on the Frame they run in place, with `--local` on any host, and with an ssh host
+as the first argument they push from a PC as before. The lifter's software-FP hash is printed, and compared with another
+host only when given `--ref-hash`; from a PC, `tests/arm_host/run_frame.sh <host>` still does the x86 comparison. Not in the kit:
+`tests/cspike/xbuild.sh` and `xcheck.sh` are cross-build checks of the whole runtime (they need the cross toolchain and
+sysroot; `setup.py --target linux-arm64` is the native build), and `gaps.c` is already built and run by `threads`.
 
 ## Playing against upstream builds
 

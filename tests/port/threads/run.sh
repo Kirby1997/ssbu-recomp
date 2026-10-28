@@ -39,21 +39,26 @@ $CC $F -c runtime/os_threads.c -o "$OUT/os_threads.o"
 } > "$OUT/libstubs.c"
 $CC $F -c "$OUT/libstubs.c" -o "$OUT/libstubs.o"
 $CC $F -c $T/stubs.c -o "$OUT/stubs.o"
-PLAT="$OUT/plat_posix.o $OUT/libstubs.o"
+HAVE_CRASH=""
 TESTS="test_threads test_sync test_fls test_os_fibers"
+link() {                                           # link <name> <sources/objects...>: + the platform layer (paths may hold spaces)
+    _n=$1; shift
+    if [ -n "$HAVE_CRASH" ]; then $CC $F "$@" "$OUT/plat_posix.o" "$OUT/libstubs.o" "$OUT/plat_crash.o" $L -o "$OUT/$_n"
+    else $CC $F "$@" "$OUT/plat_posix.o" "$OUT/libstubs.o" $L -o "$OUT/$_n"; fi
+}
 if $CC $F -dM -E -x c /dev/null | grep -q __aarch64__; then              # test_fiber: the aarch64 switch
     # plat_crash.c too (C4; Linux aarch64 thread starts call its crash_thread_init), so these runs set up the real alternate
     # signal stack on every thread they make. Built as tests/port/crash builds it (without the plat headers).
     $CC $(echo "$F" | sed 's#-include runtime/plat/plat_pre.h##; s#-I runtime/plat ##') -std=gnu11 -c runtime/plat_crash.c -o "$OUT/plat_crash.o"
-    PLAT="$PLAT $OUT/plat_crash.o"
+    HAVE_CRASH=1
     TESTS="test_fiber $TESTS"
-    $CC $F $T/test_fiber.c $T/regcheck_a64.S $PLAT $L -o "$OUT/test_fiber"
+    link test_fiber $T/test_fiber.c $T/regcheck_a64.S
 fi
-$CC $F $T/test_threads.c $PLAT $L -o "$OUT/test_threads"
-$CC $F $T/test_sync.c $PLAT $L -o "$OUT/test_sync"
-$CC $F $T/test_fls.c $PLAT $L -o "$OUT/test_fls"
-$CC $F $T/test_os_fibers.c "$OUT/os_threads.o" "$OUT/stubs.o" $PLAT $L -o "$OUT/test_os_fibers"
-$CC $F tests/cspike/gaps.c $PLAT $L -o "$OUT/gaps"           # the C-spike's gap probe, now against this layer
+link test_threads $T/test_threads.c
+link test_sync $T/test_sync.c
+link test_fls $T/test_fls.c
+link test_os_fibers $T/test_os_fibers.c "$OUT/os_threads.o" "$OUT/stubs.o"
+link gaps tests/cspike/gaps.c                                # the C-spike's gap probe, now against this layer
 [ "$MODE" = cross ] && { ls "$OUT"; exit 0; }
 fail=0
 for t in $TESTS; do

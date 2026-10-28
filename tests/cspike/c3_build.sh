@@ -1,9 +1,19 @@
 #!/bin/sh
-# C3: build tests/cspike/c3_low.c + plat_selftest. $1 = arm64 (cross, with plat_heap.c, -no-pie) or x86 (native). OUT default /tmp/ssbu-c3.
+# C3: build tests/cspike/c3_low.c + plat_selftest. $1 = arm64 (cross, with plat_heap.c, -no-pie), x86 (native on x86 WSL) or
+# native (ON the Steam Frame, $CC (cc), same flags as arm64; SDL3 from $SDL3_ROOT or abort() stubs: tests/port/native_env.sh). OUT default /tmp/ssbu-c3.
 set -eu
 cd "$(dirname "$0")/../.."
 OUT=${OUT:-/tmp/ssbu-c3}; mkdir -p "$OUT"
-if [ "${1:-x86}" = arm64 ]; then
+if [ "${1:-x86}" = native ]; then
+    . tests/port/native_env.sh
+    CCN=${CC:-cc}
+    F="-fno-pie -no-pie -O1 -g -w -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat $NAT_INC"
+    $CCN $F -c runtime/plat_posix.c -o "$OUT/pp.o"
+    nat_stubs "$OUT/stubs.c" "$OUT/pp.o"
+    # libcrypto is real (plat_selftest checks SHA-256 through it); without it the EVP_* stubs abort and that check fails
+    $CCN $F tests/cspike/c3_low.c runtime/plat_posix.c runtime/plat_heap.c runtime/plat_crash.c "$OUT/stubs.c" $NAT_SDL_LIBS $NAT_SSL_LIBS -lm -lpthread -ldl -o "$OUT/c3_low"
+    $CCN $F tests/plat_selftest.c runtime/plat_posix.c runtime/plat_heap.c runtime/plat_crash.c "$OUT/stubs.c" $NAT_SDL_LIBS $NAT_SSL_LIBS -lm -lpthread -ldl -o "$OUT/plat_selftest"
+elif [ "${1:-x86}" = arm64 ]; then
     . tests/cspike/xenv.sh
     F="$X_ARCH $X_CODEGEN $X_LD -fno-pie -no-pie -O1 -g -w -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat -I$SDL3_ROOT/include"
     L="-L$SDL3_ROOT/lib -Wl,-rpath-link,$SDL3_ROOT/lib -lSDL3 -lssl -lcrypto -lm -lpthread -ldl"
